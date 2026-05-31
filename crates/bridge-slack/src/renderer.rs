@@ -233,7 +233,7 @@ impl TuiRenderer {
         // numeric arg parses cleanly. We don't actually act on private CSIs;
         // this just keeps `nums` from absorbing an empty entry that would
         // shift the indices below.
-        let body = params.trim_start_matches(|c: char| matches!(c, '?' | '<' | '>' | '='));
+        let body = params.trim_start_matches(['?', '<', '>', '=']);
         let nums: Vec<usize> = body
             .split(';')
             .filter(|s| !s.is_empty())
