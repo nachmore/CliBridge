@@ -19,6 +19,9 @@ pub struct AppConfig {
     pub rows: Option<u16>,
     /// Minimum seconds between message updates (for TUI mode)
     pub update_interval_secs: Option<u64>,
+    /// Re-anchor the live TUI message every N inbound Slack messages so it
+    /// stays near the bottom of the channel as the user types. 0 disables.
+    pub anchor_refresh: Option<u32>,
 }
 
 impl AppConfig {

@@ -63,6 +63,12 @@ struct Cli {
     /// Don't auto-open a local terminal window; only bridge to Slack.
     #[arg(long)]
     no_local: bool,
+
+    /// Re-anchor the live TUI message every N inbound Slack messages, so it
+    /// stays near the bottom of the channel as you type. 0 disables.
+    /// Default: 10.
+    #[arg(long)]
+    anchor_refresh: Option<u32>,
 }
 
 #[tokio::main]
@@ -116,6 +122,8 @@ async fn main() -> Result<()> {
         rows: cli.rows.or(config.rows).unwrap_or(24),
     };
 
+    let anchor_refresh = cli.anchor_refresh.or(config.anchor_refresh).unwrap_or(10);
+
     bridge::run(
         &channel,
         &shell,
@@ -123,6 +131,7 @@ async fn main() -> Result<()> {
         cli.url.as_deref(),
         size,
         !cli.no_local,
+        anchor_refresh,
     )
     .await
 }

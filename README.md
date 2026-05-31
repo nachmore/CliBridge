@@ -78,6 +78,7 @@ Options:
       --cols <COLS>            Terminal width in columns (default: 120)
       --rows <ROWS>            Terminal height in rows (default: 24)
       --no-local               Skip auto-opening a local terminal mirror
+      --anchor-refresh <N>     Re-anchor the live TUI message every N inbound Slack messages (default: 10, 0 to disable)
       --config <CONFIG>        Path to config file
       --login                  Open browser to sign in to Slack
       --list-workspaces        List saved workspaces

@@ -44,6 +44,7 @@ enum SessionEnd {
 
 /// Top-level entrypoint. Manages session lifecycle: connects to Slack once,
 /// then spawns shell sessions as needed and supervises them.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     channel: &str,
     shell: &str,
@@ -51,6 +52,7 @@ pub async fn run(
     api_url: Option<&str>,
     size: TerminalSize,
     local: bool,
+    anchor_refresh: u32,
 ) -> Result<()> {
     let store = CredentialStore::new()?;
     let credentials = if let Some(ws) = workspace {
@@ -92,7 +94,16 @@ pub async fn run(
     let mut message_rx = slack.subscribe(channel).await?;
 
     loop {
-        let outcome = run_session(&slack, &mut message_rx, channel, shell, size, local).await?;
+        let outcome = run_session(
+            &slack,
+            &mut message_rx,
+            channel,
+            shell,
+            size,
+            local,
+            anchor_refresh,
+        )
+        .await?;
         match outcome {
             SessionEnd::ShellExited => {
                 // Wait for `--new` (Slack) or Ctrl+C (local). Don't auto-spawn
@@ -139,6 +150,7 @@ pub async fn run(
 
 /// Run a single shell session: spawn PTY + (optional) attach server, pump I/O
 /// between PTY, Slack, and attach clients until the session ends.
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     slack: &SlackClient,
     message_rx: &mut mpsc::Receiver<IncomingMessage>,
@@ -146,6 +158,7 @@ async fn run_session(
     shell: &str,
     size: TerminalSize,
     local: bool,
+    anchor_refresh: u32,
 ) -> Result<SessionEnd> {
     // Start a fresh attach server per session. Old attach clients (from a
     // previous session) have already disconnected because their server was
@@ -184,6 +197,12 @@ async fn run_session(
     let mut current_message_id: Option<String> = None;
     let mut tick = tokio::time::interval(RENDER_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Counter for the live-message re-anchor feature: every N inbound Slack
+    // messages, drop current_message_id so the next TUI frame posts a NEW
+    // message instead of editing the old one. This keeps the live frame
+    // visible near the bottom of the channel as the user types. 0 disables.
+    let mut messages_since_anchor: u32 = 0;
 
     // Split the attach server so we can both forward output and drain events.
     let attach_output = attach.as_ref().map(|a| a.output_tx.clone());
@@ -275,7 +294,7 @@ async fn run_session(
                     let _ = pty.kill();
                     break SessionEnd::Interrupted;
                 };
-                match handle_slack_message(
+                let outcome = handle_slack_message(
                     &msg,
                     &input_tx,
                     &mut pty,
@@ -283,7 +302,29 @@ async fn run_session(
                     slack,
                     channel,
                     &mut current_message_id,
-                ).await {
+                ).await;
+
+                // Re-anchor: every Nth inbound message, force the next TUI
+                // frame to post a NEW message instead of editing the old one.
+                // This keeps the live frame near the bottom of the channel
+                // so the user doesn't have to scroll back up to see it.
+                // The `--clear` command (handled inside handle_slack_message)
+                // already nulls current_message_id, so we treat that path as
+                // an implicit anchor reset by checking is_some() first.
+                if anchor_refresh > 0 && current_message_id.is_some() {
+                    messages_since_anchor = messages_since_anchor.saturating_add(1);
+                    if messages_since_anchor >= anchor_refresh {
+                        current_message_id = None;
+                        messages_since_anchor = 0;
+                    }
+                } else {
+                    // current_message_id is None — either we haven't posted a
+                    // TUI frame yet or --clear just ran. Reset the counter
+                    // so the *next* threshold cycle starts fresh.
+                    messages_since_anchor = 0;
+                }
+
+                match outcome {
                     SlackOutcome::Continue => {}
                     SlackOutcome::Kill => {
                         let _ = pty.kill();

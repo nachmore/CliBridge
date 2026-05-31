@@ -21,3 +21,7 @@
 
 # Minimum seconds between Slack message updates in TUI mode (default: 1)
 # update_interval_secs = 1
+
+# Re-anchor the live TUI message every N inbound Slack messages so it stays
+# near the bottom of the channel as you type. 0 disables. Default: 10.
+# anchor_refresh = 10
