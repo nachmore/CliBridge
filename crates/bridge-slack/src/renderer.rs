@@ -1,14 +1,13 @@
-use std::time::{Duration, Instant};
-
 /// Renders terminal output for display in Slack messages.
 ///
 /// Strategy:
-/// - Accumulates terminal output
-/// - Detects whether output is "TUI-like" (contains cursor movement/screen clears)
-///   or "streaming" (plain line-by-line output)
-/// - For TUI: maintains a virtual screen buffer, renders as a single code block
-///   that gets edited in place
-/// - For streaming: batches lines and posts new messages when buffer is full
+/// - Accumulates terminal output as it arrives. `process()` does not render.
+/// - Detects "TUI mode" only when an app enables the alternate screen buffer
+///   (vim, htop, less, tmux). Plain output stays in streaming mode.
+/// - Streaming mode: appends to a buffer that the bridge drains on a fixed
+///   tick via `take_pending()` and posts as a new message.
+/// - TUI mode: maintains a virtual screen and renders the full frame on tick;
+///   the bridge edits the existing message.
 pub struct TuiRenderer {
     /// Current screen buffer (rows x cols)
     screen: Vec<Vec<char>>,
@@ -20,13 +19,9 @@ pub struct TuiRenderer {
     cursor_col: usize,
     /// Whether we've detected TUI-mode output
     tui_mode: bool,
-    /// Accumulated line-mode output
+    /// Accumulated streaming output, drained by `take_pending`.
     line_buffer: String,
-    /// Last time we rendered
-    last_render: Instant,
-    /// Minimum time between renders
-    render_interval: Duration,
-    /// Whether the screen has changed since last render
+    /// Whether the TUI screen has changed since the last `take_pending`.
     dirty: bool,
 }
 
@@ -42,19 +37,16 @@ impl TuiRenderer {
             cursor_col: 0,
             tui_mode: false,
             line_buffer: String::new(),
-            last_render: Instant::now(),
-            render_interval: Duration::from_secs(1),
             dirty: false,
         }
     }
 
-    /// Process raw terminal output bytes.
-    /// Returns Some(rendered_text) if it's time to send/update a message.
-    pub fn process(&mut self, data: &[u8]) -> Option<RenderedOutput> {
+    /// Append raw terminal output bytes to the renderer's buffer. Cheap and
+    /// allocation-light; the bridge calls `take_pending()` on a tick to actually
+    /// produce a message.
+    pub fn process(&mut self, data: &[u8]) {
         let text = String::from_utf8_lossy(data);
 
-        // Detect TUI mode by looking for ANSI escape sequences that indicate
-        // full-screen applications (cursor positioning, screen clears, etc.)
         if !self.tui_mode && Self::is_tui_output(&text) {
             self.tui_mode = true;
         }
@@ -64,18 +56,30 @@ impl TuiRenderer {
         } else {
             self.process_streaming(&text);
         }
-
-        self.maybe_render()
     }
 
-    /// Force a render regardless of timing.
-    pub fn flush(&mut self) -> Option<RenderedOutput> {
-        if self.dirty || !self.line_buffer.is_empty() {
+    /// Drain whatever output has accumulated since the last call.
+    /// In streaming mode this empties the buffer; in TUI mode it returns
+    /// the current screen and clears the dirty flag.
+    pub fn take_pending(&mut self) -> Option<RenderedOutput> {
+        if self.tui_mode {
+            if !self.dirty {
+                return None;
+            }
             self.dirty = false;
-            self.last_render = Instant::now();
-            Some(self.render())
+            Some(RenderedOutput {
+                text: self.render_screen(),
+                is_edit: true,
+            })
         } else {
-            None
+            if self.line_buffer.is_empty() {
+                return None;
+            }
+            let chunk = std::mem::take(&mut self.line_buffer);
+            Some(RenderedOutput {
+                text: format!("```\n{chunk}```"),
+                is_edit: false,
+            })
         }
     }
 
@@ -99,15 +103,12 @@ impl TuiRenderer {
     }
 
     fn is_tui_output(text: &str) -> bool {
-        // Indicators of full-screen TUI apps:
-        // - CSI H (cursor home / cursor position)
-        // - CSI 2J (clear screen)
-        // - CSI ?1049h (alternate screen buffer)
-        // - CSI ?25l (hide cursor)
-        text.contains("\x1b[H")
-            || text.contains("\x1b[2J")
-            || text.contains("\x1b[?1049h")
-            || text.contains("\x1b[?25l")
+        // Only enable TUI mode for the alternate-screen-buffer escape (DECSET
+        // ?1049 or its older sibling ?47). Apps that take over the screen
+        // (vim, htop, less, tmux) emit this; cmd.exe / PowerShell prompts use
+        // ?25l and \x1b[H during normal echo on Windows ConPTY, so those alone
+        // would mis-classify regular output as a TUI frame.
+        text.contains("\x1b[?1049h") || text.contains("\x1b[?47h")
     }
 
     fn process_tui(&mut self, text: &str) {
@@ -266,32 +267,6 @@ impl TuiRenderer {
         }
     }
 
-    fn maybe_render(&mut self) -> Option<RenderedOutput> {
-        if !self.dirty {
-            return None;
-        }
-        if self.last_render.elapsed() < self.render_interval {
-            return None;
-        }
-        self.dirty = false;
-        self.last_render = Instant::now();
-        Some(self.render())
-    }
-
-    fn render(&self) -> RenderedOutput {
-        if self.tui_mode {
-            RenderedOutput {
-                text: self.render_screen(),
-                is_edit: true,
-            }
-        } else {
-            RenderedOutput {
-                text: self.render_streaming(),
-                is_edit: false,
-            }
-        }
-    }
-
     fn render_screen(&self) -> String {
         let mut output = String::from("```\n");
         for row in &self.screen {
@@ -301,14 +276,6 @@ impl TuiRenderer {
         }
         output.push_str("```");
         output
-    }
-
-    fn render_streaming(&self) -> String {
-        if self.line_buffer.is_empty() {
-            return String::new();
-        }
-        // Wrap in code block for monospace rendering
-        format!("```\n{}```", &self.line_buffer)
     }
 }
 
@@ -354,27 +321,56 @@ mod tests {
     #[test]
     fn test_streaming_output() {
         let mut renderer = TuiRenderer::new(80, 24);
-        renderer.render_interval = Duration::from_millis(0);
-
-        let output = renderer.process(b"hello world\n").unwrap();
+        renderer.process(b"hello world\n");
+        let output = renderer.take_pending().unwrap();
         assert!(!output.is_edit);
         assert!(output.text.contains("hello world"));
     }
 
     #[test]
+    fn test_streaming_drains_buffer() {
+        // Two `process` calls accumulate; one `take_pending` drains; the next
+        // `take_pending` returns None until more data arrives.
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"first\n");
+        renderer.process(b"second\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("first"));
+        assert!(out.text.contains("second"));
+        assert!(renderer.take_pending().is_none());
+        renderer.process(b"third\n");
+        assert!(renderer.take_pending().unwrap().text.contains("third"));
+    }
+
+    #[test]
     fn test_tui_detection() {
-        assert!(TuiRenderer::is_tui_output("\x1b[2J\x1b[H"));
+        // Only alternate-screen escapes flip TUI mode.
         assert!(TuiRenderer::is_tui_output("\x1b[?1049h"));
+        assert!(TuiRenderer::is_tui_output("\x1b[?47h"));
+        // Cmd.exe / PowerShell echo includes these but is NOT a TUI app.
+        assert!(!TuiRenderer::is_tui_output("\x1b[H"));
+        assert!(!TuiRenderer::is_tui_output("\x1b[?25l"));
+        assert!(!TuiRenderer::is_tui_output("\x1b[2J"));
         assert!(!TuiRenderer::is_tui_output("plain text"));
+    }
+
+    #[test]
+    fn test_cmd_echo_stays_streaming() {
+        let mut renderer = TuiRenderer::new(80, 24);
+        // Typical ConPTY prompt redraw: hide cursor, home, then text.
+        renderer.process(b"\x1b[?25l\x1b[Hhello\r\n");
+        assert!(!renderer.is_tui_mode());
+        let out = renderer.take_pending().unwrap();
+        assert!(!out.is_edit);
+        assert!(out.text.contains("hello"));
     }
 
     #[test]
     fn test_tui_mode_renders_screen() {
         let mut renderer = TuiRenderer::new(10, 3);
-        renderer.render_interval = Duration::from_millis(0);
-
-        // Clear screen + position cursor + write text
-        let output = renderer.process(b"\x1b[2J\x1b[1;1Hhello").unwrap();
+        // Enable alt screen + write something.
+        renderer.process(b"\x1b[?1049h\x1b[2J\x1b[1;1Hhello");
+        let output = renderer.take_pending().unwrap();
         assert!(output.is_edit);
         assert!(output.text.contains("hello"));
     }
@@ -397,8 +393,6 @@ mod tests {
     fn test_cursor_movement() {
         let mut renderer = TuiRenderer::new(10, 5);
         renderer.tui_mode = true;
-        renderer.render_interval = Duration::from_millis(0);
-
         // Move to row 3, col 5 and write 'X'
         renderer.process(b"\x1b[3;5HX");
         assert_eq!(renderer.screen[2][4], 'X');
@@ -408,7 +402,6 @@ mod tests {
     fn test_line_wrap() {
         let mut renderer = TuiRenderer::new(5, 3);
         renderer.tui_mode = true;
-
         renderer.process(b"\x1b[1;1H12345X");
         // 'X' should wrap to next line
         assert_eq!(renderer.screen[1][0], 'X');

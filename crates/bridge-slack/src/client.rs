@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,8 +24,13 @@ pub struct SlackClient {
     credentials: Option<Credentials>,
     rate_limiter: RateLimiter,
     api_base: String,
-    /// Our own user ID (to filter out our own messages)
+    /// Our own user ID, when auth.test succeeds. With user tokens this IS the
+    /// user typing in Slack, so we can't use it to filter "our own" messages —
+    /// we track posted ts's instead (see `posted_ts`).
     self_user_id: Option<String>,
+    /// Timestamps of messages we ourselves posted via chat.postMessage / chat.update.
+    /// The poller skips these so we don't echo terminal output back into the PTY.
+    posted_ts: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -64,6 +71,13 @@ impl SlackClient {
             rate_limiter: RateLimiter::new(Duration::from_millis(1100)),
             api_base: DEFAULT_API_BASE.to_string(),
             self_user_id: None,
+            posted_ts: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    fn remember_posted(&self, ts: &str) {
+        if let Ok(mut set) = self.posted_ts.lock() {
+            set.insert(ts.to_string());
         }
     }
 
@@ -196,8 +210,11 @@ impl MessagingClient for SlackClient {
             )));
         }
 
-        resp.ts
-            .ok_or_else(|| BridgeError::Messaging("No timestamp in response".to_string()))
+        let ts = resp
+            .ts
+            .ok_or_else(|| BridgeError::Messaging("No timestamp in response".to_string()))?;
+        self.remember_posted(&ts);
+        Ok(ts)
     }
 
     async fn edit_message(
@@ -243,7 +260,6 @@ impl MessagingClient for SlackClient {
     ) -> Result<mpsc::Receiver<IncomingMessage>, BridgeError> {
         let (tx, rx) = mpsc::channel(64);
         let channel = channel.to_string();
-        let self_user_id = self.self_user_id.clone();
         let credentials = self
             .credentials
             .clone()
@@ -251,29 +267,69 @@ impl MessagingClient for SlackClient {
 
         let http = self.http.clone();
         let api_base = self.api_base.clone();
+        let posted_ts = self.posted_ts.clone();
 
-        // Spawn a polling task to check for new messages
+        let build_headers = |creds: &Credentials| -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            if let Some(cookie) = &creds.cookie
+                && let Ok(cookie_val) = HeaderValue::from_str(cookie)
+            {
+                headers.insert(COOKIE, cookie_val);
+            }
+            headers.insert(
+                reqwest::header::ORIGIN,
+                HeaderValue::from_static("https://app.slack.com"),
+            );
+            headers
+        };
+
+        // Seed last_ts to "now" by fetching the most recent message before
+        // we enter the polling loop. Without this, the first poll would
+        // replay the entire visible channel history into the PTY.
+        let mut last_ts: Option<String> = match http
+            .post(format!("{api_base}/conversations.history"))
+            .headers(build_headers(&credentials))
+            .form(&[
+                ("token", credentials.token.as_str()),
+                ("channel", channel.as_str()),
+                ("limit", "1"),
+            ])
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json::<ConversationsHistoryResponse>().await {
+                Ok(h) if h.ok => h.messages.and_then(|m| m.first().and_then(|x| x.ts.clone())),
+                Ok(h) => {
+                    warn!("seed conversations.history error: {:?}", h.error);
+                    None
+                }
+                Err(e) => {
+                    warn!("seed conversations.history parse error: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("seed conversations.history HTTP error: {e}");
+                None
+            }
+        };
+        // Mark the seed ts as already handled so the first polling pass doesn't
+        // re-deliver it (oldest is inclusive in conversations.history).
+        if let Some(seed) = last_ts.as_deref()
+            && let Ok(mut set) = posted_ts.lock()
+        {
+            set.insert(seed.to_string());
+        }
+        debug!("Subscribed to channel {channel}, last_ts seed: {last_ts:?}");
+
         tokio::spawn(async move {
-            let mut last_ts: Option<String> = None;
-
             loop {
                 tokio::time::sleep(POLL_INTERVAL).await;
-
-                let mut headers = HeaderMap::new();
-                if let Some(cookie) = &credentials.cookie
-                    && let Ok(cookie_val) = HeaderValue::from_str(cookie)
-                {
-                    headers.insert(COOKIE, cookie_val);
-                }
-                headers.insert(
-                    reqwest::header::ORIGIN,
-                    HeaderValue::from_static("https://app.slack.com"),
-                );
 
                 let mut form: Vec<(&str, String)> = vec![
                     ("token", credentials.token.clone()),
                     ("channel", channel.clone()),
-                    ("limit", "10".to_string()),
+                    ("limit", "20".to_string()),
                 ];
                 if let Some(ref ts) = last_ts {
                     form.push(("oldest", ts.clone()));
@@ -281,61 +337,75 @@ impl MessagingClient for SlackClient {
 
                 let resp = http
                     .post(format!("{api_base}/conversations.history"))
-                    .headers(headers)
+                    .headers(build_headers(&credentials))
                     .form(&form)
                     .send()
                     .await;
 
-                match resp {
-                    Ok(response) => {
-                        if let Ok(history) =
-                            response.json::<ConversationsHistoryResponse>().await
-                        {
-                            if !history.ok {
-                                warn!("conversations.history error: {:?}", history.error);
-                                continue;
-                            }
-
-                            if let Some(messages) = history.messages {
-                                for msg in messages.iter().rev() {
-                                    if msg.subtype.is_some() {
-                                        continue;
-                                    }
-                                    if let Some(ref user) = msg.user
-                                        && Some(user) == self_user_id.as_ref()
-                                    {
-                                        continue;
-                                    }
-
-                                    if let (Some(text), Some(user), Some(ts)) =
-                                        (&msg.text, &msg.user, &msg.ts)
-                                    {
-                                        let incoming = IncomingMessage {
-                                            channel: channel.clone(),
-                                            text: text.clone(),
-                                            user: user.clone(),
-                                            timestamp: ts.clone(),
-                                        };
-
-                                        if tx.send(incoming).await.is_err() {
-                                            debug!("Subscriber channel closed");
-                                            return;
-                                        }
-
-                                        last_ts = Some(ts.clone());
-                                    }
-                                }
-
-                                if last_ts.is_none()
-                                    && let Some(newest) = messages.first()
-                                {
-                                    last_ts = newest.ts.clone();
-                                }
-                            }
-                        }
-                    }
+                let response = match resp {
+                    Ok(r) => r,
                     Err(e) => {
                         error!("Failed to poll messages: {e}");
+                        continue;
+                    }
+                };
+
+                let history: ConversationsHistoryResponse = match response.json().await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!("Failed to parse conversations.history: {e}");
+                        continue;
+                    }
+                };
+
+                if !history.ok {
+                    warn!("conversations.history error: {:?}", history.error);
+                    continue;
+                }
+
+                let Some(messages) = history.messages else {
+                    continue;
+                };
+
+                // API returns newest-first; reverse for chronological delivery.
+                for msg in messages.iter().rev() {
+                    let Some(ts) = msg.ts.as_deref() else {
+                        continue;
+                    };
+
+                    // Always advance the cursor so we don't re-fetch this message
+                    // even if we end up filtering it out.
+                    if last_ts.as_deref().is_none_or(|prev| ts > prev) {
+                        last_ts = Some(ts.to_string());
+                    }
+
+                    if msg.subtype.is_some() {
+                        continue;
+                    }
+
+                    // Skip messages we ourselves posted — chat.postMessage
+                    // returns under the same user_id as the human, so we
+                    // can't filter by user; we keyed on ts at post time.
+                    let is_self_post = posted_ts
+                        .lock()
+                        .map(|s| s.contains(ts))
+                        .unwrap_or(false);
+                    if is_self_post {
+                        continue;
+                    }
+
+                    if let (Some(text), Some(user)) = (&msg.text, &msg.user) {
+                        let incoming = IncomingMessage {
+                            channel: channel.clone(),
+                            text: text.clone(),
+                            user: user.clone(),
+                            timestamp: ts.to_string(),
+                        };
+
+                        if tx.send(incoming).await.is_err() {
+                            debug!("Subscriber channel closed");
+                            return;
+                        }
                     }
                 }
             }

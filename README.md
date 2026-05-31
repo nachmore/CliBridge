@@ -82,25 +82,25 @@ Options:
 
 ## Special Commands
 
-When typing in Slack, prefix with `/` for special commands:
+When typing in Slack, prefix with `--` for special commands. (We avoid `/` because Slack treats those as native slash commands and never delivers them.)
 
 | Command | Action |
 |---------|--------|
-| `/ctrl+c` | Send interrupt (SIGINT) |
-| `/ctrl+d` | Send EOF |
-| `/ctrl+z` | Suspend (SIGTSTP) |
-| `/ctrl+l` | Clear screen |
-| `/ctrl+\` | Send SIGQUIT |
-| `/kill` | Kill the shell process |
-| `/restart` | Restart the shell |
-| `/resize 120x40` | Resize terminal |
-| `/clear` | Clear message history |
-| `/tab` | Send Tab key |
-| `/esc` | Send Escape key |
-| `/up` `/down` `/left` `/right` | Arrow keys |
-| `/tmux <key>` | Send tmux prefix (Ctrl+B) + key |
-| `/raw <hex>` | Send raw bytes (hex-encoded) |
-| `/help` | Show command help |
+| `--ctrl+c` | Send interrupt (SIGINT) |
+| `--ctrl+d` | Send EOF |
+| `--ctrl+z` | Suspend (SIGTSTP) |
+| `--ctrl+l` | Clear screen |
+| `--ctrl+\` | Send SIGQUIT |
+| `--kill` | Kill the shell process |
+| `--restart` | Restart the shell |
+| `--resize 120x40` | Resize terminal |
+| `--clear` | Clear message history |
+| `--tab` | Send Tab key |
+| `--esc` | Send Escape key |
+| `--up` `--down` `--left` `--right` | Arrow keys |
+| `--tmux <key>` | Send tmux prefix (Ctrl+B) + key |
+| `--raw <hex>` | Send raw bytes (hex-encoded) |
+| `--help` | Show command help |
 
 Any other text is sent directly as terminal input with a newline appended.
 

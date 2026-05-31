@@ -54,17 +54,17 @@ pub enum ParsedInput {
     Text(String),
 }
 
-const COMMAND_PREFIX: char = '/';
+const COMMAND_PREFIX: &str = "--";
 
 /// Parse a message from the messaging platform into either a command or text input.
 pub fn parse_input(input: &str) -> ParsedInput {
     let trimmed = input.trim();
 
-    if !trimmed.starts_with(COMMAND_PREFIX) {
+    let Some(rest) = trimmed.strip_prefix(COMMAND_PREFIX) else {
         return ParsedInput::Text(input.to_string());
-    }
+    };
 
-    let parts: Vec<&str> = trimmed[1..].splitn(2, ' ').collect();
+    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
     let cmd = parts[0].to_lowercase();
     let arg = parts.get(1).map(|s| s.trim());
 
@@ -161,21 +161,21 @@ pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
 /// Generate help text listing all available commands.
 pub fn help_text() -> String {
     r#"*CliBridge Commands:*
-• `/ctrl+c` — Send interrupt (SIGINT)
-• `/ctrl+d` — Send EOF
-• `/ctrl+z` — Suspend (SIGTSTP)
-• `/ctrl+l` — Clear screen
-• `/ctrl+\` — Send SIGQUIT
-• `/kill` — Kill the shell process
-• `/restart` — Restart the shell
-• `/resize 120x40` — Resize terminal (cols x rows)
-• `/clear` — Clear message history
-• `/tab` — Send Tab key
-• `/esc` — Send Escape key
-• `/up` `/down` `/left` `/right` — Arrow keys
-• `/tmux <key>` — Send tmux prefix + key
-• `/raw <hex>` — Send raw bytes (hex-encoded)
-• `/help` — Show this help
+• `--ctrl+c` — Send interrupt (SIGINT)
+• `--ctrl+d` — Send EOF
+• `--ctrl+z` — Suspend (SIGTSTP)
+• `--ctrl+l` — Clear screen
+• `--ctrl+\` — Send SIGQUIT
+• `--kill` — Kill the shell process
+• `--restart` — Restart the shell
+• `--resize 120x40` — Resize terminal (cols x rows)
+• `--clear` — Clear message history
+• `--tab` — Send Tab key
+• `--esc` — Send Escape key
+• `--up` `--down` `--left` `--right` — Arrow keys
+• `--tmux <key>` — Send tmux prefix + key
+• `--raw <hex>` — Send raw bytes (hex-encoded)
+• `--help` — Show this help
 
 Any other text is sent directly as terminal input."#
         .to_string()
@@ -202,11 +202,11 @@ mod tests {
     #[test]
     fn test_parse_ctrl_c() {
         assert_eq!(
-            parse_input("/ctrl+c"),
+            parse_input("--ctrl+c"),
             ParsedInput::Command(SpecialCommand::CtrlC)
         );
         assert_eq!(
-            parse_input("/cc"),
+            parse_input("--cc"),
             ParsedInput::Command(SpecialCommand::CtrlC)
         );
     }
@@ -220,9 +220,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_slash_is_text() {
+        // Slash messages are Slack slash commands and shouldn't reach us, but
+        // if they do we treat them as plain text.
+        assert_eq!(
+            parse_input("/help"),
+            ParsedInput::Text("/help".to_string())
+        );
+    }
+
+    #[test]
     fn test_parse_resize() {
         assert_eq!(
-            parse_input("/resize 120x40"),
+            parse_input("--resize 120x40"),
             ParsedInput::Command(SpecialCommand::Resize(TerminalSize {
                 cols: 120,
                 rows: 40
@@ -233,15 +243,15 @@ mod tests {
     #[test]
     fn test_parse_unknown_command_passes_through() {
         assert_eq!(
-            parse_input("/unknown"),
-            ParsedInput::Text("/unknown".to_string())
+            parse_input("--unknown"),
+            ParsedInput::Text("--unknown".to_string())
         );
     }
 
     #[test]
     fn test_parse_tmux() {
         assert_eq!(
-            parse_input("/tmux d"),
+            parse_input("--tmux d"),
             ParsedInput::Command(SpecialCommand::Tmux("d".to_string()))
         );
     }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use tracing::{error, info};
 
@@ -9,7 +11,12 @@ use bridge_core::messaging::MessagingClient;
 use bridge_core::terminal::TerminalBackend;
 use bridge_core::types::TerminalSize;
 use bridge_pty::PtyBackend;
-use bridge_slack::{SlackClient, TuiRenderer};
+use bridge_slack::{RenderedOutput, SlackClient, TuiRenderer};
+
+/// How often we drain the renderer and post to Slack. Slack's rate limit on
+/// chat.postMessage is ~1 message/second per channel, so we tick a hair above
+/// that to stay safely under it.
+const RENDER_TICK: Duration = Duration::from_millis(1100);
 
 /// Main bridge loop: connects PTY output to Slack and Slack input to PTY.
 pub async fn run(
@@ -49,7 +56,7 @@ pub async fn run(
     slack
         .send_message(
             channel,
-            "🖥️ *CliBridge session started*\nType commands here or use `/help` for special commands.",
+            "🖥️ *CliBridge session started*\nType commands here or use `--help` for special commands.",
         )
         .await?;
 
@@ -65,36 +72,22 @@ pub async fn run(
 
     let mut renderer = TuiRenderer::new(size.cols, size.rows);
     let mut current_message_id: Option<String> = None;
+    let mut tick = tokio::time::interval(RENDER_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            // Pull terminal output and buffer it. Posting happens on the tick
+            // below so a burst of bytes turns into one Slack message instead
+            // of one per chunk.
             Some(data) = output_rx.recv() => {
-                if let Some(rendered) = renderer.process(&data) {
-                    if rendered.text.is_empty() {
-                        continue;
-                    }
+                renderer.process(&data);
+            }
 
-                    if rendered.is_edit {
-                        if let Some(ref msg_id) = current_message_id {
-                            if let Err(e) = slack.edit_message(channel, msg_id, &rendered.text).await {
-                                error!("Failed to edit message: {e}");
-                                match slack.send_message(channel, &rendered.text).await {
-                                    Ok(ts) => current_message_id = Some(ts),
-                                    Err(e) => error!("Failed to send message: {e}"),
-                                }
-                            }
-                        } else {
-                            match slack.send_message(channel, &rendered.text).await {
-                                Ok(ts) => current_message_id = Some(ts),
-                                Err(e) => error!("Failed to send message: {e}"),
-                            }
-                        }
-                    } else {
-                        match slack.send_message(channel, &rendered.text).await {
-                            Ok(ts) => current_message_id = Some(ts),
-                            Err(e) => error!("Failed to send message: {e}"),
-                        }
-                    }
+            // Drain the renderer and post.
+            _ = tick.tick() => {
+                if let Some(rendered) = renderer.take_pending() {
+                    post_or_edit(&slack, channel, rendered, &mut current_message_id).await;
                 }
             }
 
@@ -103,7 +96,11 @@ pub async fn run(
                 match parsed {
                     ParsedInput::Text(text) => {
                         let mut bytes = text.into_bytes();
-                        bytes.push(b'\n');
+                        // Submit the line. ConPTY (cmd.exe / PowerShell) needs CR;
+                        // Unix shells accept either CR or LF, so CR alone works
+                        // for everyone. \n on Windows just appends a literal
+                        // newline to the line buffer without submitting it.
+                        bytes.push(b'\r');
                         if input_tx.send(bytes).await.is_err() {
                             error!("PTY input channel closed");
                             break;
@@ -153,8 +150,8 @@ pub async fn run(
 
             else => {
                 if !pty.is_alive() {
-                    if let Some(rendered) = renderer.flush() {
-                        let _ = slack.send_message(channel, &rendered.text).await;
+                    if let Some(rendered) = renderer.take_pending() {
+                        post_or_edit(&slack, channel, rendered, &mut current_message_id).await;
                     }
                     slack.send_message(channel, "⚡ Shell process exited.").await?;
                     break;
@@ -165,4 +162,33 @@ pub async fn run(
 
     info!("Bridge session ended");
     Ok(())
+}
+
+/// Post the rendered chunk, or edit the current message in place for TUI frames.
+/// Falls back to a fresh post if editing fails (e.g. message was deleted).
+async fn post_or_edit(
+    slack: &SlackClient,
+    channel: &str,
+    rendered: RenderedOutput,
+    current_message_id: &mut Option<String>,
+) {
+    if rendered.text.is_empty() {
+        return;
+    }
+
+    if rendered.is_edit
+        && let Some(msg_id) = current_message_id.as_deref()
+    {
+        match slack.edit_message(channel, msg_id, &rendered.text).await {
+            Ok(()) => return,
+            Err(e) => {
+                error!("Failed to edit message, falling back to new post: {e}");
+            }
+        }
+    }
+
+    match slack.send_message(channel, &rendered.text).await {
+        Ok(ts) => *current_message_id = Some(ts),
+        Err(e) => error!("Failed to send message: {e}"),
+    }
 }
