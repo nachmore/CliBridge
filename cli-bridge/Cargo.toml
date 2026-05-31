@@ -1,0 +1,19 @@
+[package]
+name = "cli-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bridge-core = { path = "../crates/bridge-core" }
+bridge-pty = { path = "../crates/bridge-pty" }
+bridge-auth = { path = "../crates/bridge-auth" }
+bridge-slack = { path = "../crates/bridge-slack" }
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+serde.workspace = true
+dirs.workspace = true
