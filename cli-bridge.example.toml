@@ -1,0 +1,23 @@
+# CliBridge configuration
+# Place this file at:
+#   ./cli-bridge.toml (project-local)
+#   ~/.config/cli-bridge/config.toml (user-global)
+
+# Slack channel ID to bridge to (required)
+# Find this in Slack: right-click channel > View channel details > scroll to bottom
+# channel = "C0123456789"
+
+# Shell command to spawn (default: cmd.exe on Windows, $SHELL on Mac/Linux)
+# shell = "cmd.exe"
+# shell = "/bin/zsh"
+# shell = "powershell.exe"
+
+# Workspace name (as saved by --extract-tokens) or URL
+# workspace = "My Workspace"
+
+# Terminal dimensions (default: 80x24)
+# cols = 120
+# rows = 40
+
+# Minimum seconds between Slack message updates in TUI mode (default: 1)
+# update_interval_secs = 1
