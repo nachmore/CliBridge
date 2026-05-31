@@ -89,7 +89,9 @@ mod commands {
 
     pub fn login() -> Result<()> {
         println!("Opening Slack login window…");
-        println!("Sign in to your workspace; the window will close automatically once credentials are captured.");
+        println!(
+            "Sign in to your workspace; the window will close automatically once credentials are captured."
+        );
 
         let mut credentials = browser_login()?;
 

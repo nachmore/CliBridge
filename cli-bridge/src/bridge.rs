@@ -166,6 +166,11 @@ pub async fn run(
 
 /// Post the rendered chunk, or edit the current message in place for TUI frames.
 /// Falls back to a fresh post if editing fails (e.g. message was deleted).
+///
+/// `current_message_id` is the ts of the message TUI frames edit each tick.
+/// Streaming chunks always post anew and never become the edit target — that
+/// keeps prior streaming output intact and avoids overwriting it with the
+/// next TUI frame.
 async fn post_or_edit(
     slack: &SlackClient,
     channel: &str,
@@ -183,12 +188,17 @@ async fn post_or_edit(
             Ok(()) => return,
             Err(e) => {
                 error!("Failed to edit message, falling back to new post: {e}");
+                *current_message_id = None;
             }
         }
     }
 
     match slack.send_message(channel, &rendered.text).await {
-        Ok(ts) => *current_message_id = Some(ts),
+        Ok(ts) => {
+            if rendered.is_edit {
+                *current_message_id = Some(ts);
+            }
+        }
         Err(e) => error!("Failed to send message: {e}"),
     }
 }

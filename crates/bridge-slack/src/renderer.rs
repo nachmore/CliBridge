@@ -21,6 +21,11 @@ pub struct TuiRenderer {
     tui_mode: bool,
     /// Accumulated streaming output, drained by `take_pending`.
     line_buffer: String,
+    /// Streaming text left over when we transitioned into TUI mode mid-stream.
+    /// Returned (and cleared) by the next `take_pending` so we don't lose the
+    /// pre-TUI output. Held separately because once `tui_mode` is on, the next
+    /// `take_pending` would otherwise return a TUI frame.
+    pending_handoff: Option<String>,
     /// Whether the TUI screen has changed since the last `take_pending`.
     dirty: bool,
 }
@@ -37,6 +42,7 @@ impl TuiRenderer {
             cursor_col: 0,
             tui_mode: false,
             line_buffer: String::new(),
+            pending_handoff: None,
             dirty: false,
         }
     }
@@ -49,6 +55,11 @@ impl TuiRenderer {
 
         if !self.tui_mode && Self::is_tui_output(&text) {
             self.tui_mode = true;
+            // Preserve whatever streaming text we'd already accumulated so
+            // it gets posted before the first TUI frame.
+            if !self.line_buffer.is_empty() {
+                self.pending_handoff = Some(std::mem::take(&mut self.line_buffer));
+            }
         }
 
         if self.tui_mode {
@@ -62,6 +73,15 @@ impl TuiRenderer {
     /// In streaming mode this empties the buffer; in TUI mode it returns
     /// the current screen and clears the dirty flag.
     pub fn take_pending(&mut self) -> Option<RenderedOutput> {
+        // Drain any leftover streaming text that was buffered before we
+        // transitioned into TUI mode. Always return it as a fresh post.
+        if let Some(chunk) = self.pending_handoff.take() {
+            return Some(RenderedOutput {
+                text: format!("```\n{chunk}```"),
+                is_edit: false,
+            });
+        }
+
         if self.tui_mode {
             if !self.dirty {
                 return None;
@@ -103,12 +123,18 @@ impl TuiRenderer {
     }
 
     fn is_tui_output(text: &str) -> bool {
-        // Only enable TUI mode for the alternate-screen-buffer escape (DECSET
-        // ?1049 or its older sibling ?47). Apps that take over the screen
-        // (vim, htop, less, tmux) emit this; cmd.exe / PowerShell prompts use
-        // ?25l and \x1b[H during normal echo on Windows ConPTY, so those alone
-        // would mis-classify regular output as a TUI frame.
-        text.contains("\x1b[?1049h") || text.contains("\x1b[?47h")
+        // Indicators a full-screen app is taking over the terminal:
+        //  - \x1b[?1049h / ?47h: alternate screen buffer (vim, htop, less, tmux)
+        //  - \x1b[2J:           full-screen clear (Claude Code, many TUIs)
+        //  - \x1b[<r>;<c>H:     two-arg cursor positioning, used to lay out boxes
+        //
+        // We deliberately do NOT trigger on bare \x1b[H or \x1b[?25l: cmd.exe
+        // and PowerShell emit those during normal prompt redraws on Windows
+        // ConPTY, so those alone would mis-classify regular output as a TUI.
+        if text.contains("\x1b[?1049h") || text.contains("\x1b[?47h") || text.contains("\x1b[2J") {
+            return true;
+        }
+        contains_two_arg_cursor_position(text)
     }
 
     fn process_tui(&mut self, text: &str) {
@@ -116,24 +142,35 @@ impl TuiRenderer {
 
         while let Some(ch) = chars.next() {
             if ch == '\x1b' {
-                // Parse ANSI escape sequence
-                if chars.peek() == Some(&'[') {
-                    chars.next(); // consume '['
-                    let mut params = String::new();
-                    while let Some(&c) = chars.peek() {
-                        if c.is_ascii_digit() || c == ';' || c == '?' {
-                            params.push(c);
+                match chars.peek() {
+                    Some(&'[') => {
+                        chars.next();
+                        let mut params = String::new();
+                        while let Some(&c) = chars.peek() {
+                            if c.is_ascii_digit() || c == ';' || c == '?' {
+                                params.push(c);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        if let Some(&cmd) = chars.peek() {
                             chars.next();
-                        } else {
-                            break;
+                            self.handle_csi(&params, cmd);
                         }
                     }
-                    if let Some(&cmd) = chars.peek() {
+                    Some(&']') => {
+                        // OSC: \x1b]<params><BEL> or \x1b]<params>\x1b\\
                         chars.next();
-                        self.handle_csi(&params, cmd);
+                        skip_osc_body(&mut chars);
                     }
+                    Some(_) => {
+                        // Single-char escapes (e.g. \x1b=, \x1b>, \x1bM). Drop
+                        // the next char so it doesn't render as a literal.
+                        chars.next();
+                    }
+                    None => {}
                 }
-                // Skip other escape sequences (OSC, etc.)
             } else {
                 self.put_char(ch);
             }
@@ -288,30 +325,96 @@ pub struct RenderedOutput {
     pub is_edit: bool,
 }
 
-/// Strip ANSI escape sequences from text.
+/// Strip ANSI escape sequences from text. Handles:
+///  - CSI: `\x1b[...<final>` where `<final>` is an ASCII letter (or `~`)
+///  - OSC: `\x1b]...\x07` (BEL terminator) or `\x1b]...\x1b\\` (ST terminator)
+///  - Single-char escapes: `\x1b<X>` for non-`[`/non-`]` introducers
+///  - Stray BEL (`\x07`), used to terminate OSC; we drop it everywhere so it
+///    can't leak into the rendered output as a literal control char.
 fn strip_ansi(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Skip the escape sequence
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                // Skip until we hit a letter
-                while let Some(&c) = chars.peek() {
+        match ch {
+            '\x1b' => match chars.peek() {
+                Some(&'[') => {
                     chars.next();
-                    if c.is_ascii_alphabetic() {
-                        break;
+                    // CSI body: parameter bytes (0x30-0x3F), intermediate
+                    // bytes (0x20-0x2F), then a final byte (0x40-0x7E).
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if (0x40..=0x7E).contains(&(c as u32)) {
+                            break;
+                        }
                     }
                 }
+                Some(&']') => {
+                    chars.next();
+                    skip_osc_body(&mut chars);
+                }
+                Some(_) => {
+                    // Two-byte escape (\x1b=, \x1b>, \x1bM, etc.) — drop both.
+                    chars.next();
+                }
+                None => {}
+            },
+            '\x07' => {
+                // Stray BEL — drop. We already swallow it as the OSC terminator
+                // above, but ConPTY occasionally emits it on its own.
             }
-        } else {
-            result.push(ch);
+            _ => result.push(ch),
         }
     }
 
     result
+}
+
+/// Consume an OSC body up to and including its terminator.
+/// Body ends at BEL (0x07) or ST (`\x1b\\`).
+fn skip_osc_body<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
+    while let Some(c) = chars.next() {
+        if c == '\x07' {
+            return;
+        }
+        if c == '\x1b' && chars.peek() == Some(&'\\') {
+            chars.next();
+            return;
+        }
+    }
+}
+
+/// Heuristic: does `text` contain a CSI cursor-position escape with at least
+/// one explicit parameter (e.g. `\x1b[3;5H`)? Bare `\x1b[H` is excluded because
+/// cmd.exe uses it for prompt redraws. Apps that lay out boxes via absolute
+/// positioning (Claude Code, ncurses-style TUIs) emit the parameterized form.
+fn contains_two_arg_cursor_position(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            let mut saw_digit = false;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if b.is_ascii_digit() || b == b';' {
+                    if b.is_ascii_digit() {
+                        saw_digit = true;
+                    }
+                    j += 1;
+                } else {
+                    if saw_digit && (b == b'H' || b == b'f') {
+                        return true;
+                    }
+                    break;
+                }
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -344,13 +447,15 @@ mod tests {
 
     #[test]
     fn test_tui_detection() {
-        // Only alternate-screen escapes flip TUI mode.
+        // Triggers TUI mode:
         assert!(TuiRenderer::is_tui_output("\x1b[?1049h"));
         assert!(TuiRenderer::is_tui_output("\x1b[?47h"));
-        // Cmd.exe / PowerShell echo includes these but is NOT a TUI app.
+        assert!(TuiRenderer::is_tui_output("\x1b[2J"));
+        assert!(TuiRenderer::is_tui_output("\x1b[3;5Hx"));
+        // Does NOT trigger (cmd.exe / PowerShell prompt echo):
         assert!(!TuiRenderer::is_tui_output("\x1b[H"));
         assert!(!TuiRenderer::is_tui_output("\x1b[?25l"));
-        assert!(!TuiRenderer::is_tui_output("\x1b[2J"));
+        assert!(!TuiRenderer::is_tui_output("\x1b[?25l\x1b[H"));
         assert!(!TuiRenderer::is_tui_output("plain text"));
     }
 
@@ -379,6 +484,77 @@ mod tests {
     fn test_strip_ansi() {
         assert_eq!(strip_ansi("\x1b[32mgreen\x1b[0m"), "green");
         assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_window_title() {
+        // cmd.exe sets the window title via OSC 0: \x1b]0;TITLE\x07
+        assert_eq!(
+            strip_ansi("before\x1b]0;C:\\Windows\\system32\\cmd.exe\x07after"),
+            "beforeafter"
+        );
+        // ST-terminated form
+        assert_eq!(strip_ansi("a\x1b]0;title\x1b\\b"), "ab");
+    }
+
+    #[test]
+    fn test_strip_ansi_stray_bel() {
+        assert_eq!(strip_ansi("hi\x07there"), "hithere");
+    }
+
+    #[test]
+    fn test_strip_ansi_two_byte_escape() {
+        // \x1b= and \x1b> are application-keypad escapes; both bytes drop.
+        assert_eq!(strip_ansi("a\x1b=b\x1b>c"), "abc");
+    }
+
+    #[test]
+    fn test_streaming_drops_window_title() {
+        // Regression: dir output used to leak the OSC body and BEL into Slack.
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"line1\n\x1b]0;C:\\WINDOWS\\system32\\cmd.exe\x07line2\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(!out.is_edit);
+        assert!(out.text.contains("line1"));
+        assert!(out.text.contains("line2"));
+        assert!(!out.text.contains(']'));
+        assert!(!out.text.contains('\x07'));
+        assert!(!out.text.contains("cmd.exe"));
+    }
+
+    #[test]
+    fn test_two_arg_cursor_position_detected() {
+        // Apps that lay out boxes use parameterized H, e.g. claude-code.
+        assert!(contains_two_arg_cursor_position("\x1b[3;5Hhi"));
+        assert!(contains_two_arg_cursor_position("\x1b[10Hbar"));
+        assert!(contains_two_arg_cursor_position("\x1b[2;1f"));
+        // Bare \x1b[H is cmd.exe's prompt redraw — must NOT trigger TUI mode.
+        assert!(!contains_two_arg_cursor_position("\x1b[H"));
+        assert!(!contains_two_arg_cursor_position("\x1b[?25l\x1b[H"));
+        assert!(!contains_two_arg_cursor_position("plain"));
+    }
+
+    #[test]
+    fn test_tui_mode_triggers_on_screen_clear() {
+        // \x1b[2J alone is enough — Claude Code uses it to (re)paint.
+        let mut renderer = TuiRenderer::new(20, 5);
+        renderer.process(b"\x1b[2J\x1b[1;1Hhi");
+        assert!(renderer.is_tui_mode());
+    }
+
+    #[test]
+    fn test_handoff_streaming_then_tui() {
+        // Pre-TUI streaming output should be posted as its own streaming
+        // message before the first TUI frame is emitted.
+        let mut renderer = TuiRenderer::new(20, 5);
+        renderer.process(b"about to launch tui\n");
+        renderer.process(b"\x1b[?1049h\x1b[2J\x1b[1;1Hframe");
+        let first = renderer.take_pending().unwrap();
+        assert!(!first.is_edit, "handoff should post, not edit");
+        assert!(first.text.contains("about to launch tui"));
+        let second = renderer.take_pending().unwrap();
+        assert!(second.is_edit, "subsequent TUI frame should edit");
+        assert!(second.text.contains("frame"));
     }
 
     #[test]

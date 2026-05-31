@@ -298,7 +298,9 @@ impl MessagingClient for SlackClient {
             .await
         {
             Ok(resp) => match resp.json::<ConversationsHistoryResponse>().await {
-                Ok(h) if h.ok => h.messages.and_then(|m| m.first().and_then(|x| x.ts.clone())),
+                Ok(h) if h.ok => h
+                    .messages
+                    .and_then(|m| m.first().and_then(|x| x.ts.clone())),
                 Ok(h) => {
                     warn!("seed conversations.history error: {:?}", h.error);
                     None
@@ -386,10 +388,7 @@ impl MessagingClient for SlackClient {
                     // Skip messages we ourselves posted — chat.postMessage
                     // returns under the same user_id as the human, so we
                     // can't filter by user; we keyed on ts at post time.
-                    let is_self_post = posted_ts
-                        .lock()
-                        .map(|s| s.contains(ts))
-                        .unwrap_or(false);
+                    let is_self_post = posted_ts.lock().map(|s| s.contains(ts)).unwrap_or(false);
                     if is_self_post {
                         continue;
                     }

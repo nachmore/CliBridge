@@ -223,10 +223,7 @@ mod tests {
     fn test_parse_slash_is_text() {
         // Slash messages are Slack slash commands and shouldn't reach us, but
         // if they do we treat them as plain text.
-        assert_eq!(
-            parse_input("/help"),
-            ParsedInput::Text("/help".to_string())
-        );
+        assert_eq!(parse_input("/help"), ParsedInput::Text("/help".to_string()));
     }
 
     #[test]

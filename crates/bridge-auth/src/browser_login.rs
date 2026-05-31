@@ -106,7 +106,9 @@ struct CapturedAuth {
 /// and capture the resulting xoxc- token + slack cookies once the web client
 /// makes its first authenticated API call.
 pub fn login() -> Result<Credentials> {
-    info!("Opening Slack login window. Sign in to your workspace; this window will close automatically.");
+    info!(
+        "Opening Slack login window. Sign in to your workspace; this window will close automatically."
+    );
 
     let mut event_loop: tao::event_loop::EventLoop<UserEvent> =
         EventLoopBuilder::with_user_event().build();
