@@ -1,0 +1,35 @@
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+
+use crate::error::BridgeError;
+use crate::types::TerminalSize;
+
+/// Trait abstracting a terminal/PTY backend.
+/// Implementations handle spawning a shell and managing I/O.
+#[async_trait]
+pub trait TerminalBackend: Send {
+    /// Spawn a new shell process with the given command and size.
+    /// Returns channels for reading output and writing input.
+    async fn spawn(
+        &mut self,
+        command: &str,
+        size: TerminalSize,
+    ) -> Result<TerminalHandle, BridgeError>;
+
+    /// Resize the terminal to new dimensions.
+    fn resize(&mut self, size: TerminalSize) -> Result<(), BridgeError>;
+
+    /// Check if the child process is still running.
+    fn is_alive(&self) -> bool;
+
+    /// Kill the child process.
+    fn kill(&mut self) -> Result<(), BridgeError>;
+}
+
+/// Handle returned after spawning a terminal, providing I/O channels.
+pub struct TerminalHandle {
+    /// Receiver for terminal output bytes
+    pub output_rx: mpsc::Receiver<Vec<u8>>,
+    /// Sender for terminal input bytes
+    pub input_tx: mpsc::Sender<Vec<u8>>,
+}
