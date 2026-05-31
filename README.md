@@ -10,7 +10,7 @@ Bridge your local CLI to Slack. Interact with your terminal from anywhere — ty
 - **Special commands** — Send Ctrl+C, resize, arrow keys, tmux prefix, and more from Slack
 - **Auto token extraction** — Extracts Slack credentials from the desktop app (no bot setup needed)
 - **Modular architecture** — Platform (Windows/macOS) and client (Slack/future: Teams) abstractions
-- **Cross-platform** — Windows (ConPTY) and macOS (Unix PTY)
+- **Cross-platform** — Windows (ConPTY), macOS (Unix PTY), and Linux (Unix PTY)
 
 ## Quick Start
 
@@ -182,7 +182,7 @@ cargo clippy -- -D warnings
 
 ## CI/CD
 
-- **CI** (`ci.yml`): Runs on every push to main and PRs. Builds + tests on Windows and macOS ARM. Uploads debug artifacts. Auto-dispatches nightly release on green.
+- **CI** (`ci.yml`): Runs on every push to main and PRs. Builds + tests on Windows, macOS ARM, and Linux. Uploads debug artifacts. Auto-dispatches nightly release on green.
 - **Release** (`release.yml`): Stable releases via `v*.*.*` tags. Nightly releases auto-rotated (keeps latest + previous).
 
 ## License
