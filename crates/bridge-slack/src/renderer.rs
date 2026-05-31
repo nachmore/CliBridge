@@ -169,10 +169,28 @@ impl TuiRenderer {
                 match chars.peek() {
                     Some(&'[') => {
                         chars.next();
+                        // CSI structure (ECMA-48):
+                        //   parameter bytes:    0x30-0x3F  (0-9 : ; < = > ?)
+                        //   intermediate bytes: 0x20-0x2F  (space ! " # $ % & ' ( ) * + , - . /)
+                        //   final byte:         0x40-0x7E  (@-~)
+                        // We were previously only accepting digits, ';' and '?',
+                        // so e.g. Kitty's \x1b[>1u (with '>' as a parameter
+                        // byte) terminated parsing early at '>', and "1u" then
+                        // rendered as literal text.
                         let mut params = String::new();
                         while let Some(&c) = chars.peek() {
-                            if c.is_ascii_digit() || c == ';' || c == '?' {
+                            let cu = c as u32;
+                            if (0x30..=0x3F).contains(&cu) {
                                 params.push(c);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        // Skip optional intermediate bytes (we don't act on them).
+                        while let Some(&c) = chars.peek() {
+                            let cu = c as u32;
+                            if (0x20..=0x2F).contains(&cu) {
                                 chars.next();
                             } else {
                                 break;
@@ -211,9 +229,14 @@ impl TuiRenderer {
     }
 
     fn handle_csi(&mut self, params: &str, cmd: char) {
-        let nums: Vec<usize> = params
+        // Strip a leading private-marker byte if present (?, <, >, =) so the
+        // numeric arg parses cleanly. We don't actually act on private CSIs;
+        // this just keeps `nums` from absorbing an empty entry that would
+        // shift the indices below.
+        let body = params.trim_start_matches(|c: char| matches!(c, '?' | '<' | '>' | '='));
+        let nums: Vec<usize> = body
             .split(';')
-            .filter(|s| !s.is_empty() && !s.starts_with('?'))
+            .filter(|s| !s.is_empty())
             .filter_map(|s| s.parse().ok())
             .collect();
 
@@ -707,6 +730,23 @@ mod tests {
         assert_eq!(strip_ansi("a\x1b_kitty stuff\x1b\\b"), "ab"); // APC
         assert_eq!(strip_ansi("a\x1b^private msg\x1b\\b"), "ab"); // PM
         assert_eq!(strip_ansi("a\x1bXstart of string\x1b\\b"), "ab"); // SOS
+    }
+
+    #[test]
+    fn test_tui_consumes_kitty_keyboard_escape() {
+        // Regression: Claude Code uses Kitty's keyboard protocol, which emits
+        // \x1b[>1u and \x1b[<u. The TUI parser used to stop at the '>' and
+        // render "1u" as literal text in the screen buffer.
+        let mut renderer = TuiRenderer::new(20, 3);
+        // Force TUI mode without otherwise touching the screen.
+        renderer.process(b"\x1b[2J\x1b[1;1H");
+        renderer.process(b"\x1b[>1u\x1b[<uhello");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.is_edit);
+        assert!(out.text.contains("hello"));
+        assert!(!out.text.contains("1u"));
+        assert!(!out.text.contains(">1"));
+        assert!(!out.text.contains('<'));
     }
 
     #[test]
