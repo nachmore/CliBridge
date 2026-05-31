@@ -7,24 +7,9 @@ license.workspace = true
 [dependencies]
 bridge-core = { path = "../bridge-core" }
 anyhow.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
-rusty-leveldb.workspace = true
-tokio.workspace = true
-async-trait.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-aes.workspace = true
-cbc.workspace = true
-pbkdf2.workspace = true
-sha1.workspace = true
 
 [dev-dependencies]
-mockall.workspace = true
 tempfile = "3"

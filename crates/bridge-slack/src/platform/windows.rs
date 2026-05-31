@@ -1,10 +1,8 @@
 use anyhow::{Result, bail};
 use rusty_leveldb::LdbIterator;
-
 use std::path::Path;
 
 /// Extract the `d` cookie from Slack's local storage on Windows.
-/// Looks in LevelDB for xoxd- values since newer Slack versions store it there.
 pub fn extract_cookie_impl(slack_dir: &Path) -> Result<String> {
     let cookies_path = slack_dir.join("Cookies");
     let network_cookies_path = slack_dir.join("Network").join("Cookies");
@@ -17,7 +15,6 @@ pub fn extract_cookie_impl(slack_dir: &Path) -> Result<String> {
         bail!("Cookie file not found. Is Slack installed?");
     };
 
-    // Look in LevelDB for the cookie, since newer Slack versions store it there.
     let local_storage_dir = path.parent().unwrap().join("Local Storage").join("leveldb");
 
     if local_storage_dir.exists() {
@@ -43,7 +40,6 @@ pub fn extract_cookie_impl(slack_dir: &Path) -> Result<String> {
     )
 }
 
-/// Find a `d` cookie value (xoxd-...) in a string.
 fn extract_d_cookie_from_value(value: &str) -> Option<String> {
     if let Some(start) = value.find("xoxd-") {
         let rest = &value[start..];

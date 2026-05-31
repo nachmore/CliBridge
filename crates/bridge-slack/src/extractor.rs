@@ -13,8 +13,6 @@ use crate::platform;
 /// The Slack desktop app stores:
 /// - User tokens (xoxc-) in a LevelDB database (localStorage)
 /// - Session cookie (d/xoxd-) in an encrypted cookie store
-///
-/// This extractor reads both to provide full API access.
 pub struct SlackTokenExtractor;
 
 impl SlackTokenExtractor {
@@ -37,7 +35,6 @@ impl SlackTokenExtractor {
             .collect())
     }
 
-    /// Find the Slack desktop app's data directory.
     fn find_slack_data_dir() -> Result<PathBuf> {
         let base = if cfg!(windows) {
             dirs::data_dir()
@@ -63,7 +60,6 @@ impl SlackTokenExtractor {
         Ok(base)
     }
 
-    /// Extract tokens from Slack's LevelDB localStorage.
     fn extract_tokens_from_leveldb(slack_dir: &Path) -> Result<Vec<WorkspaceToken>> {
         let local_storage_dir = slack_dir.join("Local Storage").join("leveldb");
 
@@ -105,13 +101,11 @@ impl SlackTokenExtractor {
         Ok(tokens)
     }
 
-    /// Parse the localConfig_v2 JSON to extract token, workspace name, and URL.
     fn parse_local_config(value: &str) -> Option<WorkspaceToken> {
         let json_start = value.find('{')?;
         let json_str = &value[json_start..];
 
         let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
-
         let teams = parsed.get("teams").or_else(|| parsed.get("workspaces"))?;
 
         if let Some(teams_obj) = teams.as_object() {

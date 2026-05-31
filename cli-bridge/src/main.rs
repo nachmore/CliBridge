@@ -84,7 +84,8 @@ fn default_shell() -> String {
 
 mod commands {
     use anyhow::Result;
-    use bridge_auth::{CredentialStore, SlackTokenExtractor};
+    use bridge_auth::CredentialStore;
+    use bridge_slack::SlackTokenExtractor;
     use tracing::info;
 
     pub async fn extract_tokens() -> Result<()> {
