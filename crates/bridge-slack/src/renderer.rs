@@ -26,6 +26,12 @@ pub struct TuiRenderer {
     /// pre-TUI output. Held separately because once `tui_mode` is on, the next
     /// `take_pending` would otherwise return a TUI frame.
     pending_handoff: Option<String>,
+    /// Bytes carried over from the previous `process()` call. ConPTY (and PTYs
+    /// in general) chunk output without regard to escape-sequence or UTF-8
+    /// boundaries — a chunk can end mid-`\x1b[1;4;2m`, mid-OSC, or mid-codepoint.
+    /// We stash any incomplete trailing bytes here and prepend them to the next
+    /// chunk so the parser only ever sees complete units.
+    input_carry: Vec<u8>,
     /// Whether the TUI screen has changed since the last `take_pending`.
     dirty: bool,
 }
@@ -43,6 +49,7 @@ impl TuiRenderer {
             tui_mode: false,
             line_buffer: String::new(),
             pending_handoff: None,
+            input_carry: Vec::new(),
             dirty: false,
         }
     }
@@ -51,7 +58,24 @@ impl TuiRenderer {
     /// allocation-light; the bridge calls `take_pending()` on a tick to actually
     /// produce a message.
     pub fn process(&mut self, data: &[u8]) {
-        let text = String::from_utf8_lossy(data);
+        // Combine carry from the previous chunk with this one. ConPTY likes
+        // to slice in the middle of \x1b[1;4;2m and the like; without this
+        // step we'd render fragments as literal "u1u4;2m" garbage.
+        let mut bytes: Vec<u8> = Vec::with_capacity(self.input_carry.len() + data.len());
+        bytes.extend_from_slice(&self.input_carry);
+        bytes.extend_from_slice(data);
+        self.input_carry.clear();
+
+        let process_end = find_process_end(&bytes);
+        if process_end < bytes.len() {
+            self.input_carry.extend_from_slice(&bytes[process_end..]);
+        }
+        let to_process = &bytes[..process_end];
+        if to_process.is_empty() {
+            return;
+        }
+
+        let text = String::from_utf8_lossy(to_process);
 
         if !self.tui_mode && Self::is_tui_output(&text) {
             self.tui_mode = true;
@@ -325,6 +349,119 @@ pub struct RenderedOutput {
     pub is_edit: bool,
 }
 
+/// Walk `bytes` and return the offset at which the last *complete* unit ends.
+/// A unit is one of: a UTF-8 codepoint, a CSI sequence (`\x1b[...<final>`),
+/// an OSC sequence (`\x1b]...<terminator>`), or a two-byte ESC sequence.
+/// Bytes from the returned offset to the end should be carried over to the
+/// next chunk so the parser never sees a half-finished sequence.
+fn find_process_end(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if b == 0x1b {
+            // ESC alone — wait for follow-up byte.
+            let Some(&next) = bytes.get(i + 1) else {
+                return i;
+            };
+            match next {
+                b'[' => {
+                    // CSI: zero or more parameter bytes (0x30-0x3F) and
+                    // intermediate bytes (0x20-0x2F), then a final (0x40-0x7E).
+                    let mut j = i + 2;
+                    let mut found_final = false;
+                    while let Some(&c) = bytes.get(j) {
+                        if (0x40..=0x7E).contains(&c) {
+                            j += 1;
+                            found_final = true;
+                            break;
+                        }
+                        if (0x20..=0x3F).contains(&c) {
+                            j += 1;
+                        } else {
+                            // Anything else aborts the sequence — treat what
+                            // we've seen as complete so the loop advances.
+                            found_final = true;
+                            break;
+                        }
+                    }
+                    if !found_final {
+                        // Ran out of bytes before the final byte arrived —
+                        // carry from the ESC.
+                        return i;
+                    }
+                    i = j;
+                }
+                b']' => {
+                    // OSC: scan until BEL (0x07) or ST (\x1b\\).
+                    let mut j = i + 2;
+                    let mut completed = false;
+                    while j < bytes.len() {
+                        let c = bytes[j];
+                        if c == 0x07 {
+                            i = j + 1;
+                            completed = true;
+                            break;
+                        }
+                        if c == 0x1b {
+                            if let Some(&after) = bytes.get(j + 1) {
+                                if after == b'\\' {
+                                    i = j + 2;
+                                    completed = true;
+                                }
+                                // else: nested ESC, treat OSC as still open
+                            } else {
+                                // Trailing ESC inside OSC — incomplete.
+                                return i;
+                            }
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if !completed {
+                        return i;
+                    }
+                }
+                _ => {
+                    // Two-byte ESC sequence: \x1b followed by one byte.
+                    i += 2;
+                }
+            }
+            continue;
+        }
+
+        // Regular byte. Check for a partial UTF-8 codepoint at the tail.
+        if b < 0x80 {
+            i += 1;
+        } else {
+            let need = utf8_seq_len(b);
+            if need == 0 {
+                // Invalid leading byte — pass it through so from_utf8_lossy
+                // turns it into U+FFFD.
+                i += 1;
+            } else if i + need <= bytes.len() {
+                i += need;
+            } else {
+                // Incomplete codepoint at the tail.
+                return i;
+            }
+        }
+    }
+    i
+}
+
+/// Length in bytes of the UTF-8 sequence starting with `lead`, or 0 if `lead`
+/// is not a valid leading byte.
+fn utf8_seq_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 0,
+    }
+}
+
 /// Strip ANSI escape sequences from text. Handles:
 ///  - CSI: `\x1b[...<final>` where `<final>` is an ASCII letter (or `~`)
 ///  - OSC: `\x1b]...\x07` (BEL terminator) or `\x1b]...\x1b\\` (ST terminator)
@@ -540,6 +677,70 @@ mod tests {
         let mut renderer = TuiRenderer::new(20, 5);
         renderer.process(b"\x1b[2J\x1b[1;1Hhi");
         assert!(renderer.is_tui_mode());
+    }
+
+    #[test]
+    fn test_carry_split_csi() {
+        // ConPTY chunks output without regard to escape boundaries. A split
+        // mid-CSI must NOT leak into the rendered text as literal bytes.
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"hello \x1b[1");
+        renderer.process(b";4;2mworld\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("hello "));
+        assert!(out.text.contains("world"));
+        assert!(!out.text.contains("u1u4"));
+        assert!(!out.text.contains(';'));
+        assert!(!out.text.contains("[1"));
+    }
+
+    #[test]
+    fn test_carry_lone_esc_at_chunk_end() {
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"abc\x1b");
+        renderer.process(b"[31mred\x1b[0m\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("abc"));
+        assert!(out.text.contains("red"));
+        assert!(!out.text.contains('['));
+    }
+
+    #[test]
+    fn test_carry_split_osc() {
+        // OSC body split across chunks (cmd.exe sends \x1b]0;TITLE\x07).
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"line1\n\x1b]0;C:\\WINDOWS");
+        renderer.process(b"\\system32\\cmd.exe\x07line2\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("line1"));
+        assert!(out.text.contains("line2"));
+        assert!(!out.text.contains("cmd.exe"));
+        assert!(!out.text.contains('\x07'));
+    }
+
+    #[test]
+    fn test_carry_split_utf8() {
+        // 'ä' is two bytes (0xC3 0xA4); split between them.
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(&[b'h', b'i', 0xC3]);
+        renderer.process(&[0xA4, b'\n']);
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("hiä"));
+        assert!(!out.text.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn test_carry_split_multibyte_utf8() {
+        // 4-byte codepoint (a CJK extension B character) split 1+3.
+        let bytes = "𠮷".as_bytes();
+        assert_eq!(bytes.len(), 4);
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(&bytes[..1]);
+        renderer.process(&bytes[1..]);
+        renderer.process(b"\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("𠮷"));
+        assert!(!out.text.contains('\u{FFFD}'));
     }
 
     #[test]
