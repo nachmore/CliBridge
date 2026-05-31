@@ -18,6 +18,10 @@ use bridge_slack::{RenderedOutput, SlackClient, TuiRenderer};
 /// that to stay safely under it.
 const RENDER_TICK: Duration = Duration::from_millis(1100);
 
+/// How long to wait for the goodbye Slack post when the user hits Ctrl+C.
+/// Best-effort: if the network is wedged we'd rather exit than hang.
+const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Main bridge loop: connects PTY output to Slack and Slack input to PTY.
 pub async fn run(
     channel: &str,
@@ -74,6 +78,7 @@ pub async fn run(
     let mut current_message_id: Option<String> = None;
     let mut tick = tokio::time::interval(RENDER_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut interrupted = false;
 
     loop {
         tokio::select! {
@@ -89,6 +94,15 @@ pub async fn run(
                 if let Some(rendered) = renderer.take_pending() {
                     post_or_edit(&slack, channel, rendered, &mut current_message_id).await;
                 }
+            }
+
+            // Ctrl+C in the local terminal: notify Slack (best effort) and
+            // exit cleanly. Without this, tokio::signal kills the process
+            // immediately and the channel is left hanging on the prior message.
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C received, shutting down");
+                interrupted = true;
+                break;
             }
 
             Some(msg) = message_rx.recv() => {
@@ -158,6 +172,29 @@ pub async fn run(
                 }
             }
         }
+    }
+
+    if interrupted {
+        // Try to flush any pending output and post a goodbye, but don't let a
+        // wedged network keep us from exiting. Best effort — if Slack is slow
+        // we still want Ctrl+C to feel like Ctrl+C.
+        if let Some(rendered) = renderer.take_pending() {
+            let _ = tokio::time::timeout(
+                SHUTDOWN_POST_TIMEOUT,
+                post_or_edit(&slack, channel, rendered, &mut current_message_id),
+            )
+            .await;
+        }
+        let _ = tokio::time::timeout(
+            SHUTDOWN_POST_TIMEOUT,
+            slack.send_message(
+                channel,
+                "👋 *CliBridge session ended* (interrupted by host)",
+            ),
+        )
+        .await;
+        // Best-effort kill so the shell process doesn't outlive us.
+        let _ = pty.kill();
     }
 
     info!("Bridge session ended");
