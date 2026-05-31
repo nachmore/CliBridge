@@ -76,7 +76,7 @@ Options:
   -w, --workspace <WORKSPACE>  Workspace name or URL
       --url <URL>              Slack API base URL (for enterprise grids)
       --cols <COLS>            Terminal width in columns (default: 120)
-      --rows <ROWS>            Terminal height in rows (default: 40)
+      --rows <ROWS>            Terminal height in rows (default: 24)
       --config <CONFIG>        Path to config file
       --login                  Open browser to sign in to Slack
       --list-workspaces        List saved workspaces

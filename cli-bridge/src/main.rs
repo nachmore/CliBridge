@@ -31,7 +31,9 @@ struct Cli {
     #[arg(long)]
     cols: Option<u16>,
 
-    /// Terminal height in rows (default: 40)
+    /// Terminal height in rows (default: 24). Bumping this just makes the
+    /// rendered TUI frame taller in Slack, since trailing-whitespace rows are
+    /// trimmed — width is what gets you nicer layouts.
     #[arg(long)]
     rows: Option<u16>,
 
@@ -80,12 +82,12 @@ async fn main() -> Result<()> {
 
     let workspace = cli.workspace.or(config.workspace.clone());
 
-    // Terminal size: CLI > config > default. Default is 120x40 — wide enough
-    // for most TUIs to lay out side-by-side panels without overflowing Slack's
-    // code-block render.
+    // Terminal size: CLI > config > default. 120 cols gives TUIs room to lay
+    // out side-by-side panels without overflowing Slack's code-block render;
+    // 24 rows keeps the rendered frame about as tall as a normal terminal.
     let size = bridge_core::types::TerminalSize {
         cols: cli.cols.or(config.cols).unwrap_or(120),
-        rows: cli.rows.or(config.rows).unwrap_or(40),
+        rows: cli.rows.or(config.rows).unwrap_or(24),
     };
 
     bridge::run(

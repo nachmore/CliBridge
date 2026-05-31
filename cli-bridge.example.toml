@@ -15,9 +15,9 @@
 # Workspace name (as saved by --login) or URL
 # workspace = "My Workspace"
 
-# Terminal dimensions (default: 120x40)
+# Terminal dimensions (default: 120 cols x 24 rows)
 # cols = 120
-# rows = 40
+# rows = 24
 
 # Minimum seconds between Slack message updates in TUI mode (default: 1)
 # update_interval_secs = 1
