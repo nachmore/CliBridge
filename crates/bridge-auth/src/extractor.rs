@@ -204,6 +204,7 @@ impl SlackTokenExtractor {
 }
 
 /// Helper to find a `d` cookie value (xoxd-...) in a string.
+#[cfg(windows)]
 fn extract_d_cookie_from_value(value: &str) -> Option<String> {
     if let Some(start) = value.find("xoxd-") {
         let rest = &value[start..];
@@ -252,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn test_extract_d_cookie() {
         let value = r#"something "xoxd-abc123def456" other"#;
         let cookie = extract_d_cookie_from_value(value).unwrap();
@@ -259,6 +261,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn test_extract_d_cookie_not_found() {
         let value = "no cookie here";
         assert!(extract_d_cookie_from_value(value).is_none());
