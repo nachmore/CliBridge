@@ -1,0 +1,70 @@
+[workspace]
+members = ["crates/*", "cli-bridge"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/nachmore/CliBridge"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "cookies"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# PTY
+portable-pty = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# LevelDB for token extraction
+rusty-leveldb = "3"
+
+# Crypto for cookie decryption
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+sha1 = "0.10"
+
+# Platform-specific
+windows = { version = "0.58", features = ["Win32_Security_Cryptography"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Testing
+mockall = "0.13"
+
+# Async
+async-trait = "0.1"
+futures = "0.3"
+
+# Config directories
+dirs = "6"
+
+# UUID for message tracking
+uuid = { version = "1", features = ["v4"] }
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
