@@ -18,17 +18,21 @@ struct Cli {
     #[arg(short, long)]
     shell: Option<String>,
 
-    /// Workspace name or URL to connect to
+    /// Workspace name or URL (selects credentials saved by `--login`)
     #[arg(short, long)]
     workspace: Option<String>,
+
+    /// Slack API base URL (default: https://slack.com/api, enterprise: https://myco.enterprise.slack.com/api)
+    #[arg(long)]
+    url: Option<String>,
 
     /// Path to config file
     #[arg(long)]
     config: Option<String>,
 
-    /// Extract tokens from Slack desktop app and save them
+    /// Open a browser window to sign in to Slack and save credentials
     #[arg(long)]
-    extract_tokens: bool,
+    login: bool,
 
     /// List saved workspaces
     #[arg(long)]
@@ -37,7 +41,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -46,18 +49,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Load config (file -> env -> CLI args, with CLI taking precedence)
     let config = AppConfig::load(cli.config.as_deref())?;
 
-    if cli.extract_tokens {
-        return commands::extract_tokens().await;
+    if cli.login {
+        return commands::login();
     }
 
     if cli.list_workspaces {
         return commands::list_workspaces();
     }
 
-    // Determine final settings
     let channel = cli
         .channel
         .or(config.channel.clone())
@@ -70,8 +71,7 @@ async fn main() -> Result<()> {
 
     let workspace = cli.workspace.or(config.workspace.clone());
 
-    // Run the bridge
-    bridge::run(&channel, &shell, workspace.as_deref()).await
+    bridge::run(&channel, &shell, workspace.as_deref(), cli.url.as_deref()).await
 }
 
 fn default_shell() -> String {
@@ -84,30 +84,34 @@ fn default_shell() -> String {
 
 mod commands {
     use anyhow::Result;
-    use bridge_auth::CredentialStore;
-    use bridge_slack::SlackTokenExtractor;
+    use bridge_auth::{CredentialStore, login as browser_login};
     use tracing::info;
 
-    pub async fn extract_tokens() -> Result<()> {
-        println!("Extracting tokens from Slack desktop app...");
-        println!("(Make sure Slack is closed)");
+    pub fn login() -> Result<()> {
+        println!("Opening Slack login window…");
+        println!("Sign in to your workspace; the window will close automatically once credentials are captured.");
 
-        let credentials = SlackTokenExtractor::extract_all()?;
-        let store = CredentialStore::new()?;
+        let mut credentials = browser_login()?;
 
-        for cred in &credentials {
-            store.save(cred)?;
-            println!(
-                "  ✓ Saved token for: {}",
-                cred.workspace_name.as_deref().unwrap_or("Unknown")
-            );
+        // The webview can't tell us a friendly workspace name, so let the user
+        // pick one (this is what `--workspace <name>` will look up later).
+        if credentials.workspace_name.is_none() {
+            let derived = credentials
+                .workspace_url
+                .as_deref()
+                .and_then(workspace_name_from_url)
+                .unwrap_or_else(|| "default".to_string());
+            credentials.workspace_name = Some(derived);
         }
 
-        info!(
-            "Extracted and saved {} workspace token(s)",
-            credentials.len()
-        );
-        println!("\nDone! You can now run cli-bridge with --workspace <name>");
+        let store = CredentialStore::new()?;
+        store.save(&credentials)?;
+
+        let name = credentials.workspace_name.as_deref().unwrap_or("default");
+        let url = credentials.workspace_url.as_deref().unwrap_or("(none)");
+        println!("\n✓ Saved credentials for workspace '{name}' ({url})");
+        println!("Run: cli-bridge --workspace \"{name}\" --channel <CHANNEL_ID>");
+        info!("Login complete for workspace '{name}'");
         Ok(())
     }
 
@@ -116,7 +120,7 @@ mod commands {
         let workspaces = store.list_workspaces()?;
 
         if workspaces.is_empty() {
-            println!("No saved workspaces. Run with --extract-tokens first.");
+            println!("No saved workspaces. Run with --login first.");
         } else {
             println!("Saved workspaces:");
             for ws in workspaces {
@@ -124,5 +128,20 @@ mod commands {
             }
         }
         Ok(())
+    }
+
+    /// Pull a friendly workspace identifier out of an origin URL.
+    /// e.g. https://acme.enterprise.slack.com -> "acme"
+    ///      https://acme.slack.com           -> "acme"
+    ///      https://app.slack.com            -> None
+    fn workspace_name_from_url(url: &str) -> Option<String> {
+        let after_scheme = url.split("://").nth(1)?;
+        let host = after_scheme.split('/').next()?;
+        let first = host.split('.').next()?;
+        if first == "app" || first == "slack" || first.is_empty() {
+            None
+        } else {
+            Some(first.to_string())
+        }
     }
 }

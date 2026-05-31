@@ -31,17 +31,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# LevelDB for token extraction
-rusty-leveldb = "3"
-
-# Crypto for cookie decryption
-aes = "0.8"
-cbc = "0.1"
-pbkdf2 = { version = "0.12", features = ["simple"] }
-sha1 = "0.10"
-
-# Platform-specific
-windows = { version = "0.58", features = ["Win32_Security_Cryptography"] }
+# Embedded browser for Slack login (captures xoxc token + cookies)
+wry = "0.55"
+tao = "0.31"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
