@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rusty_leveldb::LdbIterator;
 use tracing::{debug, info};
 
 use bridge_core::types::Credentials;
@@ -65,31 +64,42 @@ impl SlackTokenExtractor {
 
         if !local_storage_dir.exists() {
             bail!(
-                "LevelDB directory not found at: {}. Make sure Slack is closed.",
+                "LevelDB directory not found at: {}",
                 local_storage_dir.display()
             );
         }
 
-        debug!("Reading LevelDB at: {}", local_storage_dir.display());
+        debug!("Scanning LevelDB files at: {}", local_storage_dir.display());
 
-        let opts = rusty_leveldb::Options::default();
-        let mut db = rusty_leveldb::DB::open(&local_storage_dir, opts)
-            .map_err(|e| anyhow::anyhow!("Failed to open LevelDB: {e}. Is Slack closed?"))?;
-
+        // Scan .ldb and .log files directly — avoids the LOCK file so Slack can stay open.
         let mut tokens = Vec::new();
 
-        let mut iter = db
-            .new_iter()
-            .map_err(|e| anyhow::anyhow!("Failed to create iterator: {e}"))?;
+        let entries = std::fs::read_dir(&local_storage_dir)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "ldb" && ext != "log" {
+                continue;
+            }
 
-        while let Some((key, value)) = iter.next() {
-            let key_str = String::from_utf8_lossy(&key);
-            let value_str = String::from_utf8_lossy(&value);
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
 
-            if key_str.contains("localConfig_v2")
-                && let Some(token_info) = Self::parse_local_config(&value_str)
-            {
-                tokens.push(token_info);
+            let content = String::from_utf8_lossy(&data);
+
+            // Scan for localConfig_v2 entries containing xoxc- tokens
+            for chunk in content.split("localConfig_v2") {
+                if let Some(token_info) = Self::parse_local_config(chunk) {
+                    // Deduplicate by token
+                    if !tokens
+                        .iter()
+                        .any(|t: &WorkspaceToken| t.token == token_info.token)
+                    {
+                        tokens.push(token_info);
+                    }
+                }
             }
         }
 

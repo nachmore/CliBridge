@@ -17,7 +17,6 @@ serde_json.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 uuid.workspace = true
-rusty-leveldb.workspace = true
 dirs.workspace = true
 
 [dev-dependencies]

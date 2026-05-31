@@ -1,34 +1,31 @@
 use anyhow::{Result, bail};
-use rusty_leveldb::LdbIterator;
 use std::path::Path;
 
 /// Extract the `d` cookie from Slack's local storage on Windows.
+/// Scans LevelDB files directly to avoid lock conflicts with a running Slack.
 pub fn extract_cookie_impl(slack_dir: &Path) -> Result<String> {
-    let cookies_path = slack_dir.join("Cookies");
-    let network_cookies_path = slack_dir.join("Network").join("Cookies");
+    let local_storage_dir = slack_dir.join("Local Storage").join("leveldb");
 
-    let path = if network_cookies_path.exists() {
-        network_cookies_path
-    } else if cookies_path.exists() {
-        cookies_path
-    } else {
-        bail!("Cookie file not found. Is Slack installed?");
-    };
+    if !local_storage_dir.exists() {
+        bail!("LevelDB directory not found. Is Slack installed?");
+    }
 
-    let local_storage_dir = path.parent().unwrap().join("Local Storage").join("leveldb");
+    let entries = std::fs::read_dir(&local_storage_dir)?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "ldb" && ext != "log" {
+            continue;
+        }
 
-    if local_storage_dir.exists() {
-        let opts = rusty_leveldb::Options::default();
-        if let Ok(mut db) = rusty_leveldb::DB::open(&local_storage_dir, opts) {
-            let mut iter = db
-                .new_iter()
-                .map_err(|e| anyhow::anyhow!("Iterator error: {e}"))?;
-            while let Some((_key, value)) = iter.next() {
-                let value_str = String::from_utf8_lossy(&value);
-                if let Some(cookie) = extract_d_cookie_from_value(&value_str) {
-                    return Ok(cookie);
-                }
-            }
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let content = String::from_utf8_lossy(&data);
+        if let Some(cookie) = extract_d_cookie_from_value(&content) {
+            return Ok(cookie);
         }
     }
 

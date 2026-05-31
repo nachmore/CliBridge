@@ -1,24 +1,31 @@
 use anyhow::{Result, bail};
-use rusty_leveldb::LdbIterator;
 use std::path::Path;
 
 /// Extract the `d` cookie from Slack's local storage on Linux.
-/// Slack on Linux stores cookies in the same LevelDB structure as Windows.
+/// Scans LevelDB files directly to avoid lock conflicts with a running Slack.
 pub fn extract_cookie_impl(slack_dir: &Path) -> Result<String> {
     let local_storage_dir = slack_dir.join("Local Storage").join("leveldb");
 
-    if local_storage_dir.exists() {
-        let opts = rusty_leveldb::Options::default();
-        if let Ok(mut db) = rusty_leveldb::DB::open(&local_storage_dir, opts) {
-            let mut iter = db
-                .new_iter()
-                .map_err(|e| anyhow::anyhow!("Iterator error: {e}"))?;
-            while let Some((_key, value)) = iter.next() {
-                let value_str = String::from_utf8_lossy(&value);
-                if let Some(cookie) = extract_d_cookie_from_value(&value_str) {
-                    return Ok(cookie);
-                }
-            }
+    if !local_storage_dir.exists() {
+        bail!("LevelDB directory not found. Is Slack installed?");
+    }
+
+    let entries = std::fs::read_dir(&local_storage_dir)?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "ldb" && ext != "log" {
+            continue;
+        }
+
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let content = String::from_utf8_lossy(&data);
+        if let Some(cookie) = extract_d_cookie_from_value(&content) {
+            return Ok(cookie);
         }
     }
 
