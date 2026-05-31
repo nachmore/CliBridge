@@ -13,6 +13,8 @@ use bridge_core::types::TerminalSize;
 use bridge_pty::PtyBackend;
 use bridge_slack::{RenderedOutput, SlackClient, TuiRenderer};
 
+use crate::attach::{AttachEvent, AttachServer, open_attach_terminal, print_manual_attach_hint};
+
 /// How often we drain the renderer and post to Slack. Slack's rate limit on
 /// chat.postMessage is ~1 message/second per channel, so we tick a hair above
 /// that to stay safely under it.
@@ -23,12 +25,16 @@ const RENDER_TICK: Duration = Duration::from_millis(1100);
 const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Main bridge loop: connects PTY output to Slack and Slack input to PTY.
+/// When `local` is true, also starts an attach server and auto-spawns a new
+/// terminal window running the attach client, giving the user a real local
+/// terminal that mirrors the bridge.
 pub async fn run(
     channel: &str,
     shell: &str,
     workspace: Option<&str>,
     api_url: Option<&str>,
     size: TerminalSize,
+    local: bool,
 ) -> Result<()> {
     let store = CredentialStore::new()?;
     let credentials = if let Some(ws) = workspace {
@@ -65,6 +71,32 @@ pub async fn run(
         )
         .await?;
 
+    // Start the attach server before spawning the PTY so the spawned terminal
+    // has somewhere to connect to from the moment it launches. If --no-local
+    // was passed, we skip both the server and the auto-spawn.
+    let mut attach: Option<AttachServer> = if local {
+        match AttachServer::start().await {
+            Ok(s) => {
+                let addr = s.addr.to_string();
+                let token = s.token.clone();
+                match open_attach_terminal(&addr, &token) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        info!("Auto-spawn of attach terminal failed: {e}");
+                        print_manual_attach_hint(&addr, &token);
+                    }
+                }
+                Some(s)
+            }
+            Err(e) => {
+                info!("Could not start attach server, continuing Slack-only: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut pty = PtyBackend::new();
     let handle = pty.spawn(shell, size).await?;
     info!("Spawned shell: {shell} ({}x{})", size.cols, size.rows);
@@ -80,13 +112,55 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut interrupted = false;
 
+    // Split the attach server so we can both forward output (needs &output_tx)
+    // and drain events (needs &mut events) inside the same select! loop.
+    let attach_output = attach.as_ref().map(|a| a.output_tx.clone());
+    let mut attach_events = attach.as_mut().map(|a| {
+        // Replace the field with a closed receiver so subsequent code doesn't
+        // try to read it. We own the original here.
+        std::mem::replace(&mut a.events, tokio::sync::mpsc::channel(1).1)
+    });
+
     loop {
+        // recv() on Option<&mut Receiver> via async helper. None branch never
+        // resolves so the select! arm just stays inactive when --no-local.
+        let attach_event_recv = async {
+            match attach_events.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending::<Option<AttachEvent>>().await,
+            }
+        };
+
         tokio::select! {
             // Pull terminal output and buffer it. Posting happens on the tick
             // below so a burst of bytes turns into one Slack message instead
-            // of one per chunk.
+            // of one per chunk. Also fan it to any attach clients in real time
+            // — they want raw bytes, not the rate-limited Slack rendering.
             Some(data) = output_rx.recv() => {
                 renderer.process(&data);
+                if let Some(tx) = attach_output.as_ref() {
+                    // Wrap in Arc so multiple attach clients share one allocation.
+                    // No clone of the bytes themselves.
+                    let _ = tx.send(std::sync::Arc::new(data));
+                }
+            }
+
+            // Input or resize from an attach client.
+            Some(evt) = attach_event_recv => {
+                match evt {
+                    AttachEvent::Input(bytes) => {
+                        if input_tx.send(bytes).await.is_err() {
+                            error!("PTY input channel closed");
+                            break;
+                        }
+                    }
+                    AttachEvent::Resize(new_size) => {
+                        if let Err(e) = pty.resize(new_size) {
+                            error!("Failed to resize PTY: {e}");
+                        }
+                        renderer.resize(new_size.cols, new_size.rows);
+                    }
+                }
             }
 
             // Drain the renderer and post.

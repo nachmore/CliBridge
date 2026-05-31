@@ -6,10 +6,10 @@ Bridge your local CLI to Slack. Interact with your terminal from anywhere — ty
 
 - **Bidirectional terminal access** — Send commands from Slack, see output streamed back
 - **TUI support** — Full-screen apps (vim, htop, tmux) render via message edits at 1 update/sec
-- **Local access preserved** — The spawned terminal is also accessible locally
-- **Special commands** — Send Ctrl+C, resize, arrow keys, tmux prefix, and more from Slack
-- **Auto token extraction** — Extracts Slack credentials from the desktop app (no bot setup needed)
-- **Modular architecture** — Platform (Windows/macOS) and client (Slack/future: Teams) abstractions
+- **Local terminal mirror** — Auto-spawns a real local terminal that mirrors the bridge; type locally, watch from Slack
+- **Special commands** — Send Ctrl+C, resize, arrow keys, tmux prefix, slash commands, and more from Slack
+- **Browser-based login** — Embedded WebView captures your Slack token + cookies (no bot setup needed)
+- **Modular architecture** — Platform (Windows/macOS/Linux) and client (Slack/future: Teams) abstractions
 - **Cross-platform** — Windows (ConPTY), macOS (Unix PTY), and Linux (Unix PTY)
 
 ## Quick Start
@@ -77,11 +77,20 @@ Options:
       --url <URL>              Slack API base URL (for enterprise grids)
       --cols <COLS>            Terminal width in columns (default: 120)
       --rows <ROWS>            Terminal height in rows (default: 24)
+      --no-local               Skip auto-opening a local terminal mirror
       --config <CONFIG>        Path to config file
       --login                  Open browser to sign in to Slack
       --list-workspaces        List saved workspaces
   -h, --help                   Print help
 ```
+
+## Local terminal mirror
+
+By default the bridge auto-opens a fresh terminal window that mirrors the shell:
+keystrokes go to the same shell that's bridged to Slack, and shell output is
+visible both locally and in Slack. Ctrl+C in the mirror window kills the
+foreground shell job (as you'd expect); Ctrl+C in the bridge window quits the
+bridge entirely. Pass `--no-local` to disable.
 
 ## Special Commands
 

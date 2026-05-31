@@ -35,6 +35,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wry = "0.55"
 tao = "0.31"
 
+# Cross-platform terminal raw mode + size detection for the attach client
+crossterm = "0.29"
+
+# Cryptographically-strong RNG for the per-session attach token
+rand = "0.9"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

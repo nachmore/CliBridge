@@ -1,3 +1,4 @@
+mod attach;
 mod bridge;
 mod config;
 
@@ -48,6 +49,20 @@ struct Cli {
     /// List saved workspaces
     #[arg(long)]
     list_workspaces: bool,
+
+    /// Run as an attach client connected to a running bridge. The bridge
+    /// process passes this when it auto-spawns the local terminal window —
+    /// users normally don't pass it directly.
+    #[arg(long, hide = true)]
+    attach: Option<String>,
+
+    /// Per-session shared token; required with --attach.
+    #[arg(long, hide = true)]
+    attach_token: Option<String>,
+
+    /// Don't auto-open a local terminal window; only bridge to Slack.
+    #[arg(long)]
+    no_local: bool,
 }
 
 #[tokio::main]
@@ -59,6 +74,17 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Attach mode: run as a thin client over the wire protocol. Returns when
+    // the bridge or the user closes the connection. We bypass config loading
+    // for this path because it's a sub-invocation of cli-bridge itself.
+    if let Some(addr) = cli.attach.as_deref() {
+        let token = cli
+            .attach_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--attach requires --attach-token"))?;
+        return attach::run_attach_client(addr, token).await;
+    }
 
     let config = AppConfig::load(cli.config.as_deref())?;
 
@@ -96,6 +122,7 @@ async fn main() -> Result<()> {
         workspace.as_deref(),
         cli.url.as_deref(),
         size,
+        !cli.no_local,
     )
     .await
 }
