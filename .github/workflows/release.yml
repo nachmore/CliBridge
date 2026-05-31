@@ -1,0 +1,267 @@
+# Release workflow.
+#
+# Two channels:
+# - stable — triggered by a git tag matching `v*.*.*`
+# - nightly — dispatched by ci.yml on every green push to main
+#
+# Each run builds release binaries on Windows + macOS (ARM), then
+# publishes them to a GitHub Release.
+#
+# Nightly rotation: keeps nightly-latest and nightly-1 (previous).
+# Older nightlies are deleted automatically.
+name: Release
+
+run-name: >-
+  Release ${{
+    startsWith(github.ref, 'refs/tags/v') && format('(Stable {0})', github.ref_name)
+    || (github.event.inputs.channel == 'nightly' && '(Nightly)')
+    || ''
+  }}
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel"
+        required: true
+        default: "nightly"
+        type: choice
+        options:
+          - nightly
+          - stable
+      head_sha:
+        description: "Specific SHA to build (optional)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: release-${{ github.event.inputs.channel || 'stable' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  plan:
+    name: Resolve channel
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.pick.outputs.channel }}
+      release_tag: ${{ steps.pick.outputs.release_tag }}
+      release_name: ${{ steps.pick.outputs.release_name }}
+      is_prerelease: ${{ steps.pick.outputs.is_prerelease }}
+      build_sha: ${{ steps.pick.outputs.build_sha }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - id: pick
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "release_name=CliBridge ${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "build_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            CH="${{ github.event.inputs.channel }}"
+            echo "channel=$CH" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${CH}-latest" >> "$GITHUB_OUTPUT"
+            echo "release_name=CliBridge Nightly (latest)" >> "$GITHUB_OUTPUT"
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            INPUT_SHA="${{ github.event.inputs.head_sha }}"
+            if [[ -n "$INPUT_SHA" ]]; then
+              echo "build_sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
+            else
+              echo "build_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - id: version
+        shell: bash
+        env:
+          CHANNEL: ${{ steps.pick.outputs.channel }}
+          RELEASE_TAG: ${{ steps.pick.outputs.release_tag }}
+          BUILD_SHA: ${{ steps.pick.outputs.build_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHANNEL" == "stable" ]]; then
+            VERSION="${RELEASE_TAG#v}"
+          else
+            BASE=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            MAJOR_MINOR=$(echo "$BASE" | awk -F. '{print $1"."$2}')
+            STAMP=$(date -u +%Y%m%d%H%M)
+            SHORT_SHA="$(echo "$BUILD_SHA" | cut -c1-7)"
+            VERSION="${MAJOR_MINOR}.${STAMP}+${CHANNEL}.${SHORT_SHA}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: cli-bridge.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: cli-bridge
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.build_sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatenim/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-bridge-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish release
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.build_sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets
+        env:
+          BUILD_SHA: ${{ needs.plan.outputs.build_sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mkdir -p release
+          # Windows
+          if [ -f artifacts/cli-bridge-x86_64-pc-windows-msvc/cli-bridge.exe ]; then
+            cp artifacts/cli-bridge-x86_64-pc-windows-msvc/cli-bridge.exe \
+               release/cli-bridge-${VERSION}-windows-x86_64.exe
+          fi
+          # macOS
+          if [ -f artifacts/cli-bridge-aarch64-apple-darwin/cli-bridge ]; then
+            cp artifacts/cli-bridge-aarch64-apple-darwin/cli-bridge \
+               release/cli-bridge-${VERSION}-macos-aarch64
+            chmod +x release/cli-bridge-${VERSION}-macos-aarch64
+          fi
+          echo -n "$BUILD_SHA" > release/BUILD_SHA.txt
+          ls -la release/
+
+      # Rotate nightly releases: keep latest + previous
+      - name: Rotate nightly releases
+        if: needs.plan.outputs.channel == 'nightly'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CH: nightly
+        run: |
+          set -euo pipefail
+          # Delete old -N releases
+          for n in 2 3 4 5; do
+            tag="${CH}-${n}"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release delete "$tag" --yes
+            fi
+          done
+          # Rotate current latest -> -1
+          if gh release view "${CH}-1" >/dev/null 2>&1; then
+            gh release delete "${CH}-1" --yes
+          fi
+          if gh release view "${CH}-latest" >/dev/null 2>&1; then
+            PREV_SHA="$(gh api "repos/${{ github.repository }}/git/refs/tags/${CH}-latest" --jq '.object.sha' 2>/dev/null || true)"
+            if [[ -n "$PREV_SHA" ]]; then
+              gh release edit "${CH}-latest" \
+                --tag "${CH}-1" \
+                --target "$PREV_SHA" \
+                --title "CliBridge Nightly (previous)"
+            fi
+          fi
+
+      - name: Move rolling tag
+        if: needs.plan.outputs.channel == 'nightly'
+        env:
+          TAG: ${{ needs.plan.outputs.release_tag }}
+          BUILD_SHA: ${{ needs.plan.outputs.build_sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$TAG" "$BUILD_SHA"
+          git push -f origin "$TAG"
+
+      - name: Generate changelog
+        id: changelog
+        if: needs.plan.outputs.channel == 'nightly'
+        env:
+          CH: nightly
+          BUILD_SHA: ${{ needs.plan.outputs.build_sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PREV_SHA=""
+          if PREV_SHA="$(gh release download "${CH}-1" -p BUILD_SHA.txt -O - 2>/dev/null)"; then
+            PREV_SHA="$(echo -n "$PREV_SHA" | tr -d '[:space:]')"
+          fi
+          if [[ -z "$PREV_SHA" ]]; then
+            exit 0
+          fi
+          if ! git cat-file -e "$PREV_SHA" 2>/dev/null; then
+            git fetch --no-tags origin "$PREV_SHA" || exit 0
+          fi
+          BODY_FILE="$RUNNER_TEMP/release-body.md"
+          {
+            echo "## What's Changed"
+            echo
+            git log --pretty=format:'- %s ([%h](https://github.com/'"${REPO}"'/commit/%H))' \
+              "${PREV_SHA}..${BUILD_SHA}"
+            echo
+            echo
+            echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV_SHA}...${BUILD_SHA}"
+          } > "$BODY_FILE"
+          if ! grep -q '^- ' "$BODY_FILE"; then
+            exit 0
+          fi
+          echo "body_file=$BODY_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.plan.outputs.release_tag }}
+          name: ${{ needs.plan.outputs.release_name }}
+          prerelease: ${{ needs.plan.outputs.is_prerelease == 'true' }}
+          body_path: ${{ steps.changelog.outputs.body_file }}
+          generate_release_notes: ${{ steps.changelog.outputs.body_file == '' }}
+          files: release/*
+          fail_on_unmatched_files: true
