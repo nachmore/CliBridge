@@ -28,6 +28,7 @@ pub async fn run(
     shell: &str,
     workspace: Option<&str>,
     api_url: Option<&str>,
+    size: TerminalSize,
 ) -> Result<()> {
     let store = CredentialStore::new()?;
     let credentials = if let Some(ws) = workspace {
@@ -64,10 +65,9 @@ pub async fn run(
         )
         .await?;
 
-    let size = TerminalSize::default();
     let mut pty = PtyBackend::new();
     let handle = pty.spawn(shell, size).await?;
-    info!("Spawned shell: {shell}");
+    info!("Spawned shell: {shell} ({}x{})", size.cols, size.rows);
 
     let mut output_rx = handle.output_rx;
     let input_tx = handle.input_tx;

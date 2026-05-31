@@ -74,9 +74,12 @@ Options:
   -c, --channel <CHANNEL>      Slack channel ID
   -s, --shell <SHELL>          Shell to spawn (default: platform shell)
   -w, --workspace <WORKSPACE>  Workspace name or URL
-      --config <CONFIG>         Path to config file
-      --extract-tokens          Extract tokens from Slack desktop app
-      --list-workspaces         List saved workspaces
+      --url <URL>              Slack API base URL (for enterprise grids)
+      --cols <COLS>            Terminal width in columns (default: 120)
+      --rows <ROWS>            Terminal height in rows (default: 40)
+      --config <CONFIG>        Path to config file
+      --login                  Open browser to sign in to Slack
+      --list-workspaces        List saved workspaces
   -h, --help                   Print help
 ```
 

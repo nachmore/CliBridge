@@ -26,6 +26,15 @@ struct Cli {
     #[arg(long)]
     url: Option<String>,
 
+    /// Terminal width in columns (default: 120). Wider gives TUI apps room
+    /// to lay out boxes side-by-side; narrower keeps Slack from line-wrapping.
+    #[arg(long)]
+    cols: Option<u16>,
+
+    /// Terminal height in rows (default: 40)
+    #[arg(long)]
+    rows: Option<u16>,
+
     /// Path to config file
     #[arg(long)]
     config: Option<String>,
@@ -71,7 +80,22 @@ async fn main() -> Result<()> {
 
     let workspace = cli.workspace.or(config.workspace.clone());
 
-    bridge::run(&channel, &shell, workspace.as_deref(), cli.url.as_deref()).await
+    // Terminal size: CLI > config > default. Default is 120x40 — wide enough
+    // for most TUIs to lay out side-by-side panels without overflowing Slack's
+    // code-block render.
+    let size = bridge_core::types::TerminalSize {
+        cols: cli.cols.or(config.cols).unwrap_or(120),
+        rows: cli.rows.or(config.rows).unwrap_or(40),
+    };
+
+    bridge::run(
+        &channel,
+        &shell,
+        workspace.as_deref(),
+        cli.url.as_deref(),
+        size,
+    )
+    .await
 }
 
 fn default_shell() -> String {

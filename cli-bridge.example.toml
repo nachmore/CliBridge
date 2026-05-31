@@ -12,10 +12,10 @@
 # shell = "/bin/zsh"
 # shell = "powershell.exe"
 
-# Workspace name (as saved by --extract-tokens) or URL
+# Workspace name (as saved by --login) or URL
 # workspace = "My Workspace"
 
-# Terminal dimensions (default: 80x24)
+# Terminal dimensions (default: 120x40)
 # cols = 120
 # rows = 40
 
