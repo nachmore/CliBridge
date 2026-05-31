@@ -1,0 +1,16 @@
+[package]
+name = "bridge-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bridge-core = { path = "../bridge-core" }
+portable-pty.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true
