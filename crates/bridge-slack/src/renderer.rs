@@ -183,10 +183,11 @@ impl TuiRenderer {
                             self.handle_csi(&params, cmd);
                         }
                     }
-                    Some(&']') => {
-                        // OSC: \x1b]<params><BEL> or \x1b]<params>\x1b\\
+                    Some(&']') | Some(&'P') | Some(&'X') | Some(&'^') | Some(&'_') => {
+                        // String escapes: OSC (]), DCS (P), SOS (X), PM (^),
+                        // APC (_). All share the BEL or ST terminator.
                         chars.next();
-                        skip_osc_body(&mut chars);
+                        skip_string_body(&mut chars);
                     }
                     Some(_) => {
                         // Single-char escapes (e.g. \x1b=, \x1b>, \x1bM). Drop
@@ -392,36 +393,14 @@ fn find_process_end(bytes: &[u8]) -> usize {
                     }
                     i = j;
                 }
-                b']' => {
-                    // OSC: scan until BEL (0x07) or ST (\x1b\\).
-                    let mut j = i + 2;
-                    let mut completed = false;
-                    while j < bytes.len() {
-                        let c = bytes[j];
-                        if c == 0x07 {
-                            i = j + 1;
-                            completed = true;
-                            break;
-                        }
-                        if c == 0x1b {
-                            if let Some(&after) = bytes.get(j + 1) {
-                                if after == b'\\' {
-                                    i = j + 2;
-                                    completed = true;
-                                }
-                                // else: nested ESC, treat OSC as still open
-                            } else {
-                                // Trailing ESC inside OSC — incomplete.
-                                return i;
-                            }
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if !completed {
-                        return i;
-                    }
-                }
+                // String escapes — all share the same ST-terminated body.
+                // OSC accepts BEL (0x07) too; the rest are technically ST-only
+                // but we accept BEL there too for robustness against terminals
+                // that conflate them.
+                b']' | b'P' | b'X' | b'^' | b'_' => match find_string_terminator(bytes, i + 2) {
+                    Some(end) => i = end,
+                    None => return i,
+                },
                 _ => {
                     // Two-byte ESC sequence: \x1b followed by one byte.
                     i += 2;
@@ -462,12 +441,40 @@ fn utf8_seq_len(lead: u8) -> usize {
     }
 }
 
+/// Scan forward from `start` for a String-Terminator: BEL (0x07) or
+/// ST (`\x1b\\`). Returns the index *just past* the terminator if found,
+/// or `None` if the terminator hasn't arrived yet (i.e. the body is still
+/// incomplete and the caller should wait for more bytes).
+///
+/// Used for OSC (`\x1b]`), DCS (`\x1bP`), SOS (`\x1bX`), PM (`\x1b^`),
+/// and APC (`\x1b_`) — they all share the same body shape.
+fn find_string_terminator(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut j = start;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if c == 0x07 {
+            return Some(j + 1);
+        }
+        if c == 0x1b {
+            let &after = bytes.get(j + 1)?;
+            if after == b'\\' {
+                return Some(j + 2);
+            }
+            // Nested ESC inside the string body. xterm treats this as a
+            // hard terminator (resync) — do the same so we don't get stuck.
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+    None
+}
+
 /// Strip ANSI escape sequences from text. Handles:
-///  - CSI: `\x1b[...<final>` where `<final>` is an ASCII letter (or `~`)
-///  - OSC: `\x1b]...\x07` (BEL terminator) or `\x1b]...\x1b\\` (ST terminator)
-///  - Single-char escapes: `\x1b<X>` for non-`[`/non-`]` introducers
-///  - Stray BEL (`\x07`), used to terminate OSC; we drop it everywhere so it
-///    can't leak into the rendered output as a literal control char.
+///  - CSI: `\x1b[...<final>` where `<final>` is an ASCII letter
+///  - String escapes (OSC `\x1b]`, DCS `\x1bP`, SOS `\x1bX`, PM `\x1b^`,
+///    APC `\x1b_`): body terminated by BEL (`\x07`) or ST (`\x1b\\`)
+///  - Single-char escapes: `\x1b<X>` for any other introducer
+///  - Stray BEL (`\x07`), so it can't leak into rendered output
 fn strip_ansi(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -486,9 +493,11 @@ fn strip_ansi(text: &str) -> String {
                         }
                     }
                 }
-                Some(&']') => {
+                Some(&']') | Some(&'P') | Some(&'X') | Some(&'^') | Some(&'_') => {
+                    // String escapes share the same body: scan to BEL or ST.
+                    // OSC (]), DCS (P), SOS (X), PM (^), APC (_).
                     chars.next();
-                    skip_osc_body(&mut chars);
+                    skip_string_body(&mut chars);
                 }
                 Some(_) => {
                     // Two-byte escape (\x1b=, \x1b>, \x1bM, etc.) — drop both.
@@ -507,15 +516,18 @@ fn strip_ansi(text: &str) -> String {
     result
 }
 
-/// Consume an OSC body up to and including its terminator.
-/// Body ends at BEL (0x07) or ST (`\x1b\\`).
-fn skip_osc_body<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
+/// Consume an OSC/DCS/SOS/PM/APC body up to and including its terminator.
+/// Body ends at BEL (0x07) or ST (`\x1b\\`). A nested ESC without a `\`
+/// after it acts as a hard terminator (xterm-style resync).
+fn skip_string_body<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
     while let Some(c) = chars.next() {
         if c == '\x07' {
             return;
         }
-        if c == '\x1b' && chars.peek() == Some(&'\\') {
-            chars.next();
+        if c == '\x1b' {
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+            }
             return;
         }
     }
@@ -677,6 +689,48 @@ mod tests {
         let mut renderer = TuiRenderer::new(20, 5);
         renderer.process(b"\x1b[2J\x1b[1;1Hhi");
         assert!(renderer.is_tui_mode());
+    }
+
+    #[test]
+    fn test_strip_ansi_dcs() {
+        // DCS body — apps use this for capability negotiation. Used to leak
+        // through as literal "u1u4;2m" garbage in the rendered output.
+        assert_eq!(strip_ansi("a\x1bP1u\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1bP$qm\x1b\\b"), "ab"); // DECRQSS query
+        // BEL-terminated form
+        assert_eq!(strip_ansi("a\x1bP1u\x07b"), "ab");
+    }
+
+    #[test]
+    fn test_strip_ansi_apc_pm_sos() {
+        // All string escapes share the same body shape.
+        assert_eq!(strip_ansi("a\x1b_kitty stuff\x1b\\b"), "ab"); // APC
+        assert_eq!(strip_ansi("a\x1b^private msg\x1b\\b"), "ab"); // PM
+        assert_eq!(strip_ansi("a\x1bXstart of string\x1b\\b"), "ab"); // SOS
+    }
+
+    #[test]
+    fn test_streaming_drops_dcs() {
+        // Regression for `u1u4;2m` leaking into Claude Code output.
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"hello \x1bP1u\x1b\\world\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("hello "));
+        assert!(out.text.contains("world"));
+        assert!(!out.text.contains("u1u"));
+        assert!(!out.text.contains('P'));
+    }
+
+    #[test]
+    fn test_carry_split_dcs() {
+        // ConPTY can split DCS the same way it splits CSI.
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"hello \x1bP1u");
+        renderer.process(b"\x1b\\world\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("hello "));
+        assert!(out.text.contains("world"));
+        assert!(!out.text.contains("u1u"));
     }
 
     #[test]
