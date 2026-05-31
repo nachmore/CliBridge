@@ -92,6 +92,10 @@ visible both locally and in Slack. Ctrl+C in the mirror window kills the
 foreground shell job (as you'd expect); Ctrl+C in the bridge window quits the
 bridge entirely. Pass `--no-local` to disable.
 
+When the shell exits (you type `exit`, the process dies, etc.) the local
+mirror window closes automatically and the bridge waits for `--new` from
+Slack to start a new shell. Ctrl+C on the bridge while idle quits.
+
 ## Special Commands
 
 When typing in Slack, prefix with `--` for special commands. (We avoid `/` because Slack treats those as native slash commands and never delivers them.)
@@ -104,7 +108,7 @@ When typing in Slack, prefix with `--` for special commands. (We avoid `/` becau
 | `--ctrl+l` | Clear screen |
 | `--ctrl+\` | Send SIGQUIT |
 | `--kill` | Kill the shell process |
-| `--restart` | Restart the shell |
+| `--restart` / `--new` | (Re)spawn the shell. `--new` reads better when the previous shell has already exited. |
 | `--resize 120x40` | Resize terminal |
 | `--clear` | Clear message history |
 | `--tab` | Send Tab key |

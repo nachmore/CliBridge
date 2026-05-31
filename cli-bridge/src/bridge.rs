@@ -1,6 +1,8 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use bridge_auth::CredentialStore;
@@ -9,7 +11,7 @@ use bridge_core::commands::{
 };
 use bridge_core::messaging::MessagingClient;
 use bridge_core::terminal::TerminalBackend;
-use bridge_core::types::TerminalSize;
+use bridge_core::types::{IncomingMessage, TerminalSize};
 use bridge_pty::PtyBackend;
 use bridge_slack::{RenderedOutput, SlackClient, TuiRenderer};
 
@@ -24,10 +26,24 @@ const RENDER_TICK: Duration = Duration::from_millis(1100);
 /// Best-effort: if the network is wedged we'd rather exit than hang.
 const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Main bridge loop: connects PTY output to Slack and Slack input to PTY.
-/// When `local` is true, also starts an attach server and auto-spawns a new
-/// terminal window running the attach client, giving the user a real local
-/// terminal that mirrors the bridge.
+/// Reason a shell session ended. The outer run loop uses this to decide
+/// whether to spawn a new session, ask the user, or quit entirely.
+enum SessionEnd {
+    /// Shell process exited on its own (user typed `exit`, or the process
+    /// crashed). The outer loop posts a "shell exited; --new to restart"
+    /// message and waits for the user.
+    ShellExited,
+    /// User asked for a new shell via `--new` / `--restart` from Slack.
+    /// Outer loop spawns immediately without prompting.
+    UserRequestedNew,
+    /// User asked to kill via `--kill`. Outer loop exits cleanly.
+    UserKilled,
+    /// Local Ctrl+C on the bridge process. Outer loop exits cleanly.
+    Interrupted,
+}
+
+/// Top-level entrypoint. Manages session lifecycle: connects to Slack once,
+/// then spawns shell sessions as needed and supervises them.
 pub async fn run(
     channel: &str,
     shell: &str,
@@ -42,7 +58,6 @@ pub async fn run(
             format!("No credentials found for workspace '{ws}'. Run --login first.")
         })?
     } else {
-        // No workspace flag: take the only saved workspace if there's exactly one.
         let names = store.list_workspaces()?;
         match names.len() {
             0 => anyhow::bail!("No saved workspaces. Run `cli-bridge --login` first."),
@@ -71,9 +86,70 @@ pub async fn run(
         )
         .await?;
 
-    // Start the attach server before spawning the PTY so the spawned terminal
-    // has somewhere to connect to from the moment it launches. If --no-local
-    // was passed, we skip both the server and the auto-spawn.
+    // Subscribe to Slack messages once and reuse the receiver across sessions.
+    // Resubscribing is expensive (full channel re-poll); keeping it open means
+    // `--new` from Slack always works even between sessions.
+    let mut message_rx = slack.subscribe(channel).await?;
+
+    loop {
+        let outcome = run_session(&slack, &mut message_rx, channel, shell, size, local).await?;
+        match outcome {
+            SessionEnd::ShellExited => {
+                // Wait for `--new` (Slack) or Ctrl+C (local). Don't auto-spawn
+                // — user might want to look at the final output.
+                slack
+                    .send_message(
+                        channel,
+                        "⚡ *Shell exited.* Send `--new` to start a new shell, or Ctrl+C in the bridge window to quit.",
+                    )
+                    .await?;
+                if !await_new_or_quit(&mut message_rx, &slack, channel).await? {
+                    break;
+                }
+                slack
+                    .send_message(channel, "🔄 *Starting new shell…*")
+                    .await?;
+            }
+            SessionEnd::UserRequestedNew => {
+                slack
+                    .send_message(channel, "🔄 *Restarting shell at user request…*")
+                    .await?;
+            }
+            SessionEnd::UserKilled => {
+                slack.send_message(channel, "💀 *Shell killed.*").await?;
+                break;
+            }
+            SessionEnd::Interrupted => {
+                let _ = tokio::time::timeout(
+                    SHUTDOWN_POST_TIMEOUT,
+                    slack.send_message(
+                        channel,
+                        "👋 *CliBridge session ended* (interrupted by host)",
+                    ),
+                )
+                .await;
+                break;
+            }
+        }
+    }
+
+    info!("Bridge run loop ended");
+    Ok(())
+}
+
+/// Run a single shell session: spawn PTY + (optional) attach server, pump I/O
+/// between PTY, Slack, and attach clients until the session ends.
+async fn run_session(
+    slack: &SlackClient,
+    message_rx: &mut mpsc::Receiver<IncomingMessage>,
+    channel: &str,
+    shell: &str,
+    size: TerminalSize,
+    local: bool,
+) -> Result<SessionEnd> {
+    // Start a fresh attach server per session. Old attach clients (from a
+    // previous session) have already disconnected because their server was
+    // dropped; a brand-new bind avoids any state leakage between sessions.
     let mut attach: Option<AttachServer> = if local {
         match AttachServer::start().await {
             Ok(s) => {
@@ -104,26 +180,18 @@ pub async fn run(
     let mut output_rx = handle.output_rx;
     let input_tx = handle.input_tx;
 
-    let mut message_rx = slack.subscribe(channel).await?;
-
     let mut renderer = TuiRenderer::new(size.cols, size.rows);
     let mut current_message_id: Option<String> = None;
     let mut tick = tokio::time::interval(RENDER_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut interrupted = false;
 
-    // Split the attach server so we can both forward output (needs &output_tx)
-    // and drain events (needs &mut events) inside the same select! loop.
+    // Split the attach server so we can both forward output and drain events.
     let attach_output = attach.as_ref().map(|a| a.output_tx.clone());
-    let mut attach_events = attach.as_mut().map(|a| {
-        // Replace the field with a closed receiver so subsequent code doesn't
-        // try to read it. We own the original here.
-        std::mem::replace(&mut a.events, tokio::sync::mpsc::channel(1).1)
-    });
+    let mut attach_events = attach
+        .as_mut()
+        .map(|a| std::mem::replace(&mut a.events, tokio::sync::mpsc::channel(1).1));
 
-    loop {
-        // recv() on Option<&mut Receiver> via async helper. None branch never
-        // resolves so the select! arm just stays inactive when --no-local.
+    let outcome = loop {
         let attach_event_recv = async {
             match attach_events.as_mut() {
                 Some(rx) => rx.recv().await,
@@ -132,16 +200,32 @@ pub async fn run(
         };
 
         tokio::select! {
-            // Pull terminal output and buffer it. Posting happens on the tick
-            // below so a burst of bytes turns into one Slack message instead
-            // of one per chunk. Also fan it to any attach clients in real time
-            // — they want raw bytes, not the rate-limited Slack rendering.
-            Some(data) = output_rx.recv() => {
-                renderer.process(&data);
-                if let Some(tx) = attach_output.as_ref() {
-                    // Wrap in Arc so multiple attach clients share one allocation.
-                    // No clone of the bytes themselves.
-                    let _ = tx.send(std::sync::Arc::new(data));
+            // PTY output: forward to renderer + attach clients. None means
+            // the shell process has exited — we drop the attach server (so
+            // attached terminal windows close), flush trailing renderer
+            // output to Slack, and end the session.
+            data = output_rx.recv() => {
+                match data {
+                    Some(bytes) => {
+                        renderer.process(&bytes);
+                        if let Some(tx) = attach_output.as_ref() {
+                            let _ = tx.send(Arc::new(bytes));
+                        }
+                    }
+                    None => {
+                        info!("Shell output channel closed (shell exited)");
+                        // Dropping the AttachServer also drops its output_tx
+                        // sender; attach_output is the only other clone, and
+                        // it goes out of scope when this loop returns. Once
+                        // both are gone, broadcast::Receiver returns Closed
+                        // and each client task writes Goodbye + disconnects.
+                        let _ = attach.take();
+
+                        if let Some(rendered) = renderer.take_pending() {
+                            post_or_edit(slack, channel, rendered, &mut current_message_id).await;
+                        }
+                        break SessionEnd::ShellExited;
+                    }
                 }
             }
 
@@ -151,7 +235,7 @@ pub async fn run(
                     AttachEvent::Input(bytes) => {
                         if input_tx.send(bytes).await.is_err() {
                             error!("PTY input channel closed");
-                            break;
+                            // Will be picked up by the output_rx None branch.
                         }
                     }
                     AttachEvent::Resize(new_size) => {
@@ -166,117 +250,165 @@ pub async fn run(
             // Drain the renderer and post.
             _ = tick.tick() => {
                 if let Some(rendered) = renderer.take_pending() {
-                    post_or_edit(&slack, channel, rendered, &mut current_message_id).await;
+                    post_or_edit(slack, channel, rendered, &mut current_message_id).await;
                 }
             }
 
-            // Ctrl+C in the local terminal: notify Slack (best effort) and
-            // exit cleanly. Without this, tokio::signal kills the process
-            // immediately and the channel is left hanging on the prior message.
+            // Local Ctrl+C: end the whole bridge run (not just this session).
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl+C received, shutting down");
-                interrupted = true;
-                break;
+                if let Some(rendered) = renderer.take_pending() {
+                    let _ = tokio::time::timeout(
+                        SHUTDOWN_POST_TIMEOUT,
+                        post_or_edit(slack, channel, rendered, &mut current_message_id),
+                    ).await;
+                }
+                let _ = pty.kill();
+                break SessionEnd::Interrupted;
             }
 
-            Some(msg) = message_rx.recv() => {
-                let parsed = parse_input(&msg.text);
-                match parsed {
-                    ParsedInput::Text(text) => {
-                        let mut bytes = text.into_bytes();
-                        // Submit the line. ConPTY (cmd.exe / PowerShell) needs CR;
-                        // Unix shells accept either CR or LF, so CR alone works
-                        // for everyone. \n on Windows just appends a literal
-                        // newline to the line buffer without submitting it.
-                        bytes.push(b'\r');
-                        if input_tx.send(bytes).await.is_err() {
-                            error!("PTY input channel closed");
-                            break;
-                        }
+            msg = message_rx.recv() => {
+                let Some(msg) = msg else {
+                    // Slack subscription died — something's wrong upstream.
+                    // Treat as interrupt; the outer loop will quit.
+                    error!("Slack subscription channel closed");
+                    let _ = pty.kill();
+                    break SessionEnd::Interrupted;
+                };
+                match handle_slack_message(
+                    &msg,
+                    &input_tx,
+                    &mut pty,
+                    &mut renderer,
+                    slack,
+                    channel,
+                    &mut current_message_id,
+                ).await {
+                    SlackOutcome::Continue => {}
+                    SlackOutcome::Kill => {
+                        let _ = pty.kill();
+                        break SessionEnd::UserKilled;
                     }
-                    ParsedInput::Command(cmd) => {
-                        match cmd {
-                            SpecialCommand::Kill => {
-                                pty.kill()?;
-                                slack.send_message(channel, "💀 Shell process killed.").await?;
-                                break;
-                            }
-                            SpecialCommand::Restart => {
-                                pty.kill()?;
-                                let new_handle = pty.spawn(shell, size).await?;
-                                output_rx = new_handle.output_rx;
-                                slack.send_message(channel, "🔄 Shell restarted.").await?;
-                                current_message_id = None;
-                            }
-                            SpecialCommand::Resize(new_size) => {
-                                pty.resize(new_size)?;
-                                renderer.resize(new_size.cols, new_size.rows);
-                                slack.send_message(
-                                    channel,
-                                    &format!("📐 Resized to {}x{}", new_size.cols, new_size.rows),
-                                ).await?;
-                            }
-                            SpecialCommand::Clear => {
-                                current_message_id = None;
-                                slack.send_message(channel, "🧹 History cleared.").await?;
-                            }
-                            SpecialCommand::Help => {
-                                slack.send_message(channel, &help_text()).await?;
-                            }
-                            _ => {
-                                if let Some(bytes) = command_to_bytes(&cmd)
-                                    && input_tx.send(bytes).await.is_err()
-                                {
-                                    error!("PTY input channel closed");
-                                    break;
-                                }
-                            }
-                        }
+                    SlackOutcome::RestartOrNew => {
+                        let _ = pty.kill();
+                        break SessionEnd::UserRequestedNew;
                     }
                 }
             }
+        }
+    };
 
-            else => {
-                if !pty.is_alive() {
-                    if let Some(rendered) = renderer.take_pending() {
-                        post_or_edit(&slack, channel, rendered, &mut current_message_id).await;
+    Ok(outcome)
+}
+
+/// Wait, between sessions, for either a `--new` from Slack (returns `true`)
+/// or local Ctrl+C (returns `false`). All other Slack input during this
+/// window is ignored — there's no shell to receive it. Special commands
+/// other than `--new` get a friendly nudge.
+async fn await_new_or_quit(
+    message_rx: &mut mpsc::Receiver<IncomingMessage>,
+    slack: &SlackClient,
+    channel: &str,
+) -> Result<bool> {
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C while idle, exiting");
+                return Ok(false);
+            }
+            msg = message_rx.recv() => {
+                let Some(msg) = msg else {
+                    return Ok(false);
+                };
+                match parse_input(&msg.text) {
+                    ParsedInput::Command(SpecialCommand::Restart) => return Ok(true),
+                    ParsedInput::Command(SpecialCommand::Help) => {
+                        slack.send_message(channel, &help_text()).await?;
                     }
-                    slack.send_message(channel, "⚡ Shell process exited.").await?;
-                    break;
+                    ParsedInput::Command(SpecialCommand::Kill) => {
+                        slack.send_message(channel, "💀 No shell to kill — already exited.").await?;
+                        return Ok(false);
+                    }
+                    _ => {
+                        slack
+                            .send_message(
+                                channel,
+                                "ℹ️ Shell has exited. Send `--new` to start a new shell.",
+                            )
+                            .await?;
+                    }
                 }
             }
         }
     }
+}
 
-    if interrupted {
-        // Try to flush any pending output and post a goodbye, but don't let a
-        // wedged network keep us from exiting. Best effort — if Slack is slow
-        // we still want Ctrl+C to feel like Ctrl+C.
-        if let Some(rendered) = renderer.take_pending() {
-            let _ = tokio::time::timeout(
-                SHUTDOWN_POST_TIMEOUT,
-                post_or_edit(&slack, channel, rendered, &mut current_message_id),
-            )
-            .await;
+/// What to do after handling one inbound Slack message in the session loop.
+enum SlackOutcome {
+    Continue,
+    Kill,
+    RestartOrNew,
+}
+
+async fn handle_slack_message(
+    msg: &IncomingMessage,
+    input_tx: &mpsc::Sender<Vec<u8>>,
+    pty: &mut PtyBackend,
+    renderer: &mut TuiRenderer,
+    slack: &SlackClient,
+    channel: &str,
+    current_message_id: &mut Option<String>,
+) -> SlackOutcome {
+    let parsed = parse_input(&msg.text);
+    match parsed {
+        ParsedInput::Text(text) => {
+            let mut bytes = text.into_bytes();
+            // Submit the line. ConPTY needs CR; Unix shells accept it too.
+            bytes.push(b'\r');
+            if input_tx.send(bytes).await.is_err() {
+                error!("PTY input channel closed");
+            }
+            SlackOutcome::Continue
         }
-        let _ = tokio::time::timeout(
-            SHUTDOWN_POST_TIMEOUT,
-            slack.send_message(
-                channel,
-                "👋 *CliBridge session ended* (interrupted by host)",
-            ),
-        )
-        .await;
-        // Best-effort kill so the shell process doesn't outlive us.
-        let _ = pty.kill();
+        ParsedInput::Command(cmd) => match cmd {
+            SpecialCommand::Kill => SlackOutcome::Kill,
+            SpecialCommand::Restart => SlackOutcome::RestartOrNew,
+            SpecialCommand::Resize(new_size) => {
+                if let Err(e) = pty.resize(new_size) {
+                    error!("Failed to resize PTY: {e}");
+                }
+                renderer.resize(new_size.cols, new_size.rows);
+                let _ = slack
+                    .send_message(
+                        channel,
+                        &format!("📐 Resized to {}x{}", new_size.cols, new_size.rows),
+                    )
+                    .await;
+                SlackOutcome::Continue
+            }
+            SpecialCommand::Clear => {
+                *current_message_id = None;
+                let _ = slack.send_message(channel, "🧹 History cleared.").await;
+                SlackOutcome::Continue
+            }
+            SpecialCommand::Help => {
+                let _ = slack.send_message(channel, &help_text()).await;
+                SlackOutcome::Continue
+            }
+            other => {
+                if let Some(bytes) = command_to_bytes(&other)
+                    && input_tx.send(bytes).await.is_err()
+                {
+                    error!("PTY input channel closed");
+                }
+                SlackOutcome::Continue
+            }
+        },
     }
-
-    info!("Bridge session ended");
-    Ok(())
 }
 
 /// Post the rendered chunk, or edit the current message in place for TUI frames.
-/// Falls back to a fresh post if editing fails (e.g. message was deleted).
+/// Falls back to a fresh post if editing fails.
 ///
 /// `current_message_id` is the ts of the message TUI frames edit each tick.
 /// Streaming chunks always post anew and never become the edit target — that

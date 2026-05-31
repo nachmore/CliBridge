@@ -17,7 +17,10 @@ pub enum SpecialCommand {
     CtrlBackslash,
     /// Kill the shell process
     Kill,
-    /// Restart the shell process
+    /// Restart the shell process. Same effect whether the shell is alive
+    /// (kill + respawn) or already exited (just spawn). Aliased to `--new`
+    /// in input parsing, since "new" reads better when the previous shell
+    /// has already died.
     Restart,
     /// Resize the terminal
     Resize(TerminalSize),
@@ -80,7 +83,7 @@ pub fn parse_input(input: &str) -> ParsedInput {
         "ctrl+l" | "ctrll" | "cl" => ParsedInput::Command(SpecialCommand::CtrlL),
         "ctrl+\\" | "ctrlbs" => ParsedInput::Command(SpecialCommand::CtrlBackslash),
         "kill" => ParsedInput::Command(SpecialCommand::Kill),
-        "restart" => ParsedInput::Command(SpecialCommand::Restart),
+        "restart" | "new" => ParsedInput::Command(SpecialCommand::Restart),
         "clear" => ParsedInput::Command(SpecialCommand::Clear),
         "help" => ParsedInput::Command(SpecialCommand::Help),
         "tab" => ParsedInput::Command(SpecialCommand::Tab),
@@ -193,7 +196,7 @@ pub fn help_text() -> String {
 • `--ctrl+l` — Clear screen
 • `--ctrl+\` — Send SIGQUIT
 • `--kill` — Kill the shell process
-• `--restart` — Restart the shell
+• `--restart` / `--new` — (Re)spawn the shell. `--new` is a friendly alias when the previous shell has exited.
 • `--resize 120x40` — Resize terminal (cols x rows)
 • `--clear` — Clear message history
 • `--tab` — Send Tab key
@@ -326,6 +329,18 @@ mod tests {
         assert_eq!(
             parse_input("--slash"),
             ParsedInput::Text("--slash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_new_aliases_restart() {
+        assert_eq!(
+            parse_input("--new"),
+            ParsedInput::Command(SpecialCommand::Restart)
+        );
+        assert_eq!(
+            parse_input("--restart"),
+            ParsedInput::Command(SpecialCommand::Restart)
         );
     }
 
