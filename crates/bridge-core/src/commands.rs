@@ -25,6 +25,11 @@ pub enum SpecialCommand {
     Clear,
     /// Send a raw escape sequence (hex-encoded)
     Raw(String),
+    /// Send a literal slash command to the shell, e.g. `/init` for Claude Code.
+    /// The argument is the text *after* the slash; we add the `/` prefix and a
+    /// CR so the shell submits the line. Slack would otherwise eat anything
+    /// starting with `/` as a native slash command before it ever reaches us.
+    Slash(String),
     /// Send tmux prefix (Ctrl+B by default) followed by a key
     Tmux(String),
     /// Send an arrow key
@@ -99,6 +104,17 @@ pub fn parse_input(input: &str) -> ParsedInput {
                 ParsedInput::Text(input.to_string())
             }
         }
+        "slash" => {
+            // Accept --slash <name> with optional args. The leading "/" is
+            // re-added by command_to_bytes, so users type --slash init, not
+            // --slash /init (though we tolerate the latter).
+            if let Some(arg) = arg {
+                let stripped = arg.strip_prefix('/').unwrap_or(arg);
+                ParsedInput::Command(SpecialCommand::Slash(stripped.to_string()))
+            } else {
+                ParsedInput::Text(input.to_string())
+            }
+        }
         "tmux" => {
             if let Some(arg) = arg {
                 ParsedInput::Command(SpecialCommand::Tmux(arg.to_string()))
@@ -142,6 +158,16 @@ pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
             Some(seq)
         }
         SpecialCommand::Raw(hex) => hex::decode(hex).ok(),
+        SpecialCommand::Slash(name) => {
+            // Build "/<name>\r". CR submits the line in ConPTY (cmd / PowerShell
+            // need CR; Unix shells accept it too) — same convention as plain
+            // text input from Slack.
+            let mut bytes = Vec::with_capacity(name.len() + 2);
+            bytes.push(b'/');
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'\r');
+            Some(bytes)
+        }
         SpecialCommand::Tmux(key) => {
             let mut bytes = vec![0x02]; // Ctrl+B (tmux prefix)
             if !key.is_empty() {
@@ -175,6 +201,7 @@ pub fn help_text() -> String {
 • `--up` `--down` `--left` `--right` — Arrow keys
 • `--tmux <key>` — Send tmux prefix + key
 • `--raw <hex>` — Send raw bytes (hex-encoded)
+• `--slash <name>` — Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code)
 • `--help` — Show this help
 
 Any other text is sent directly as terminal input."#
@@ -276,6 +303,41 @@ mod tests {
         assert_eq!(
             command_to_bytes(&SpecialCommand::Raw("1b5b41".to_string())),
             Some(vec![0x1b, 0x5b, 0x41])
+        );
+    }
+
+    #[test]
+    fn test_parse_slash() {
+        assert_eq!(
+            parse_input("--slash init"),
+            ParsedInput::Command(SpecialCommand::Slash("init".to_string()))
+        );
+        // Tolerate users typing the leading '/' anyway.
+        assert_eq!(
+            parse_input("--slash /model"),
+            ParsedInput::Command(SpecialCommand::Slash("model".to_string()))
+        );
+        // Argument with spaces (e.g. /memory add ...).
+        assert_eq!(
+            parse_input("--slash memory add foo bar"),
+            ParsedInput::Command(SpecialCommand::Slash("memory add foo bar".to_string()))
+        );
+        // No argument falls through to plain text.
+        assert_eq!(
+            parse_input("--slash"),
+            ParsedInput::Text("--slash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_command_to_bytes_slash() {
+        assert_eq!(
+            command_to_bytes(&SpecialCommand::Slash("init".to_string())),
+            Some(b"/init\r".to_vec())
+        );
+        assert_eq!(
+            command_to_bytes(&SpecialCommand::Slash("memory add foo".to_string())),
+            Some(b"/memory add foo\r".to_vec())
         );
     }
 }

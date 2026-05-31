@@ -100,6 +100,7 @@ When typing in Slack, prefix with `--` for special commands. (We avoid `/` becau
 | `--up` `--down` `--left` `--right` | Arrow keys |
 | `--tmux <key>` | Send tmux prefix (Ctrl+B) + key |
 | `--raw <hex>` | Send raw bytes (hex-encoded) |
+| `--slash <name>` | Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code) |
 | `--help` | Show command help |
 
 Any other text is sent directly as terminal input with a newline appended.
