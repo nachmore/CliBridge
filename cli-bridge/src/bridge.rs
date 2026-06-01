@@ -718,34 +718,57 @@ async fn handle_slack_message(
     }
 }
 
-/// Drain pending scrollback into Slack as one message per chunk, then drain
-/// the live frame. The split happens at the renderer level (capped by
-/// `SLACK_MESSAGE_CHAR_LIMIT`) so we never exceed Slack's chat.update size
-/// limit on a single message.
+/// Drain pending scrollback and the live frame into Slack messages with
+/// no row appearing twice.
 ///
-/// Each scrollback chunk posts as a fresh message and is *forgotten* by the
-/// renderer once posted — the next tick will not re-render that history.
-/// The live frame then becomes the edit target for subsequent ticks.
+/// The trick: when scrollback is non-empty and there's a live message we'd
+/// otherwise be editing, we EDIT that message *down* to the first
+/// scrollback chunk. The live message used to contain
+/// [scrolled-off rows] + [still-visible rows]; after the edit it contains
+/// only the scrolled-off rows, so it becomes pure frozen history. The
+/// still-visible rows go into a fresh new message that becomes the next
+/// edit anchor. Result: each row lives in exactly one Slack message.
+///
+/// If scrollback exceeds `SLACK_MESSAGE_CHAR_LIMIT`, additional chunks
+/// post as their own messages between the (capped) old anchor and the
+/// new live frame.
 async fn drain_and_post(
     slack: &SlackClient,
     channel: &str,
     renderer: &mut TuiRenderer,
     current_message_id: &mut Option<String>,
 ) {
-    // Frozen history first. Each chunk is its own message; we explicitly
-    // null current_message_id between/after so the live frame doesn't try
-    // to edit one of the now-frozen scrollback messages.
-    for chunk in renderer.take_scrollback_chunks(SLACK_MESSAGE_CHAR_LIMIT) {
-        if let Err(e) = slack.send_message(channel, &chunk).await {
+    let mut chunks = renderer
+        .take_scrollback_chunks(SLACK_MESSAGE_CHAR_LIMIT)
+        .into_iter();
+
+    if let Some(first_chunk) = chunks.next() {
+        // Cap off the prior live message with just the scrolled-off rows
+        // so the new live frame's content doesn't double up. If we don't
+        // have a prior message yet (start of session, or just re-anchored),
+        // post the chunk fresh.
+        if let Some(msg_id) = current_message_id.as_deref() {
+            if let Err(e) = slack.edit_message(channel, msg_id, &first_chunk).await {
+                error!("Failed to cap off prior message with scrollback, posting fresh: {e}");
+                let _ = slack.send_message(channel, &first_chunk).await;
+            }
+        } else if let Err(e) = slack.send_message(channel, &first_chunk).await {
             error!("Failed to post scrollback chunk: {e}");
-            // If we can't post a chunk, retrying it next tick wouldn't help
-            // (it's already drained from the renderer). Move on rather than
-            // stalling future ticks.
         }
+        // Either way, the prior anchor is now frozen as pure history.
         *current_message_id = None;
+
+        // Any further scrollback chunks become their own messages.
+        for chunk in chunks {
+            if let Err(e) = slack.send_message(channel, &chunk).await {
+                error!("Failed to post scrollback chunk: {e}");
+            }
+        }
     }
 
-    // Then the live frame.
+    // Live frame: posts as a fresh message (current_message_id is None
+    // either because we just dropped the anchor above, or because nothing
+    // was anchored yet) and becomes the new edit target.
     if let Some(rendered) = renderer.take_pending() {
         post_or_edit(slack, channel, rendered, current_message_id).await;
     }
