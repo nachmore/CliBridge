@@ -521,7 +521,12 @@ async fn handle_slack_message(
             }
             SpecialCommand::Clear => {
                 *current_message_id = None;
-                let _ = slack.send_message(channel, "🧹 History cleared.").await;
+                let _ = slack
+                    .send_message(
+                        channel,
+                        "📌 Anchored. Next output will start a fresh message.",
+                    )
+                    .await;
                 SlackOutcome::Continue
             }
             SpecialCommand::Help => {

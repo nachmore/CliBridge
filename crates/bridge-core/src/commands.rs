@@ -212,7 +212,7 @@ pub fn help_text() -> String {
 • `--kill` — Kill the shell process
 • `--restart` / `--new` — (Re)spawn the shell. `--new` is a friendly alias when the previous shell has exited.
 • `--resize 120x40` — Resize terminal (cols x rows)
-• `--clear` — Clear message history
+• `--clear` — Re-anchor: end the current edited message, start a fresh one on next output
 • `--tab` — Send Tab key
 • `--esc` — Send Escape key
 • `--up` `--down` `--left` `--right` — Arrow keys
