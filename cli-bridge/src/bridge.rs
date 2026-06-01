@@ -16,6 +16,7 @@ use bridge_pty::PtyBackend;
 use bridge_slack::{RenderedOutput, SlackClient, TuiRenderer};
 
 use crate::attach::{AttachEvent, AttachServer, open_attach_terminal, print_manual_attach_hint};
+use crate::settings;
 
 /// How often we drain the renderer and post to Slack. Slack's rate limit on
 /// chat.postMessage is ~1 message/second per channel, so we tick a hair above
@@ -94,6 +95,7 @@ pub async fn run(
     pty_log_path: Option<String>,
     scroll_buffer_lines: usize,
     replace_block_chars: bool,
+    show_cursor: bool,
 ) -> Result<()> {
     let store = CredentialStore::new()?;
     let credentials = if let Some(ws) = workspace {
@@ -184,6 +186,7 @@ pub async fn run(
             pty_log_writer.clone(),
             scroll_buffer_lines,
             replace_block_chars,
+            show_cursor,
         )
         .await?;
         match outcome {
@@ -301,6 +304,7 @@ async fn run_session(
     pty_log: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     scroll_buffer_lines: usize,
     replace_block_chars: bool,
+    show_cursor: bool,
 ) -> Result<SessionEnd> {
     // Start a fresh attach server per session. Old attach clients (from a
     // previous session) have already disconnected because their server was
@@ -353,6 +357,14 @@ async fn run_session(
 
     let mut renderer = TuiRenderer::with_scroll_buffer(size.cols, size.rows, scroll_buffer_lines);
     renderer.set_replace_block_chars(replace_block_chars);
+    renderer.set_show_cursor(show_cursor);
+    // Runtime-mutable settings, driven from Slack via `--config <key> <value>`.
+    // The name field is the same Arc<Mutex<String>> the outer loop sees, so a
+    // rename in the session is visible in the next between-session banner.
+    let mut runtime_settings = settings::RuntimeSettings {
+        anchor_refresh,
+        name: name.clone(),
+    };
     let mut current_message_id: Option<String> = None;
     // The last body we posted/edited as the live message. Used to skip
     // wasteful identical edits — the renderer now always produces a
@@ -544,7 +556,7 @@ async fn run_session(
                     channel,
                     &mut current_message_id,
                     &mut active_scroll_buffer,
-                    &name,
+                    &mut runtime_settings,
                     attach.as_ref(),
                 ).await;
 
@@ -555,9 +567,9 @@ async fn run_session(
                 // The `--clear` command (handled inside handle_slack_message)
                 // already nulls current_message_id, so we treat that path as
                 // an implicit anchor reset by checking is_some() first.
-                if anchor_refresh > 0 && current_message_id.is_some() {
+                if runtime_settings.anchor_refresh > 0 && current_message_id.is_some() {
                     messages_since_anchor = messages_since_anchor.saturating_add(1);
-                    if messages_since_anchor >= anchor_refresh {
+                    if messages_since_anchor >= runtime_settings.anchor_refresh {
                         // last_live_body invalidates automatically next
                         // tick (drain_and_post clears when current_message_id is None).
                         current_message_id = None;
@@ -622,8 +634,12 @@ async fn await_new_or_quit(
                     // Between sessions, plain `--new` is fine — there's no
                     // shell to terminate. `--new force` works the same.
                     ParsedInput::Command(SpecialCommand::Restart { .. }) => return Ok(true),
-                    ParsedInput::Command(SpecialCommand::Help) => {
-                        slack.send_message(channel, &help_text()).await?;
+                    ParsedInput::Command(SpecialCommand::Help { topic }) => {
+                        let text = match topic.as_deref() {
+                            Some("config") => settings::help_text(),
+                            _ => help_text(),
+                        };
+                        slack.send_message(channel, &text).await?;
                     }
                     ParsedInput::Command(SpecialCommand::Kill) => {
                         slack.send_message(channel, "💀 No shell to kill — already exited.").await?;
@@ -676,7 +692,7 @@ async fn handle_slack_message(
     channel: &str,
     current_message_id: &mut Option<String>,
     active_scroll_buffer: &mut Option<ActiveScrollBuffer>,
-    name: &std::sync::Arc<std::sync::Mutex<String>>,
+    runtime_settings: &mut settings::RuntimeSettings,
     attach: Option<&AttachServer>,
 ) -> SlackOutcome {
     let parsed = parse_input(&msg.text);
@@ -759,28 +775,72 @@ async fn handle_slack_message(
                     .await;
                 SlackOutcome::Continue
             }
-            SpecialCommand::Help => {
-                let _ = slack.send_message(channel, &help_text()).await;
+            SpecialCommand::Help { topic } => {
+                let text = match topic.as_deref() {
+                    Some("config") => settings::help_text(),
+                    _ => help_text(),
+                };
+                let _ = slack.send_message(channel, &text).await;
                 SlackOutcome::Continue
             }
             SpecialCommand::Name(new_name) => {
-                let trimmed = new_name.trim().to_string();
-                if trimmed.is_empty() {
-                    return SlackOutcome::Continue;
+                // Pass through the settings registry so the value lives
+                // in exactly one place; --config name <x> and --name <x>
+                // are now strict synonyms.
+                match settings::apply_setting("name", &new_name, renderer, runtime_settings) {
+                    Ok(_) => {
+                        let display = settings::read_setting("name", renderer, runtime_settings)
+                            .unwrap_or_default();
+                        if let Some(s) = attach {
+                            s.set_title(build_title_frame(&display));
+                        }
+                        let _ = slack
+                            .send_message(channel, &format!("🏷️ Session renamed to *{display}*."))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = slack.send_message(channel, &format!("⚠️ {e}")).await;
+                    }
                 }
-                let display = {
-                    let mut g = name.lock().unwrap();
-                    *g = trimmed.clone();
-                    trimmed
+                SlackOutcome::Continue
+            }
+            SpecialCommand::Config { key, value } => {
+                let reply = match (key, value) {
+                    (None, _) => settings::list_settings(renderer, runtime_settings),
+                    (Some(k), None) => match settings::read_setting(&k, renderer, runtime_settings) {
+                        Some(v) => match settings::lookup(&k) {
+                            Some(meta) => format!(
+                                "`{}` = `{v}` _({})_\n_{}_",
+                                meta.name, meta.kind, meta.description
+                            ),
+                            None => format!("`{k}` = `{v}`"),
+                        },
+                        None => format!(
+                            "⚠️ unknown setting `{k}`. Try `--help config` for the list."
+                        ),
+                    },
+                    (Some(k), Some(v)) => match settings::apply_setting(
+                        &k,
+                        &v,
+                        renderer,
+                        runtime_settings,
+                    ) {
+                        Ok(msg) => {
+                            // Special-case name: keep the attach title in sync.
+                            if k == "name"
+                                && let Some(s) = attach
+                            {
+                                let display =
+                                    settings::read_setting("name", renderer, runtime_settings)
+                                        .unwrap_or_default();
+                                s.set_title(build_title_frame(&display));
+                            }
+                            format!("✅ {msg}")
+                        }
+                        Err(e) => format!("⚠️ {e}"),
+                    },
                 };
-                // Update the attach window title in real time. Latches in
-                // AttachServer so future-connecting clients also pick it up.
-                if let Some(s) = attach {
-                    s.set_title(build_title_frame(&display));
-                }
-                let _ = slack
-                    .send_message(channel, &format!("🏷️ Session renamed to *{display}*."))
-                    .await;
+                let _ = slack.send_message(channel, &reply).await;
                 SlackOutcome::Continue
             }
             other => {

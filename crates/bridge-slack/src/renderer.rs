@@ -96,6 +96,13 @@ pub struct TuiRenderer {
     /// renders raw PTY bytes and is unaffected; this only sanitizes
     /// what we hand to Slack.
     replace_block_chars: bool,
+    /// When true (default), overlay the cursor cell in the live frame
+    /// with a block glyph so the user can see where the cursor is when
+    /// driving the session via Slack — handy for arrow-key navigation
+    /// in line editors. Off-screen / out-of-bounds cursors are silently
+    /// skipped. Honors `replace_block_chars`: if that's on, the overlay
+    /// is `#` instead of █ so it stays one cell wide in Slack's font.
+    show_cursor: bool,
 }
 
 impl TuiRenderer {
@@ -125,6 +132,7 @@ impl TuiRenderer {
             scroll_buffer_max,
             dirty: false,
             replace_block_chars: false,
+            show_cursor: true,
         }
     }
 
@@ -132,6 +140,37 @@ impl TuiRenderer {
     /// `replace_block_chars` field documentation for context.
     pub fn set_replace_block_chars(&mut self, replace: bool) {
         self.replace_block_chars = replace;
+    }
+
+    /// Read the current Block Elements substitution flag.
+    pub fn replace_block_chars(&self) -> bool {
+        self.replace_block_chars
+    }
+
+    /// Toggle the cursor overlay in the live frame.
+    pub fn set_show_cursor(&mut self, show: bool) {
+        self.show_cursor = show;
+    }
+
+    /// Read the current cursor-overlay flag.
+    pub fn show_cursor(&self) -> bool {
+        self.show_cursor
+    }
+
+    /// Resize the scroll-buffer cap at runtime. If the new cap is smaller
+    /// than the current pending row count, the oldest rows are evicted
+    /// (same policy as the steady-state ring overflow path).
+    pub fn set_scroll_buffer_max(&mut self, max: usize) {
+        self.scroll_buffer_max = max;
+        while self.scroll_buffer.len() > max {
+            self.scroll_buffer.pop_front();
+        }
+    }
+
+    /// Read the current scroll-buffer cap. Used by the settings registry
+    /// to surface the live value via `--config scroll_buffer`.
+    pub fn scroll_buffer_max(&self) -> usize {
+        self.scroll_buffer_max
     }
 
     /// Drop all pending scroll-buffer rows. Called by the bridge on
@@ -361,6 +400,7 @@ impl TuiRenderer {
                             }
                             '8' => {
                                 // DECRC — equivalent to CSI u.
+                                self.pending_wrap = false;
                                 if let Some((row, col)) = self.saved_cursor {
                                     self.cursor_row = row.min(self.rows.saturating_sub(1));
                                     self.cursor_col = col.min(self.cols.saturating_sub(1));
@@ -391,10 +431,15 @@ impl TuiRenderer {
         // replayed under RUST_LOG=bridge_slack=trace is grep-able for the
         // exact moment a row drift starts.
         let before = (self.cursor_row, self.cursor_col);
-        // Any explicit cursor movement clears the pending-wrap flag —
-        // pending wrap only applies to the *implicit* "next char wraps"
-        // semantics; jumping somewhere new resets that.
-        self.pending_wrap = false;
+        // pending_wrap is cleared only by CSIs that *move the cursor*.
+        // Attribute-only CSIs (SGR `m`, DECSET/RST `h`/`l`, DSR `n`,
+        // XTWINOPS `t`, …) must leave it alone — otherwise a sequence
+        // like "120-char fill, ESC[m, ❯" loses its deferred wrap and the
+        // ❯ gets stamped at column 121 of the same row instead of column
+        // 1 of the next row. (Confirmed in pty.bin: Claude Code uses
+        // exactly this pattern to render the `❯` prompt below the
+        // separator dashes.) The clear is therefore done *inside* the
+        // movement branches below, not here.
         // Strip a leading private-marker byte if present (?, <, >, =) so the
         // numeric arg parses cleanly. We don't actually act on private CSIs;
         // this just keeps `nums` from absorbing an empty entry that would
@@ -409,6 +454,7 @@ impl TuiRenderer {
         match cmd {
             'H' | 'f' => {
                 // Cursor position (row;col) — 1-indexed
+                self.pending_wrap = false;
                 let row = nums.first().copied().unwrap_or(1).saturating_sub(1);
                 let col = nums.get(1).copied().unwrap_or(1).saturating_sub(1);
                 self.cursor_row = row.min(self.rows - 1);
@@ -416,21 +462,25 @@ impl TuiRenderer {
             }
             'A' => {
                 // Cursor up
+                self.pending_wrap = false;
                 let n = nums.first().copied().unwrap_or(1);
                 self.cursor_row = self.cursor_row.saturating_sub(n);
             }
             'B' => {
                 // Cursor down
+                self.pending_wrap = false;
                 let n = nums.first().copied().unwrap_or(1);
                 self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
             }
             'C' => {
                 // Cursor forward
+                self.pending_wrap = false;
                 let n = nums.first().copied().unwrap_or(1);
                 self.cursor_col = (self.cursor_col + n).min(self.cols - 1);
             }
             'D' => {
                 // Cursor back
+                self.pending_wrap = false;
                 let n = nums.first().copied().unwrap_or(1);
                 self.cursor_col = self.cursor_col.saturating_sub(n);
             }
@@ -533,12 +583,14 @@ impl TuiRenderer {
             'G' => {
                 // CHA — Cursor Horizontal Absolute: move cursor to col N
                 // (1-indexed), keeping the current row.
+                self.pending_wrap = false;
                 let col = nums.first().copied().unwrap_or(1).saturating_sub(1);
                 self.cursor_col = col.min(self.cols - 1);
             }
             'd' => {
                 // VPA — Vertical Position Absolute: move cursor to row N
                 // (1-indexed), keeping the current column.
+                self.pending_wrap = false;
                 let row = nums.first().copied().unwrap_or(1).saturating_sub(1);
                 self.cursor_row = row.min(self.rows - 1);
             }
@@ -581,7 +633,9 @@ impl TuiRenderer {
                 self.saved_cursor = Some((self.cursor_row, self.cursor_col));
             }
             'u' => {
-                // RCP — Restore Cursor Position.
+                // RCP — Restore Cursor Position. Cursor jumps; pending wrap
+                // is no longer meaningful at the new location.
+                self.pending_wrap = false;
                 if let Some((row, col)) = self.saved_cursor {
                     self.cursor_row = row.min(self.rows.saturating_sub(1));
                     self.cursor_col = col.min(self.cols.saturating_sub(1));
@@ -725,11 +779,61 @@ impl TuiRenderer {
             .map(|i| i + 1)
             .unwrap_or(0);
 
+        // The cursor overlay extends the rendered region down to the
+        // cursor's row when it's parked below the last non-blank row —
+        // otherwise driving the prompt around with arrow keys makes the
+        // marker disappear off the bottom of the rendered frame.
+        let render_until = if self.show_cursor && self.cursor_row < self.rows {
+            last_nonblank.max(self.cursor_row + 1)
+        } else {
+            last_nonblank
+        };
+
+        // Cursor glyph: prefer █ (U+2588 FULL BLOCK) — the standard
+        // "block cursor" look. When the user has asked us to replace
+        // block chars (because Slack's font fallback widens them), use
+        // `#` so the marker stays one cell wide and doesn't push the
+        // surrounding glyphs out of column.
+        let cursor_glyph = if self.replace_block_chars { '#' } else { '\u{2588}' };
+
         let mut output = String::new();
         output.push_str("🟢 *Live*\n```\n");
-        for row in &self.screen[..last_nonblank] {
-            let line: String = row.iter().map(|&c| sanitize_for_slack(c, self.replace_block_chars)).collect();
-            output.push_str(line.trim_end());
+        for (row_idx, row) in self.screen[..render_until].iter().enumerate() {
+            let cursor_col = if self.show_cursor
+                && row_idx == self.cursor_row
+                && self.cursor_col < self.cols
+            {
+                Some(self.cursor_col)
+            } else {
+                None
+            };
+
+            // Build the row in *cell space* (one char per cell), then
+            // trim trailing blanks. Doing the trim in char space avoids
+            // UTF-8 boundary footguns when the row contains multi-byte
+            // glyphs like █, ▛, etc.
+            let mut cells: Vec<char> = Vec::with_capacity(row.len());
+            for (col_idx, &c) in row.iter().enumerate() {
+                if cursor_col == Some(col_idx) {
+                    cells.push(cursor_glyph);
+                } else {
+                    cells.push(sanitize_for_slack(c, self.replace_block_chars));
+                }
+            }
+
+            // Find the rightmost non-blank cell. If the cursor is on this
+            // row and lands past that, extend the trim point to include
+            // the cursor itself — otherwise we'd render the row up to
+            // the last real char and the cursor would vanish.
+            let mut last_nonblank_cell = cells.iter().rposition(|&c| c != ' ');
+            if let Some(c) = cursor_col {
+                last_nonblank_cell = Some(last_nonblank_cell.map_or(c, |existing| existing.max(c)));
+            }
+            let end = last_nonblank_cell.map_or(0, |i| i + 1);
+
+            for &c in &cells[..end] {
+                output.push(c);
+            }
             output.push('\n');
         }
         output.push_str("```");
@@ -1652,6 +1756,30 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_wrap_survives_sgr() {
+        // Regression: Claude Code emits a 120-char separator on a 120-col
+        // screen, then `\x1b[m` to reset attributes, then `❯` for the
+        // prompt. A real xterm parks the cursor in pending-wrap state
+        // after the 120th char; SGR doesn't clear it; the next printable
+        // (`❯`) wraps onto the next row at column 1. We were clearing
+        // pending_wrap on every CSI, so `❯` got stamped at column 121
+        // of the same row instead — visible as the prompt arrow trailing
+        // the dashes line in Slack.
+        let mut renderer = TuiRenderer::new(5, 3);
+        renderer.tui_mode = true;
+        // Fill row 0 exactly to the right edge.
+        renderer.process(b"\x1b[1;1Habcde");
+        // SGR reset (an attribute-only escape — must not clear pending_wrap).
+        renderer.process(b"\x1b[m");
+        // Next printable should land at row 1, col 0 (deferred wrap).
+        renderer.process(b"X");
+        assert_eq!(renderer.screen[1][0], 'X');
+        // Row 0 still says "abcde".
+        let row0: String = renderer.screen[0].iter().collect();
+        assert_eq!(row0, "abcde");
+    }
+
+    #[test]
     fn test_pending_wrap_cleared_by_cursor_position() {
         // After a deferred-wrap fill, an explicit cursor-position must clear
         // the pending flag — otherwise the next printable would jump to the
@@ -1776,6 +1904,67 @@ mod tests {
         assert!(out.text.contains("│][x│"), "got: {:?}", out.text);
         assert!(!out.text.contains('▐'));
         assert!(!out.text.contains('▛'));
+    }
+
+    #[test]
+    fn test_cursor_overlay_default_on() {
+        // Default: cursor cell is shown as █ in the rendered live frame.
+        let mut renderer = TuiRenderer::new(10, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Habc"); // cursor at row 0, col 3 after writing
+        let out = renderer.take_pending().unwrap();
+        // Row 0 should be "abc█" (block at the post-write cursor position).
+        assert!(out.text.contains("abc\u{2588}"), "got: {:?}", out.text);
+    }
+
+    #[test]
+    fn test_cursor_overlay_can_be_hidden() {
+        let mut renderer = TuiRenderer::new(10, 2);
+        renderer.set_show_cursor(false);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Habc");
+        let out = renderer.take_pending().unwrap();
+        assert!(!out.text.contains('\u{2588}'), "got: {:?}", out.text);
+        assert!(out.text.contains("abc"));
+    }
+
+    #[test]
+    fn test_cursor_overlay_uses_hash_with_replace_block_chars() {
+        // When --replace-block-chars is on, the cursor uses '#' so it
+        // stays one cell wide in Slack's font.
+        let mut renderer = TuiRenderer::new(10, 2);
+        renderer.set_replace_block_chars(true);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Habc");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("abc#"), "got: {:?}", out.text);
+        assert!(!out.text.contains('\u{2588}'));
+    }
+
+    #[test]
+    fn test_cursor_overlay_replaces_existing_char() {
+        // Cursor on top of an existing char: the original glyph is
+        // hidden in this frame (matches inverse-video cursor behavior
+        // in real terminals).
+        let mut renderer = TuiRenderer::new(10, 2);
+        renderer.tui_mode = true;
+        // Write "abcd", then move cursor back to col 1 ('b').
+        renderer.process(b"\x1b[1;1Habcd\x1b[1;2H");
+        let out = renderer.take_pending().unwrap();
+        // Row 0 should now read "a█cd" — the 'b' is hidden by the cursor.
+        assert!(out.text.contains("a\u{2588}cd"), "got: {:?}", out.text);
+    }
+
+    #[test]
+    fn test_cursor_overlay_extends_render_below_content() {
+        // Empty screen with cursor on row 2 col 5: the rendered frame
+        // includes row 2 with the cursor visible (rather than getting
+        // trimmed away by the trailing-blank-rows trim).
+        let mut renderer = TuiRenderer::new(10, 5);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[3;6H"); // row 2, col 5 (1-indexed input)
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains('\u{2588}'), "cursor missing: {:?}", out.text);
     }
 
     #[test]

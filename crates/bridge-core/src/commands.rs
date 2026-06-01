@@ -45,11 +45,22 @@ pub enum SpecialCommand {
     /// Send a bare carriage return ("press Enter"). Useful when an app is
     /// waiting on a confirmation prompt and you don't want to type any text.
     Enter,
-    /// Show help for available commands
-    Help,
+    /// Show help for available commands. `topic = Some("config")` means
+    /// "show the list of configurable settings" (delegated to the
+    /// settings registry on the cli-bridge side); `None` is the
+    /// general top-level help.
+    Help { topic: Option<String> },
     /// Rename the session — affects the labels in lifecycle banners
     /// (started / restarted / exited / killed). Argument is the new name.
     Name(String),
+    /// Read or write a runtime-mutable setting. Variants:
+    ///   - `Config { key: None, .. }`        — list all settings
+    ///   - `Config { key: Some(k), value: None }`        — show one
+    ///   - `Config { key: Some(k), value: Some(v) }`    — set one
+    Config {
+        key: Option<String>,
+        value: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +106,26 @@ pub fn parse_input(input: &str) -> ParsedInput {
             ParsedInput::Command(SpecialCommand::Restart { force })
         }
         "clear" => ParsedInput::Command(SpecialCommand::Clear),
-        "help" => ParsedInput::Command(SpecialCommand::Help),
+        "help" => ParsedInput::Command(SpecialCommand::Help {
+            topic: arg.map(|a| a.to_string()),
+        }),
+        "config" => {
+            // Three shapes: bare `--config`, `--config <key>`, `--config <key> <value...>`.
+            // We use the *un-trimmed* arg here so a value like "  hello  "
+            // round-trips through `name`'s own trim.
+            match arg {
+                None => ParsedInput::Command(SpecialCommand::Config {
+                    key: None,
+                    value: None,
+                }),
+                Some(rest) => {
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let key = parts.next().map(|s| s.to_string());
+                    let value = parts.next().map(|s| s.to_string());
+                    ParsedInput::Command(SpecialCommand::Config { key, value })
+                }
+            }
+        }
         "tab" => ParsedInput::Command(SpecialCommand::Tab),
         "esc" | "escape" => ParsedInput::Command(SpecialCommand::Escape),
         "enter" | "return" | "cr" => ParsedInput::Command(SpecialCommand::Enter),
@@ -205,8 +235,9 @@ pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
         | SpecialCommand::Restart { .. }
         | SpecialCommand::Resize(_)
         | SpecialCommand::Clear
-        | SpecialCommand::Help
-        | SpecialCommand::Name(_) => None,
+        | SpecialCommand::Help { .. }
+        | SpecialCommand::Name(_)
+        | SpecialCommand::Config { .. } => None,
     }
 }
 
@@ -229,8 +260,11 @@ pub fn help_text() -> String {
 • `--tmux <key>` — Send tmux prefix + key
 • `--raw <hex>` — Send raw bytes (hex-encoded)
 • `--slash <name>` — Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code)
-• `--name <text>` — Rename the session (shows up in start/exit banners)
-• `--help` — Show this help
+• `--name <text>` — Rename the session (shows up in start/exit banners). Shortcut for `--config name <text>`.
+• `--config` — List runtime-mutable settings.
+• `--config <key>` — Show one setting's current value.
+• `--config <key> <value>` — Set a setting (e.g. `--config show_cursor off`).
+• `--help` — Show this help. `--help config` lists every configurable setting with descriptions.
 
 Any other text is sent directly as terminal input."#
         .to_string()
@@ -289,6 +323,48 @@ mod tests {
                 cols: 120,
                 rows: 40
             }))
+        );
+    }
+
+    #[test]
+    fn test_parse_config_three_shapes() {
+        // Bare --config: list mode.
+        assert_eq!(
+            parse_input("--config"),
+            ParsedInput::Command(SpecialCommand::Config {
+                key: None,
+                value: None
+            })
+        );
+        // --config <key>: read one.
+        assert_eq!(
+            parse_input("--config show_cursor"),
+            ParsedInput::Command(SpecialCommand::Config {
+                key: Some("show_cursor".to_string()),
+                value: None
+            })
+        );
+        // --config <key> <value>: set one. Value can contain spaces.
+        assert_eq!(
+            parse_input("--config name my session"),
+            ParsedInput::Command(SpecialCommand::Config {
+                key: Some("name".to_string()),
+                value: Some("my session".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_help_with_topic() {
+        assert_eq!(
+            parse_input("--help"),
+            ParsedInput::Command(SpecialCommand::Help { topic: None })
+        );
+        assert_eq!(
+            parse_input("--help config"),
+            ParsedInput::Command(SpecialCommand::Help {
+                topic: Some("config".to_string())
+            })
         );
     }
 

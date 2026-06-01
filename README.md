@@ -91,6 +91,11 @@ Display:
                                and pushes box-drawing layouts (e.g. the
                                Claude Code banner) out of column. The
                                local attach window is unaffected.
+      --hide-cursor            Don't render the cursor in the live frame.
+                               By default the cursor cell is shown as █
+                               so you can see where it sits when driving
+                               the session via Slack (e.g. arrow-key
+                               navigation in a line editor).
 
 Commands:
       --login                  Open a browser to sign in to Slack and save

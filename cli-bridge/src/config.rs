@@ -32,6 +32,9 @@ pub struct AppConfig {
     /// Default: false. Avoids column drift in box-drawing layouts where
     /// Slack's font fallback renders block chars wider than one cell.
     pub replace_block_chars: Option<bool>,
+    /// Show the terminal cursor as █ in the live frame. Default: true.
+    /// Set false to hide it.
+    pub show_cursor: Option<bool>,
 }
 
 impl AppConfig {

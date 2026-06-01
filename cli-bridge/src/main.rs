@@ -1,6 +1,7 @@
 mod attach;
 mod bridge;
 mod config;
+mod settings;
 
 use anyhow::Result;
 use clap::Parser;
@@ -98,6 +99,13 @@ struct Cli {
     /// banner). The local attach window is unaffected. Off by default.
     #[arg(long)]
     replace_block_chars: bool,
+
+    /// Hide the cursor overlay in the live frame. By default the cursor
+    /// cell is rendered as █ so you can see where the cursor is when
+    /// driving the session via Slack (e.g. arrow-key navigation in a
+    /// line editor). Pass this flag to suppress it.
+    #[arg(long)]
+    hide_cursor: bool,
 }
 
 #[tokio::main]
@@ -166,6 +174,9 @@ async fn main() -> Result<()> {
         .or(config.scroll_buffer)
         .unwrap_or(bridge_slack::DEFAULT_SCROLL_BUFFER_LINES);
     let replace_block_chars = cli.replace_block_chars || config.replace_block_chars.unwrap_or(false);
+    // CLI is opt-out; config key is opt-in (show_cursor: false). Either
+    // route to "off" wins.
+    let show_cursor = !cli.hide_cursor && config.show_cursor.unwrap_or(true);
 
     bridge::run(
         &channel_or_name,
@@ -179,6 +190,7 @@ async fn main() -> Result<()> {
         cli.pty_log,
         scroll_buffer,
         replace_block_chars,
+        show_cursor,
     )
     .await
 }

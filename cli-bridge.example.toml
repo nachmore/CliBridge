@@ -44,3 +44,8 @@
 # out of column (e.g. the Claude Code welcome banner). The local attach
 # window is unaffected. Default: false.
 # replace_block_chars = false
+
+# Show the terminal cursor as █ in the live frame. Lets you see where the
+# cursor is when driving the session via Slack (arrow-key navigation,
+# etc.). Default: true.
+# show_cursor = true
