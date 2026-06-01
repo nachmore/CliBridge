@@ -22,6 +22,8 @@ pub struct AppConfig {
     /// Re-anchor the live TUI message every N inbound Slack messages so it
     /// stays near the bottom of the channel as the user types. 0 disables.
     pub anchor_refresh: Option<u32>,
+    /// Friendly display name for the session, used in lifecycle banners.
+    pub name: Option<String>,
 }
 
 impl AppConfig {

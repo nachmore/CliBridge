@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 /// Returns `Ok(())` if at least one launcher succeeded; `Err` if every launcher
 /// failed, in which case the caller should print the attach command to the
 /// user's existing console so they can run it themselves.
-pub fn open_attach_terminal(addr: &str, token: &str) -> Result<()> {
+pub fn open_attach_terminal(addr: &str, token: &str, session_name: &str) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to locate cli-bridge executable")?;
     let exe_str = exe.to_string_lossy().into_owned();
 
@@ -30,7 +30,11 @@ pub fn open_attach_terminal(addr: &str, token: &str) -> Result<()> {
         exe.display()
     );
 
-    let attempts = launch_attempts(&exe_str, addr, token);
+    // Sanitize the session name for window-title use: drop quotes and control
+    // chars that would break the per-OS launcher quoting.
+    let title = sanitize_title(session_name);
+
+    let attempts = launch_attempts(&exe_str, addr, token, &title);
     let mut errors = Vec::new();
     for attempt in attempts {
         match attempt.try_spawn() {
@@ -69,7 +73,7 @@ impl LaunchAttempt {
 }
 
 #[cfg(target_os = "windows")]
-fn launch_attempts(exe: &str, addr: &str, token: &str) -> Vec<LaunchAttempt> {
+fn launch_attempts(exe: &str, addr: &str, token: &str, title: &str) -> Vec<LaunchAttempt> {
     let attach_args = format!("--attach {addr} --attach-token {token}");
     vec![
         // Prefer Windows Terminal if installed — better font, resizable.
@@ -79,7 +83,7 @@ fn launch_attempts(exe: &str, addr: &str, token: &str) -> Vec<LaunchAttempt> {
             args: vec![
                 "new-tab".to_string(),
                 "--title".to_string(),
-                "CliBridge attach".to_string(),
+                title.to_string(),
                 "cmd.exe".to_string(),
                 "/c".to_string(),
                 format!("\"{exe}\" {attach_args}"),
@@ -92,7 +96,7 @@ fn launch_attempts(exe: &str, addr: &str, token: &str) -> Vec<LaunchAttempt> {
             args: vec![
                 "/c".to_string(),
                 "start".to_string(),
-                "\"CliBridge attach\"".to_string(),
+                format!("\"{title}\""),
                 "/wait".to_string(),
                 exe.to_string(),
                 "--attach".to_string(),
@@ -105,7 +109,7 @@ fn launch_attempts(exe: &str, addr: &str, token: &str) -> Vec<LaunchAttempt> {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_attempts(exe: &str, addr: &str, token: &str) -> Vec<LaunchAttempt> {
+fn launch_attempts(exe: &str, addr: &str, token: &str, _title: &str) -> Vec<LaunchAttempt> {
     // AppleScript: tell Terminal to open a new window running our attach command.
     // Quoting is fiddly — the script is one big string passed to osascript -e.
     let script = format!(
@@ -119,7 +123,7 @@ fn launch_attempts(exe: &str, addr: &str, token: &str) -> Vec<LaunchAttempt> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn launch_attempts(exe: &str, addr: &str, token: &str) -> Vec<LaunchAttempt> {
+fn launch_attempts(exe: &str, addr: &str, token: &str, _title: &str) -> Vec<LaunchAttempt> {
     let cmd = format!("{exe} --attach {addr} --attach-token {token}");
     vec![
         // Most common on modern desktop Linux.
@@ -161,6 +165,21 @@ fn launch_attempts(exe: &str, addr: &str, token: &str) -> Vec<LaunchAttempt> {
     ]
 }
 
+/// Strip characters that would break the per-OS launcher's quoting:
+/// double-quotes, backticks, control chars. Empty input → fallback default.
+fn sanitize_title(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '`')
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "CliBridge attach".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Print the manual attach command to stderr/stdout so the user can run it
 /// themselves if no auto-launcher worked.
 pub fn print_manual_attach_hint(addr: &str, token: &str) {
@@ -181,7 +200,7 @@ mod tests {
     fn launch_attempts_nonempty() {
         // Smoke-test: every supported platform produces at least one attempt
         // with a non-empty label and program.
-        let attempts = launch_attempts("/bin/cli-bridge", "127.0.0.1:1234", "tok");
+        let attempts = launch_attempts("/bin/cli-bridge", "127.0.0.1:1234", "tok", "my-session");
         assert!(!attempts.is_empty());
         for a in &attempts {
             assert!(!a.label.is_empty());
@@ -195,5 +214,34 @@ mod tests {
                 a.args
             );
         }
+    }
+
+    #[test]
+    fn sanitize_title_strips_unsafe_chars() {
+        assert_eq!(sanitize_title("my session"), "my session");
+        assert_eq!(sanitize_title("my\"session"), "mysession");
+        assert_eq!(sanitize_title("a`b"), "ab");
+        assert_eq!(sanitize_title("a\nb"), "ab");
+        // Empty / whitespace-only → default
+        assert_eq!(sanitize_title(""), "CliBridge attach");
+        assert_eq!(sanitize_title("   "), "CliBridge attach");
+        // Trim leading/trailing whitespace.
+        assert_eq!(sanitize_title("  build  "), "build");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn launch_attempts_threads_title_into_windows_args() {
+        let attempts = launch_attempts("cli-bridge.exe", "127.0.0.1:1234", "tok", "my-session");
+        // At least one attempt should mention the title. The wt.exe attempt
+        // passes it as a separate --title arg; cmd /c start passes it as the
+        // first quoted positional.
+        let any = attempts
+            .iter()
+            .any(|a| a.args.iter().any(|s| s.contains("my-session")));
+        assert!(
+            any,
+            "no Windows launch attempt referenced the session title"
+        );
     }
 }

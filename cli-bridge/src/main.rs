@@ -69,6 +69,11 @@ struct Cli {
     /// Default: 10.
     #[arg(long)]
     anchor_refresh: Option<u32>,
+
+    /// Display name for this session. Shows up in start / exit / restart
+    /// banners. Can be changed at runtime with `--name <text>` from Slack.
+    #[arg(long)]
+    name: Option<String>,
 }
 
 #[tokio::main]
@@ -123,6 +128,10 @@ async fn main() -> Result<()> {
     };
 
     let anchor_refresh = cli.anchor_refresh.or(config.anchor_refresh).unwrap_or(10);
+    let name = cli
+        .name
+        .or(config.name.clone())
+        .unwrap_or_else(|| "CliBridge".to_string());
 
     bridge::run(
         &channel,
@@ -132,6 +141,7 @@ async fn main() -> Result<()> {
         size,
         !cli.no_local,
         anchor_refresh,
+        name,
     )
     .await
 }

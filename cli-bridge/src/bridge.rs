@@ -53,6 +53,7 @@ pub async fn run(
     size: TerminalSize,
     local: bool,
     anchor_refresh: u32,
+    name: String,
 ) -> Result<()> {
     let store = CredentialStore::new()?;
     let credentials = if let Some(ws) = workspace {
@@ -81,10 +82,19 @@ pub async fn run(
     slack.connect(credentials).await?;
     info!("Connected to Slack");
 
+    // Wrap the name in Arc<Mutex<_>> so the session task can mutate it on
+    // `--name <text>` from Slack and the outer loop sees the new value when
+    // posting between-session banners. Locks are held for microseconds at a
+    // time around format!() calls; not a perf concern.
+    let name = std::sync::Arc::new(std::sync::Mutex::new(name));
+
     slack
         .send_message(
             channel,
-            "🖥️ *CliBridge session started*\nType commands here or use `--help` for special commands.",
+            &format!(
+                "🖥️ *{} session started*\nType commands here or use `--help` for special commands.",
+                read_name(&name)
+            ),
         )
         .await?;
 
@@ -102,6 +112,7 @@ pub async fn run(
             size,
             local,
             anchor_refresh,
+            name.clone(),
         )
         .await?;
         match outcome {
@@ -111,23 +122,34 @@ pub async fn run(
                 slack
                     .send_message(
                         channel,
-                        "⚡ *Shell exited.* Send `--new` to start a new shell, or Ctrl+C in the bridge window to quit.",
+                        &format!(
+                            "⚡ *{} shell exited.* Send `--new` to start a new shell, or Ctrl+C in the bridge window to quit.",
+                            read_name(&name)
+                        ),
                     )
                     .await?;
-                if !await_new_or_quit(&mut message_rx, &slack, channel).await? {
+                if !await_new_or_quit(&mut message_rx, &slack, channel, name.clone()).await? {
                     break;
                 }
                 slack
-                    .send_message(channel, "🔄 *Starting new shell…*")
+                    .send_message(
+                        channel,
+                        &format!("🔄 *Starting new shell for {}…*", read_name(&name)),
+                    )
                     .await?;
             }
             SessionEnd::UserRequestedNew => {
                 slack
-                    .send_message(channel, "🔄 *Restarting shell at user request…*")
+                    .send_message(
+                        channel,
+                        &format!("🔄 *Restarting {} at user request…*", read_name(&name)),
+                    )
                     .await?;
             }
             SessionEnd::UserKilled => {
-                slack.send_message(channel, "💀 *Shell killed.*").await?;
+                slack
+                    .send_message(channel, &format!("💀 *{} killed.*", read_name(&name)))
+                    .await?;
                 break;
             }
             SessionEnd::Interrupted => {
@@ -135,7 +157,7 @@ pub async fn run(
                     SHUTDOWN_POST_TIMEOUT,
                     slack.send_message(
                         channel,
-                        "👋 *CliBridge session ended* (interrupted by host)",
+                        &format!("👋 *{} ended* (interrupted by host)", read_name(&name)),
                     ),
                 )
                 .await;
@@ -146,6 +168,15 @@ pub async fn run(
 
     info!("Bridge run loop ended");
     Ok(())
+}
+
+/// Read the current session name. Held briefly under the mutex; the lock
+/// is uncontended in steady state (only the session loop writes, only the
+/// banner-posting paths read).
+fn read_name(name: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
+    name.lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "CliBridge".to_string())
 }
 
 /// Run a single shell session: spawn PTY + (optional) attach server, pump I/O
@@ -159,6 +190,7 @@ async fn run_session(
     size: TerminalSize,
     local: bool,
     anchor_refresh: u32,
+    name: std::sync::Arc<std::sync::Mutex<String>>,
 ) -> Result<SessionEnd> {
     // Start a fresh attach server per session. Old attach clients (from a
     // previous session) have already disconnected because their server was
@@ -168,7 +200,8 @@ async fn run_session(
             Ok(s) => {
                 let addr = s.addr.to_string();
                 let token = s.token.clone();
-                match open_attach_terminal(&addr, &token) {
+                let session_title = read_name(&name);
+                match open_attach_terminal(&addr, &token, &session_title) {
                     Ok(()) => {}
                     Err(e) => {
                         info!("Auto-spawn of attach terminal failed: {e}");
@@ -302,6 +335,7 @@ async fn run_session(
                     slack,
                     channel,
                     &mut current_message_id,
+                    &name,
                 ).await;
 
                 // Re-anchor: every Nth inbound message, force the next TUI
@@ -350,6 +384,7 @@ async fn await_new_or_quit(
     message_rx: &mut mpsc::Receiver<IncomingMessage>,
     slack: &SlackClient,
     channel: &str,
+    name: std::sync::Arc<std::sync::Mutex<String>>,
 ) -> Result<bool> {
     loop {
         tokio::select! {
@@ -369,6 +404,22 @@ async fn await_new_or_quit(
                     ParsedInput::Command(SpecialCommand::Kill) => {
                         slack.send_message(channel, "💀 No shell to kill — already exited.").await?;
                         return Ok(false);
+                    }
+                    ParsedInput::Command(SpecialCommand::Name(new_name)) => {
+                        // Allow renaming while idle too — pre-`--new`, the
+                        // user might want to label the upcoming session.
+                        let trimmed = new_name.trim().to_string();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let display = {
+                            let mut g = name.lock().unwrap();
+                            *g = trimmed.clone();
+                            trimmed
+                        };
+                        slack
+                            .send_message(channel, &format!("🏷️ Session renamed to *{display}*."))
+                            .await?;
                     }
                     _ => {
                         slack
@@ -391,6 +442,7 @@ enum SlackOutcome {
     RestartOrNew,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_slack_message(
     msg: &IncomingMessage,
     input_tx: &mpsc::Sender<Vec<u8>>,
@@ -399,6 +451,7 @@ async fn handle_slack_message(
     slack: &SlackClient,
     channel: &str,
     current_message_id: &mut Option<String>,
+    name: &std::sync::Arc<std::sync::Mutex<String>>,
 ) -> SlackOutcome {
     let parsed = parse_input(&msg.text);
     match parsed {
@@ -434,6 +487,21 @@ async fn handle_slack_message(
             }
             SpecialCommand::Help => {
                 let _ = slack.send_message(channel, &help_text()).await;
+                SlackOutcome::Continue
+            }
+            SpecialCommand::Name(new_name) => {
+                let trimmed = new_name.trim().to_string();
+                if trimmed.is_empty() {
+                    return SlackOutcome::Continue;
+                }
+                let display = {
+                    let mut g = name.lock().unwrap();
+                    *g = trimmed.clone();
+                    trimmed
+                };
+                let _ = slack
+                    .send_message(channel, &format!("🏷️ Session renamed to *{display}*."))
+                    .await;
                 SlackOutcome::Continue
             }
             other => {

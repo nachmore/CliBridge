@@ -43,6 +43,9 @@ pub enum SpecialCommand {
     Escape,
     /// Show help for available commands
     Help,
+    /// Rename the session — affects the labels in lifecycle banners
+    /// (started / restarted / exited / killed). Argument is the new name.
+    Name(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +129,16 @@ pub fn parse_input(input: &str) -> ParsedInput {
                 ParsedInput::Command(SpecialCommand::Tmux(String::new()))
             }
         }
+        "name" => {
+            // Multi-word names are fine: "--name my session" → "my session".
+            if let Some(arg) = arg
+                && !arg.is_empty()
+            {
+                ParsedInput::Command(SpecialCommand::Name(arg.to_string()))
+            } else {
+                ParsedInput::Text(input.to_string())
+            }
+        }
         _ => ParsedInput::Text(input.to_string()),
     }
 }
@@ -183,7 +196,8 @@ pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
         | SpecialCommand::Restart
         | SpecialCommand::Resize(_)
         | SpecialCommand::Clear
-        | SpecialCommand::Help => None,
+        | SpecialCommand::Help
+        | SpecialCommand::Name(_) => None,
     }
 }
 
@@ -205,6 +219,7 @@ pub fn help_text() -> String {
 • `--tmux <key>` — Send tmux prefix + key
 • `--raw <hex>` — Send raw bytes (hex-encoded)
 • `--slash <name>` — Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code)
+• `--name <text>` — Rename the session (shows up in start/exit banners)
 • `--help` — Show this help
 
 Any other text is sent directly as terminal input."#
@@ -329,6 +344,38 @@ mod tests {
         assert_eq!(
             parse_input("--slash"),
             ParsedInput::Text("--slash".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_name() {
+        assert_eq!(
+            parse_input("--name my-session"),
+            ParsedInput::Command(SpecialCommand::Name("my-session".to_string()))
+        );
+        // Multi-word names: keep the whole tail.
+        assert_eq!(
+            parse_input("--name build server   us-east"),
+            ParsedInput::Command(SpecialCommand::Name("build server   us-east".to_string()))
+        );
+        // Empty arg → falls through to plain text (avoids silently clearing
+        // the name on a typo).
+        assert_eq!(
+            parse_input("--name"),
+            ParsedInput::Text("--name".to_string())
+        );
+        assert_eq!(
+            parse_input("--name "),
+            ParsedInput::Text("--name ".to_string())
+        );
+    }
+
+    #[test]
+    fn test_command_to_bytes_name_returns_none() {
+        // Name is a control command, no PTY bytes.
+        assert_eq!(
+            command_to_bytes(&SpecialCommand::Name("foo".to_string())),
+            None
         );
     }
 

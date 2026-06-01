@@ -79,6 +79,7 @@ Options:
       --rows <ROWS>            Terminal height in rows (default: 24)
       --no-local               Skip auto-opening a local terminal mirror
       --anchor-refresh <N>     Re-anchor the live TUI message every N inbound Slack messages (default: 10, 0 to disable)
+      --name <NAME>            Display name for this session (used in banners and the local terminal title)
       --config <CONFIG>        Path to config file
       --login                  Open browser to sign in to Slack
       --list-workspaces        List saved workspaces
@@ -118,6 +119,7 @@ When typing in Slack, prefix with `--` for special commands. (We avoid `/` becau
 | `--tmux <key>` | Send tmux prefix (Ctrl+B) + key |
 | `--raw <hex>` | Send raw bytes (hex-encoded) |
 | `--slash <name>` | Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code) |
+| `--name <text>` | Rename the session (shows up in start / exit / restart banners) |
 | `--help` | Show command help |
 
 Any other text is sent directly as terminal input with a newline appended.

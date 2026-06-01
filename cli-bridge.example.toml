@@ -25,3 +25,8 @@
 # Re-anchor the live TUI message every N inbound Slack messages so it stays
 # near the bottom of the channel as you type. 0 disables. Default: 10.
 # anchor_refresh = 10
+
+# Friendly display name for the session, used in start / exit / restart
+# banners and the local terminal window title. Default: "CliBridge".
+# Can be changed at runtime with `--name <text>` from Slack.
+# name = "build server"
