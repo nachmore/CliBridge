@@ -70,6 +70,22 @@ pub struct AttachServer {
     /// broadcast channel doesn't replay history, so without this, late
     /// joiners would see whatever default title their terminal launcher set.
     pub title_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
+    /// Handle to the spawned accept task. Aborted on Drop so the listener
+    /// closes and the accept loop's broadcast-Sender clone is released —
+    /// without this, the broadcast never reaches zero senders and connected
+    /// clients never see RecvError::Closed (so their windows never close).
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AttachServer {
+    fn drop(&mut self) {
+        // Aborting drops the accept_loop future, which drops the listener,
+        // the per-spawn output_tx clone, and any in-flight closures. The
+        // existing per-client tasks remain alive (they have their own
+        // broadcast::Receivers); they end up exiting once the broadcast
+        // closes — which now actually happens, because all senders go away.
+        self.accept_task.abort();
+    }
 }
 
 impl AttachServer {
@@ -93,7 +109,7 @@ impl AttachServer {
         let token_for_loop = token.clone();
         let output_for_loop = output_tx.clone();
         let title_for_loop = title_bytes.clone();
-        tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
             accept_loop(
                 listener,
                 token_for_loop,
@@ -111,6 +127,7 @@ impl AttachServer {
             output_tx,
             events: event_rx,
             title_bytes,
+            accept_task,
         })
     }
 
@@ -260,7 +277,12 @@ async fn handle_client(
     });
 
     // ---- Writer task: bridge → client ----
+    // Subscribe, then drop the local Sender clone. Each per-client task held
+    // a clone of the broadcast Sender; if we kept it for the lifetime of this
+    // function, the broadcast would never reach zero senders and connected
+    // clients would never see RecvError::Closed when the bridge shuts down.
     let mut output_rx = output_tx.subscribe();
+    drop(output_tx);
     loop {
         match output_rx.recv().await {
             Ok(bytes) => {
@@ -355,11 +377,13 @@ mod tests {
 
     #[tokio::test]
     async fn server_handshake_and_io() {
-        let server = AttachServer::start().await.unwrap();
+        let mut server = AttachServer::start().await.unwrap();
         let addr = server.addr;
         let token = server.token.clone();
         let output_tx = server.output_tx.clone();
-        let mut events = server.events;
+        // AttachServer has a Drop impl now (aborts the accept task), so we
+        // can't move fields out of it. Swap the receiver out instead.
+        let mut events = std::mem::replace(&mut server.events, mpsc::channel(1).1);
 
         // Client connects, says Hello, sends some Input, expects Output back.
         let client = tokio::spawn(async move {

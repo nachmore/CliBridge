@@ -1,18 +1,27 @@
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error};
 
 use bridge_core::error::BridgeError;
 use bridge_core::terminal::{TerminalBackend, TerminalHandle};
 use bridge_core::types::TerminalSize;
 
+/// How often the watcher polls `try_wait()` on the child process. Cheap; the
+/// only reason it's not faster is that we don't need it to be — exit
+/// detection within ~200ms is plenty.
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// PTY-based terminal backend using portable-pty (ConPTY on Windows, Unix PTY on Mac/Linux).
 pub struct PtyBackend {
     master: Option<Box<dyn MasterPty + Send>>,
-    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// Child process. Wrapped so a watcher task can poll try_wait() while
+    /// the bridge thread can still call kill() — both need mutable access.
+    child: Option<Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>>,
 }
 
 impl PtyBackend {
@@ -71,10 +80,17 @@ impl TerminalBackend for PtyBackend {
             .map_err(|e| BridgeError::Terminal(format!("Failed to take PTY writer: {e}")))?;
 
         self.master = Some(pair.master);
-        self.child = Some(child);
+        let child = Arc::new(Mutex::new(child));
+        self.child = Some(child.clone());
 
         // Output channel: PTY -> application
         let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(256);
+
+        // Exit signal: fires when the child process is reaped, even if the
+        // PTY's read pipe hasn't returned EOF yet. Windows ConPTY in
+        // particular can sit on a closed pipe for a beat after `exit`.
+        let (exit_tx, exit_rx) = oneshot::channel::<()>();
+        spawn_child_watcher(child, exit_tx);
 
         // Spawn a blocking thread to read from the PTY
         tokio::task::spawn_blocking(move || {
@@ -122,6 +138,7 @@ impl TerminalBackend for PtyBackend {
         Ok(TerminalHandle {
             output_rx,
             input_tx,
+            exit_rx,
         })
     }
 
@@ -139,8 +156,10 @@ impl TerminalBackend for PtyBackend {
     }
 
     fn kill(&mut self) -> Result<(), BridgeError> {
-        if let Some(mut child) = self.child.take() {
-            child
+        if let Some(child) = self.child.take()
+            && let Ok(mut guard) = child.lock()
+        {
+            guard
                 .kill()
                 .map_err(|e| BridgeError::Terminal(format!("Failed to kill child: {e}")))?;
         }
@@ -153,6 +172,44 @@ fn build_command(command: &str) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(command);
     cmd.env("TERM", "xterm-256color");
     cmd
+}
+
+/// Spawn a task that polls `try_wait()` on the child and fires `exit_tx`
+/// when it returns Some(_). Held under a Mutex with the kill path; lock is
+/// uncontended in steady state.
+fn spawn_child_watcher(
+    child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    exit_tx: oneshot::Sender<()>,
+) {
+    tokio::task::spawn_blocking(move || {
+        loop {
+            std::thread::sleep(CHILD_POLL_INTERVAL);
+            // If the bridge dropped its Arc clone (kill called .take()),
+            // the strong count would be 1 here. We could continue watching,
+            // but if the user explicitly killed, the bridge already knows.
+            // Just wait for try_wait to report the exit.
+            let status = match child.lock() {
+                Ok(mut g) => g.try_wait(),
+                Err(_) => {
+                    debug!("PTY child watcher: mutex poisoned, exiting");
+                    return;
+                }
+            };
+            match status {
+                Ok(Some(s)) => {
+                    debug!("PTY child exited: {s:?}");
+                    let _ = exit_tx.send(());
+                    return;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    debug!("PTY child try_wait error: {e}");
+                    let _ = exit_tx.send(());
+                    return;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -207,6 +264,30 @@ mod tests {
         // Kill it
         backend.kill().expect("Failed to kill");
         assert!(!backend.is_alive());
+    }
+
+    #[tokio::test]
+    async fn test_exit_signal_fires_on_kill() {
+        // After we kill the child, exit_rx must resolve. This is what the
+        // bridge relies on to detect "shell exited" without depending on
+        // the PTY's read pipe to return EOF (Windows ConPTY can be slow
+        // about that).
+        let mut backend = PtyBackend::new();
+        let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+
+        let handle = backend
+            .spawn(shell, TerminalSize::default())
+            .await
+            .expect("Failed to spawn");
+
+        backend.kill().expect("Failed to kill");
+
+        // Watcher polls every 200ms; allow generous slack.
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.exit_rx).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "exit_rx didn't fire within timeout: {result:?}"
+        );
     }
 
     #[tokio::test]

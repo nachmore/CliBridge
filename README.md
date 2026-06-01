@@ -110,7 +110,7 @@ When typing in Slack, prefix with `--` for special commands. (We avoid `/` becau
 | `--ctrl+l` | Clear screen |
 | `--ctrl+\` | Send SIGQUIT |
 | `--kill` | Kill the shell process |
-| `--restart` / `--new` | (Re)spawn the shell. `--new` reads better when the previous shell has already exited. |
+| `--restart` / `--new` | (Re)spawn the shell. While a shell is alive, asks for confirmation; reply `--new force` to terminate and start fresh. After the shell has exited, plain `--new` works. |
 | `--resize 120x40` | Resize terminal |
 | `--clear` | Re-anchor: end the current edited message and start a new one on the next output |
 | `--tab` | Send Tab key |

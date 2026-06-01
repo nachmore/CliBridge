@@ -17,11 +17,12 @@ pub enum SpecialCommand {
     CtrlBackslash,
     /// Kill the shell process
     Kill,
-    /// Restart the shell process. Same effect whether the shell is alive
-    /// (kill + respawn) or already exited (just spawn). Aliased to `--new`
-    /// in input parsing, since "new" reads better when the previous shell
-    /// has already died.
-    Restart,
+    /// Restart the shell process. The bool `force` distinguishes a plain
+    /// `--new` (asks for confirmation while a shell is alive) from
+    /// `--new force` (proceeds immediately). When the shell has already
+    /// exited, the bridge treats both as immediate. Aliased to `--new`
+    /// in input parsing.
+    Restart { force: bool },
     /// Resize the terminal
     Resize(TerminalSize),
     /// Clear the message history in the channel
@@ -86,7 +87,10 @@ pub fn parse_input(input: &str) -> ParsedInput {
         "ctrl+l" | "ctrll" | "cl" => ParsedInput::Command(SpecialCommand::CtrlL),
         "ctrl+\\" | "ctrlbs" => ParsedInput::Command(SpecialCommand::CtrlBackslash),
         "kill" => ParsedInput::Command(SpecialCommand::Kill),
-        "restart" | "new" => ParsedInput::Command(SpecialCommand::Restart),
+        "restart" | "new" => {
+            let force = matches!(arg, Some(a) if a.eq_ignore_ascii_case("force"));
+            ParsedInput::Command(SpecialCommand::Restart { force })
+        }
         "clear" => ParsedInput::Command(SpecialCommand::Clear),
         "help" => ParsedInput::Command(SpecialCommand::Help),
         "tab" => ParsedInput::Command(SpecialCommand::Tab),
@@ -193,7 +197,7 @@ pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
         }
         // These commands don't produce terminal bytes
         SpecialCommand::Kill
-        | SpecialCommand::Restart
+        | SpecialCommand::Restart { .. }
         | SpecialCommand::Resize(_)
         | SpecialCommand::Clear
         | SpecialCommand::Help
@@ -210,7 +214,7 @@ pub fn help_text() -> String {
 • `--ctrl+l` — Clear screen
 • `--ctrl+\` — Send SIGQUIT
 • `--kill` — Kill the shell process
-• `--restart` / `--new` — (Re)spawn the shell. `--new` is a friendly alias when the previous shell has exited.
+• `--restart` / `--new` — (Re)spawn the shell. While a shell is alive, asks for confirmation; reply `--new force` to terminate the current one and start fresh. After the shell has exited, plain `--new` works.
 • `--resize 120x40` — Resize terminal (cols x rows)
 • `--clear` — Re-anchor: end the current edited message, start a fresh one on next output
 • `--tab` — Send Tab key
@@ -383,11 +387,29 @@ mod tests {
     fn test_parse_new_aliases_restart() {
         assert_eq!(
             parse_input("--new"),
-            ParsedInput::Command(SpecialCommand::Restart)
+            ParsedInput::Command(SpecialCommand::Restart { force: false })
         );
         assert_eq!(
             parse_input("--restart"),
-            ParsedInput::Command(SpecialCommand::Restart)
+            ParsedInput::Command(SpecialCommand::Restart { force: false })
+        );
+    }
+
+    #[test]
+    fn test_parse_new_force() {
+        assert_eq!(
+            parse_input("--new force"),
+            ParsedInput::Command(SpecialCommand::Restart { force: true })
+        );
+        // Case-insensitive
+        assert_eq!(
+            parse_input("--new FORCE"),
+            ParsedInput::Command(SpecialCommand::Restart { force: true })
+        );
+        // Anything else is treated as not-force
+        assert_eq!(
+            parse_input("--new please"),
+            ParsedInput::Command(SpecialCommand::Restart { force: false })
         );
     }
 

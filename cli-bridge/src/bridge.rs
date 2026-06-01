@@ -26,6 +26,12 @@ const RENDER_TICK: Duration = Duration::from_millis(1100);
 /// Best-effort: if the network is wedged we'd rather exit than hang.
 const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// After the shell process exits, keep the session loop alive briefly to
+/// drain any trailing PTY output (Windows ConPTY can keep emitting bytes
+/// for a beat after the child is reaped). After this elapses, we break
+/// out and tear down.
+const SHELL_EXIT_GRACE: Duration = Duration::from_millis(500);
+
 /// Reason a shell session ended. The outer run loop uses this to decide
 /// whether to spawn a new session, ask the user, or quit entirely.
 enum SessionEnd {
@@ -250,6 +256,14 @@ async fn run_session(
 
     let mut output_rx = handle.output_rx;
     let input_tx = handle.input_tx;
+    // The PTY exit signal. Wrapped in Option so we can `take()` it on first
+    // fire — oneshot receivers panic if polled after they resolve, and we
+    // want the surrounding select! to keep running for a short while after
+    // exit to drain any trailing PTY output.
+    let mut exit_rx = Some(handle.exit_rx);
+    // Whether we've observed the shell exiting. Once true, we begin a short
+    // grace period for trailing output and then break out of the session.
+    let mut shell_exited_at: Option<tokio::time::Instant> = None;
 
     let mut renderer = TuiRenderer::new(size.cols, size.rows);
     let mut current_message_id: Option<String> = None;
@@ -277,6 +291,32 @@ async fn run_session(
             match attach_events.as_mut() {
                 Some(rx) => rx.recv().await,
                 None => std::future::pending::<Option<AttachEvent>>().await,
+            }
+        };
+
+        // Future that fires once when the child exits, then never again.
+        // After firing we still want the select! to keep running long enough
+        // to drain trailing output. Rather than re-take() the receiver each
+        // tick, we just std::future::pending after the first fire, signalled
+        // via shell_exited_at being Some.
+        let exit_signal = async {
+            if shell_exited_at.is_some() {
+                std::future::pending::<()>().await;
+            }
+            match exit_rx.as_mut() {
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+
+        // Future that fires when the post-exit grace period elapses. Only
+        // active once shell_exited_at is set.
+        let exit_grace_done = async {
+            match shell_exited_at {
+                Some(t) => tokio::time::sleep_until(t + SHELL_EXIT_GRACE).await,
+                None => std::future::pending::<()>().await,
             }
         };
 
@@ -332,6 +372,29 @@ async fn run_session(
                 if let Some(rendered) = renderer.take_pending() {
                     post_or_edit(slack, channel, rendered, &mut current_message_id).await;
                 }
+            }
+
+            // Child exited: mark the time so the grace timer starts. Don't
+            // tear down yet — keep the loop alive for SHELL_EXIT_GRACE so
+            // trailing PTY output (slow-to-flush on Windows ConPTY) makes it
+            // into Slack and the attach window before we close everything.
+            _ = exit_signal => {
+                if shell_exited_at.is_none() {
+                    info!("PTY child reaped");
+                    exit_rx = None;
+                    shell_exited_at = Some(tokio::time::Instant::now());
+                }
+            }
+
+            // Grace period elapsed after shell exit: tear down the session.
+            _ = exit_grace_done, if shell_exited_at.is_some() => {
+                info!("Shell exit grace elapsed, tearing down session");
+                let _ = attach.take();
+                let _ = attach_output.take();
+                if let Some(rendered) = renderer.take_pending() {
+                    post_or_edit(slack, channel, rendered, &mut current_message_id).await;
+                }
+                break SessionEnd::ShellExited;
             }
 
             // Local Ctrl+C: end the whole bridge run (not just this session).
@@ -435,7 +498,9 @@ async fn await_new_or_quit(
                     return Ok(false);
                 };
                 match parse_input(&msg.text) {
-                    ParsedInput::Command(SpecialCommand::Restart) => return Ok(true),
+                    // Between sessions, plain `--new` is fine — there's no
+                    // shell to terminate. `--new force` works the same.
+                    ParsedInput::Command(SpecialCommand::Restart { .. }) => return Ok(true),
                     ParsedInput::Command(SpecialCommand::Help) => {
                         slack.send_message(channel, &help_text()).await?;
                     }
@@ -505,7 +570,22 @@ async fn handle_slack_message(
         }
         ParsedInput::Command(cmd) => match cmd {
             SpecialCommand::Kill => SlackOutcome::Kill,
-            SpecialCommand::Restart => SlackOutcome::RestartOrNew,
+            SpecialCommand::Restart { force } => {
+                if force {
+                    SlackOutcome::RestartOrNew
+                } else {
+                    // Shell is alive (we're in the session loop); require
+                    // explicit `--new force` to terminate it. Stateless: no
+                    // pending-confirmation flag to mismanage on retries.
+                    let _ = slack
+                        .send_message(
+                            channel,
+                            "⚠️  A shell is already running. Reply `--new force` to terminate it and start a new one.",
+                        )
+                        .await;
+                    SlackOutcome::Continue
+                }
+            }
             SpecialCommand::Resize(new_size) => {
                 if let Err(e) = pty.resize(new_size) {
                     error!("Failed to resize PTY: {e}");

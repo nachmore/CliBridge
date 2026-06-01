@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::BridgeError;
 use crate::types::TerminalSize;
@@ -32,4 +32,9 @@ pub struct TerminalHandle {
     pub output_rx: mpsc::Receiver<Vec<u8>>,
     /// Sender for terminal input bytes
     pub input_tx: mpsc::Sender<Vec<u8>>,
+    /// Resolves when the child process exits. Backends should fire this as
+    /// soon as the child is reaped, even if the OS hasn't closed the PTY
+    /// read pipe yet (Windows ConPTY in particular can delay EOF). Carries
+    /// no payload — the bridge only needs to know that the shell is done.
+    pub exit_rx: oneshot::Receiver<()>,
 }
