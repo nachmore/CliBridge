@@ -179,6 +179,24 @@ fn read_name(name: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
         .unwrap_or_else(|_| "CliBridge".to_string())
 }
 
+/// Build the `\x1b]0;<title>\x07` OSC 0 frame ("set window title"). Both
+/// connected terminals and our own renderer accept this — the renderer's
+/// strip_ansi drops OSC bodies, so the same bytes work for Slack and attach.
+///
+/// Sanitizes BEL and ESC out of the title since they'd terminate the
+/// sequence prematurely; control chars get stripped wholesale.
+fn build_title_frame(title: &str) -> Arc<Vec<u8>> {
+    let cleaned: String = title
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\u{1b}')
+        .collect();
+    let mut bytes = Vec::with_capacity(cleaned.len() + 4);
+    bytes.extend_from_slice(b"\x1b]0;");
+    bytes.extend_from_slice(cleaned.as_bytes());
+    bytes.push(0x07);
+    Arc::new(bytes)
+}
+
 /// Run a single shell session: spawn PTY + (optional) attach server, pump I/O
 /// between PTY, Slack, and attach clients until the session ends.
 #[allow(clippy::too_many_arguments)]
@@ -222,6 +240,13 @@ async fn run_session(
     let mut pty = PtyBackend::new();
     let handle = pty.spawn(shell, size).await?;
     info!("Spawned shell: {shell} ({}x{})", size.cols, size.rows);
+
+    // Push the current session name as the attach window title. The attach
+    // server latches the frame so any client that connects after this point
+    // (handshake races the spawn) still gets the right title.
+    if let Some(s) = attach.as_ref() {
+        s.set_title(build_title_frame(&read_name(&name)));
+    }
 
     let mut output_rx = handle.output_rx;
     let input_tx = handle.input_tx;
@@ -348,6 +373,7 @@ async fn run_session(
                     channel,
                     &mut current_message_id,
                     &name,
+                    attach.as_ref(),
                 ).await;
 
                 // Re-anchor: every Nth inbound message, force the next TUI
@@ -464,6 +490,7 @@ async fn handle_slack_message(
     channel: &str,
     current_message_id: &mut Option<String>,
     name: &std::sync::Arc<std::sync::Mutex<String>>,
+    attach: Option<&AttachServer>,
 ) -> SlackOutcome {
     let parsed = parse_input(&msg.text);
     match parsed {
@@ -511,6 +538,11 @@ async fn handle_slack_message(
                     *g = trimmed.clone();
                     trimmed
                 };
+                // Update the attach window title in real time. Latches in
+                // AttachServer so future-connecting clients also pick it up.
+                if let Some(s) = attach {
+                    s.set_title(build_title_frame(&display));
+                }
                 let _ = slack
                     .send_message(channel, &format!("🏷️ Session renamed to *{display}*."))
                     .await;

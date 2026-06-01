@@ -15,7 +15,7 @@
 //!   their Hello frame; mismatch → kick before we hand them the broadcast.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -64,6 +64,12 @@ pub struct AttachServer {
     pub output_tx: broadcast::Sender<Arc<Vec<u8>>>,
     /// Events from clients → bridge.
     pub events: mpsc::Receiver<AttachEvent>,
+    /// Most recent OSC 0 title bytes set by the bridge (e.g. on session
+    /// start or rename). Replayed to each newly-connected client so a
+    /// client that joins after a rename still sees the right title. The
+    /// broadcast channel doesn't replay history, so without this, late
+    /// joiners would see whatever default title their terminal launcher set.
+    pub title_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
 }
 
 impl AttachServer {
@@ -82,11 +88,20 @@ impl AttachServer {
         // Output broadcast is 1:N where N = current attach clients.
         let (output_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(256);
+        let title_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
 
         let token_for_loop = token.clone();
         let output_for_loop = output_tx.clone();
+        let title_for_loop = title_bytes.clone();
         tokio::spawn(async move {
-            accept_loop(listener, token_for_loop, output_for_loop, event_tx).await;
+            accept_loop(
+                listener,
+                token_for_loop,
+                output_for_loop,
+                event_tx,
+                title_for_loop,
+            )
+            .await;
         });
 
         info!("Attach server listening on {addr}");
@@ -95,7 +110,19 @@ impl AttachServer {
             token,
             output_tx,
             events: event_rx,
+            title_bytes,
         })
+    }
+
+    /// Update the latching title — called by the bridge on session start
+    /// and on `--name` rename. Newly-connecting clients will receive this
+    /// frame right after HelloOk; already-connected clients receive it via
+    /// the normal broadcast.
+    pub fn set_title(&self, frame: Arc<Vec<u8>>) {
+        if let Ok(mut g) = self.title_bytes.lock() {
+            *g = Some(frame.clone());
+        }
+        let _ = self.output_tx.send(frame);
     }
 }
 
@@ -104,6 +131,7 @@ async fn accept_loop(
     token: String,
     output_tx: broadcast::Sender<Arc<Vec<u8>>>,
     event_tx: mpsc::Sender<AttachEvent>,
+    title_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
 ) {
     loop {
         let (sock, peer) = match listener.accept().await {
@@ -125,8 +153,10 @@ async fn accept_loop(
         let token = token.clone();
         let output_tx = output_tx.clone();
         let event_tx = event_tx.clone();
+        let title_for_client = title_bytes.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(sock, &token, output_tx, event_tx).await {
+            if let Err(e) = handle_client(sock, &token, output_tx, event_tx, title_for_client).await
+            {
                 debug!("attach client {peer} ended: {e}");
             }
         });
@@ -138,6 +168,7 @@ async fn handle_client(
     expected_token: &str,
     output_tx: broadcast::Sender<Arc<Vec<u8>>>,
     event_tx: mpsc::Sender<AttachEvent>,
+    title_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
 ) -> Result<()> {
     let (mut rd, wr) = sock.into_split();
     // Buffer writes so we don't make a syscall per Output frame; the writer
@@ -175,6 +206,15 @@ async fn handle_client(
 
     protocol::write_frame(&mut wr, &Message::HelloOk).await?;
     wr.flush().await?;
+
+    // Replay the latched window title so a client connecting after a rename
+    // (or after the initial title was broadcast) still gets the right title.
+    // Held under a short lock — clone the Arc, drop the guard, then write.
+    let latched_title = title_bytes.lock().ok().and_then(|g| g.clone());
+    if let Some(frame) = latched_title {
+        let _ = protocol::write_frame(&mut wr, &Message::Output((*frame).clone())).await;
+        let _ = wr.flush().await;
+    }
 
     // Tell the bridge about the client's initial size so the PTY matches.
     let _ = event_tx
@@ -375,6 +415,51 @@ mod tests {
         output_tx.send(Arc::new(b"server-greets".to_vec())).unwrap();
 
         client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_replays_latched_title_after_handshake() {
+        // Set the title BEFORE any client connects: a client that joins
+        // afterwards should still see the title frame as its first Output.
+        let server = AttachServer::start().await.unwrap();
+        let addr = server.addr;
+        let token = server.token.clone();
+        let title_frame = Arc::new(b"\x1b]0;my session\x07".to_vec());
+        server.set_title(title_frame.clone());
+
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = sock.split();
+        protocol::write_frame(
+            &mut wr,
+            &Message::Hello {
+                version: protocol::PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                token,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = tokio::time::timeout(Duration::from_secs(2), protocol::read_frame(&mut rd))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp, Message::HelloOk);
+
+        // Next frame should be the latched title.
+        let title = tokio::time::timeout(Duration::from_secs(2), protocol::read_frame(&mut rd))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match title {
+            Message::Output(bytes) => {
+                assert_eq!(bytes, *title_frame);
+            }
+            other => panic!("expected Output(title), got {other:?}"),
+        }
     }
 
     #[tokio::test]
