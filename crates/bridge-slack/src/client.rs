@@ -29,6 +29,16 @@ pub struct SlackClient {
     /// user typing in Slack, so we can't use it to filter "our own" messages —
     /// we track posted ts's instead (see `posted_ts`).
     self_user_id: Option<String>,
+    /// The workspace's `team_id`, captured from `auth.test`. Required as a
+    /// query param for some endpoints when the bridge talks to an enterprise
+    /// grid: without it, `users.conversations` returns
+    /// `enterprise_is_restricted`.
+    team_id: Option<String>,
+    /// The enterprise grid's ID (e.g. `E015GUGD2V6`), captured from
+    /// `auth.test` when the workspace is part of a grid. Used to talk to
+    /// the edge search API when the regular `users.conversations` endpoint
+    /// is restricted.
+    enterprise_id: Option<String>,
     /// Timestamps of messages we ourselves posted via chat.postMessage /
     /// chat.update. The poller skips these so we don't echo our own output
     /// back into the PTY.
@@ -84,6 +94,8 @@ struct SlackResponse {
 struct AuthTestResponse {
     ok: bool,
     user_id: Option<String>,
+    team_id: Option<String>,
+    enterprise_id: Option<String>,
     error: Option<String>,
 }
 
@@ -122,6 +134,17 @@ struct ResponseMetadata {
     next_cursor: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct EdgeSearchResponse {
+    results: Option<Vec<EdgeChannel>>,
+}
+
+#[derive(Deserialize)]
+struct EdgeChannel {
+    id: Option<String>,
+    name: Option<String>,
+}
+
 impl SlackClient {
     pub fn new() -> Self {
         Self {
@@ -130,6 +153,8 @@ impl SlackClient {
             rate_limiter: RateLimiter::new(Duration::from_millis(1100)),
             api_base: DEFAULT_API_BASE.to_string(),
             self_user_id: None,
+            team_id: None,
+            enterprise_id: None,
             posted_ts: Arc::new(Mutex::new(PostedTsRing::default())),
         }
     }
@@ -171,13 +196,28 @@ impl SlackClient {
         Ok(headers)
     }
 
-    /// Resolve a channel name (e.g. "general") to its ID via the Slack API.
-    /// Iterates `users.conversations` so it covers public, private, and
-    /// group DMs the authenticated user is a member of. Match is exact and
-    /// case-sensitive (Slack channel names are lowercased server-side, so
-    /// the caller should lowercase too if it accepted user input).
+    /// Resolve a channel name (e.g. "general") to its ID.
+    ///
+    /// Tries `users.conversations` first (covers public, private, mpim, and
+    /// im for whatever the user is in). Some enterprise grids deny that
+    /// endpoint with `enterprise_is_restricted`; for those we fall back to
+    /// the edge search API used by the web client
+    /// (`edgeapi.slack.com/cache/<enterprise_id>/channels/search`).
     pub async fn resolve_channel_name(&self, name: &str) -> Result<String, BridgeError> {
         let needle = name.trim_start_matches('#').to_lowercase();
+
+        match self.resolve_via_users_conversations(&needle).await {
+            Ok(id) => Ok(id),
+            Err(BridgeError::Messaging(msg)) if msg.contains("enterprise_is_restricted") => {
+                debug!("users.conversations restricted on this grid, falling back to edge search");
+                self.resolve_via_edge_search(&needle).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Standard path. Works on regular workspaces; some grids will refuse.
+    async fn resolve_via_users_conversations(&self, needle: &str) -> Result<String, BridgeError> {
         let creds = self.credentials.as_ref().ok_or_else(|| {
             BridgeError::Messaging("resolve_channel_name: not connected".to_string())
         })?;
@@ -193,6 +233,10 @@ impl SlackClient {
                     "public_channel,private_channel,mpim,im".to_string(),
                 ),
             ];
+            // Including team_id when available makes the query grid-aware.
+            if let Some(ref t) = self.team_id {
+                form.push(("team_id", t.clone()));
+            }
             if let Some(ref c) = cursor {
                 form.push(("cursor", c.clone()));
             }
@@ -237,7 +281,84 @@ impl SlackClient {
         }
 
         Err(BridgeError::Messaging(format!(
-            "channel '{name}' not found (or not visible to this user)"
+            "channel '{needle}' not found (or not visible to this user)"
+        )))
+    }
+
+    /// Edge search fallback for enterprise grids.
+    /// `POST https://edgeapi.slack.com/cache/<enterprise_id>/channels/search`
+    /// with a JSON body — same call the Slack web client makes.
+    async fn resolve_via_edge_search(&self, needle: &str) -> Result<String, BridgeError> {
+        let creds = self.credentials.as_ref().ok_or_else(|| {
+            BridgeError::Messaging("resolve_channel_name: not connected".to_string())
+        })?;
+        let enterprise = self.enterprise_id.as_deref().ok_or_else(|| {
+            BridgeError::Messaging(
+                "edge search needs an enterprise_id, but auth.test didn't return one — \
+                 pass the channel ID via --channel <C…> instead"
+                    .to_string(),
+            )
+        })?;
+        let team = self.team_id.as_deref().ok_or_else(|| {
+            BridgeError::Messaging(
+                "edge search needs a team_id, but auth.test didn't return one".to_string(),
+            )
+        })?;
+
+        let url = format!("https://edgeapi.slack.com/cache/{enterprise}/channels/search");
+        let body = serde_json::json!({
+            "token": creds.token,
+            "query": needle,
+            "count": 30,
+            "fuzz": 1,
+            "filter": "xws",
+            "include_record_channels": true,
+            "default_workspace": team,
+            "check_membership": true,
+            "enterprise_token": creds.token,
+        });
+
+        let mut req_headers = HeaderMap::new();
+        if let Some(cookie) = &creds.cookie {
+            req_headers.insert(
+                COOKIE,
+                HeaderValue::from_str(cookie)
+                    .map_err(|e| BridgeError::Messaging(format!("Invalid cookie: {e}")))?,
+            );
+        }
+        req_headers.insert(
+            reqwest::header::ORIGIN,
+            HeaderValue::from_static("https://app.slack.com"),
+        );
+
+        let resp_text = self
+            .http
+            .post(&url)
+            .headers(req_headers)
+            .header("Content-Type", "text/plain;charset=UTF-8")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| BridgeError::Messaging(format!("HTTP error (edge search): {e}")))?
+            .text()
+            .await
+            .map_err(|e| BridgeError::Messaging(format!("Response read error: {e}")))?;
+
+        let parsed: EdgeSearchResponse = serde_json::from_str(&resp_text)
+            .map_err(|e| BridgeError::Messaging(format!("JSON parse error (edge search): {e}")))?;
+
+        // The schema isn't documented; the web client iterates `results`
+        // looking for an exact name match. We do the same.
+        for ch in parsed.results.unwrap_or_default() {
+            if let (Some(id), Some(n)) = (ch.id, ch.name)
+                && n.to_lowercase() == needle
+            {
+                return Ok(id);
+            }
+        }
+
+        Err(BridgeError::Messaging(format!(
+            "channel '{needle}' not found via edge search — pass --channel <C…> with the ID instead"
         )))
     }
 }
@@ -300,7 +421,12 @@ impl MessagingClient for SlackClient {
             );
         } else {
             self.self_user_id = resp.user_id;
-            debug!("Connected to Slack as user: {:?}", self.self_user_id);
+            self.team_id = resp.team_id;
+            self.enterprise_id = resp.enterprise_id;
+            debug!(
+                "Connected to Slack as user: {:?} (team={:?}, enterprise={:?})",
+                self.self_user_id, self.team_id, self.enterprise_id
+            );
         }
         Ok(())
     }
