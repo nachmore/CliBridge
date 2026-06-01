@@ -32,6 +32,12 @@ const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(2);
 /// out and tear down.
 const SHELL_EXIT_GRACE: Duration = Duration::from_millis(500);
 
+/// Per-message size budget for chat.postMessage / chat.update content.
+/// Slack's documented hard limit is 40,000 chars; we leave ~5% slack for
+/// trailing content the renderer may add (currently just the closing
+/// fence — but margin is cheap insurance).
+const SLACK_MESSAGE_CHAR_LIMIT: usize = 38_000;
+
 /// Reason a shell session ended. The outer run loop uses this to decide
 /// whether to spawn a new session, ask the user, or quit entirely.
 enum SessionEnd {
@@ -89,6 +95,21 @@ pub async fn run(
     };
     slack.connect(credentials).await?;
     info!("Connected to Slack");
+
+    // Resolve channel: if `channel` looks like a Slack ID (C/G/D + ALL CAPS
+    // alnum), use it verbatim. Otherwise treat it as a name and look it up
+    // via the Slack API.
+    let resolved_channel = if looks_like_channel_id(channel) {
+        channel.to_string()
+    } else {
+        let name_clean = channel.trim_start_matches('#');
+        info!("Resolving channel name '{name_clean}'…");
+        slack
+            .resolve_channel_name(name_clean)
+            .await
+            .with_context(|| format!("resolve channel name '{name_clean}'"))?
+    };
+    let channel: &str = &resolved_channel;
 
     // Wrap the name in Arc<Mutex<_>> so the session task can mutate it on
     // `--name <text>` from Slack and the outer loop sees the new value when
@@ -196,6 +217,24 @@ pub async fn run(
 /// Read the current session name. Held briefly under the mutex; the lock
 /// is uncontended in steady state (only the session loop writes, only the
 /// banner-posting paths read).
+/// Heuristic: does the input look like a Slack channel/conversation ID?
+/// Slack IDs are uppercase letter prefix (C public, G private/group, D DM)
+/// followed by alphanumeric chars, typically 9–11 long. Channel *names*
+/// are lowercase, may contain dashes/underscores, and start with a letter
+/// or `#` — none of which match this pattern.
+fn looks_like_channel_id(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() < 5 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !matches!(first, 'C' | 'G' | 'D') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_lowercase())
+}
+
 fn read_name(name: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
     name.lock()
         .map(|g| g.clone())
@@ -358,13 +397,13 @@ async fn run_session(
                 let _ = attach_output.take();
                 // Kill the PTY child so the shell doesn't outlive us.
                 let _ = pty.kill();
-                // Best-effort post any pending renderer output to Slack.
-                if let Some(rendered) = renderer.take_pending() {
-                    let _ = tokio::time::timeout(
-                        SHUTDOWN_POST_TIMEOUT,
-                        post_or_edit(slack, channel, rendered, &mut current_message_id),
-                    ).await;
-                }
+                // Best-effort post any pending output (scrollback + live
+                // frame) to Slack within the shutdown budget.
+                let _ = tokio::time::timeout(
+                    SHUTDOWN_POST_TIMEOUT,
+                    drain_and_post(slack, channel, &mut renderer, &mut current_message_id),
+                )
+                .await;
                 break SessionEnd::Interrupted;
             }
 
@@ -373,9 +412,7 @@ async fn run_session(
                 info!("Shell exit grace elapsed, tearing down session");
                 let _ = attach.take();
                 let _ = attach_output.take();
-                if let Some(rendered) = renderer.take_pending() {
-                    post_or_edit(slack, channel, rendered, &mut current_message_id).await;
-                }
+                drain_and_post(slack, channel, &mut renderer, &mut current_message_id).await;
                 break SessionEnd::ShellExited;
             }
 
@@ -420,9 +457,7 @@ async fn run_session(
                         let _ = attach.take();
                         let _ = attach_output.take();
 
-                        if let Some(rendered) = renderer.take_pending() {
-                            post_or_edit(slack, channel, rendered, &mut current_message_id).await;
-                        }
+                        drain_and_post(slack, channel, &mut renderer, &mut current_message_id).await;
                         break SessionEnd::ShellExited;
                     }
                 }
@@ -446,11 +481,9 @@ async fn run_session(
                 }
             }
 
-            // Drain the renderer and post.
+            // Drain pending scrollback + live frame and post.
             _ = tick.tick() => {
-                if let Some(rendered) = renderer.take_pending() {
-                    post_or_edit(slack, channel, rendered, &mut current_message_id).await;
-                }
+                drain_and_post(slack, channel, &mut renderer, &mut current_message_id).await;
             }
 
             msg = message_rx.recv() => {
@@ -685,6 +718,39 @@ async fn handle_slack_message(
     }
 }
 
+/// Drain pending scrollback into Slack as one message per chunk, then drain
+/// the live frame. The split happens at the renderer level (capped by
+/// `SLACK_MESSAGE_CHAR_LIMIT`) so we never exceed Slack's chat.update size
+/// limit on a single message.
+///
+/// Each scrollback chunk posts as a fresh message and is *forgotten* by the
+/// renderer once posted — the next tick will not re-render that history.
+/// The live frame then becomes the edit target for subsequent ticks.
+async fn drain_and_post(
+    slack: &SlackClient,
+    channel: &str,
+    renderer: &mut TuiRenderer,
+    current_message_id: &mut Option<String>,
+) {
+    // Frozen history first. Each chunk is its own message; we explicitly
+    // null current_message_id between/after so the live frame doesn't try
+    // to edit one of the now-frozen scrollback messages.
+    for chunk in renderer.take_scrollback_chunks(SLACK_MESSAGE_CHAR_LIMIT) {
+        if let Err(e) = slack.send_message(channel, &chunk).await {
+            error!("Failed to post scrollback chunk: {e}");
+            // If we can't post a chunk, retrying it next tick wouldn't help
+            // (it's already drained from the renderer). Move on rather than
+            // stalling future ticks.
+        }
+        *current_message_id = None;
+    }
+
+    // Then the live frame.
+    if let Some(rendered) = renderer.take_pending() {
+        post_or_edit(slack, channel, rendered, current_message_id).await;
+    }
+}
+
 /// Post the rendered chunk, or edit the current message in place for TUI frames.
 /// Falls back to a fresh post if editing fails.
 ///
@@ -721,5 +787,31 @@ async fn post_or_edit(
             }
         }
         Err(e) => error!("Failed to send message: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_id_recognized() {
+        assert!(looks_like_channel_id("C0123456789"));
+        assert!(looks_like_channel_id("G017KTQLT5M"));
+        assert!(looks_like_channel_id("D01ABCDEF12"));
+    }
+
+    #[test]
+    fn channel_name_not_id() {
+        // Names start lowercase or with `#`; never a bare uppercase ID prefix.
+        assert!(!looks_like_channel_id("general"));
+        assert!(!looks_like_channel_id("#general"));
+        assert!(!looks_like_channel_id("dev-team"));
+        // Lowercase letters anywhere disqualify (Slack IDs are uppercase).
+        assert!(!looks_like_channel_id("CabC123"));
+        // Wrong leading letter.
+        assert!(!looks_like_channel_id("XABCDEFGH"));
+        // Too short.
+        assert!(!looks_like_channel_id("CXY"));
     }
 }

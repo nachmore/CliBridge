@@ -109,6 +109,77 @@ impl TuiRenderer {
         self.scrollback.clear();
     }
 
+    /// Drain pending scrollback into one or more Slack-ready code-block
+    /// chunks, each guaranteed to be at most `max_chars` Unicode scalars.
+    /// Each chunk is wrapped in a ```` ``` ```` fence so it renders as a
+    /// monospace block.
+    ///
+    /// Returns an empty Vec when there's no scrollback. After calling this,
+    /// the renderer no longer holds the drained lines — the next render
+    /// produces only the live frame plus *new* scrollback that arrives
+    /// after this call. This is what gives the user the "history is posted
+    /// once, then forgotten" property they expect when the live message
+    /// would otherwise grow past Slack's 40 KB chat.update limit.
+    ///
+    /// Splits at line boundaries. A single line longer than `max_chars` is
+    /// hard-split at byte `max_chars` to guarantee progress; that's a degenerate
+    /// case we don't expect with `cols <= 200` but we handle it for safety.
+    pub fn take_scrollback_chunks(&mut self, max_chars: usize) -> Vec<String> {
+        if self.scrollback.is_empty() {
+            return Vec::new();
+        }
+        // Reserve budget for the surrounding code-block fences.
+        const FENCE_OVERHEAD: usize = "```\n".len() + "```".len();
+        let budget = max_chars.saturating_sub(FENCE_OVERHEAD).max(1);
+
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut current_chars: usize = 0;
+
+        let flush = |chunks: &mut Vec<String>, current: &mut String, current_chars: &mut usize| {
+            if !current.is_empty() {
+                chunks.push(format!("```\n{current}```"));
+                current.clear();
+                *current_chars = 0;
+            }
+        };
+
+        while let Some(row) = self.scrollback.pop_front() {
+            // Build the line text + trailing newline once.
+            let mut line: String = row.iter().collect();
+            line.push('\n');
+            let mut line_chars = line.chars().count();
+
+            // Hard-split lines that exceed the per-chunk budget on their
+            // own. Splits at a char boundary so we never produce invalid
+            // UTF-8.
+            while line_chars > budget {
+                flush(&mut chunks, &mut current, &mut current_chars);
+                let split = line
+                    .char_indices()
+                    .nth(budget)
+                    .map(|(i, _)| i)
+                    .unwrap_or(line.len());
+                let head = line[..split].to_string();
+                let tail = line[split..].to_string();
+                chunks.push(format!("```\n{head}```"));
+                line = tail;
+                line_chars = line.chars().count();
+            }
+
+            // If adding this line would push the current chunk past the
+            // budget, flush the current chunk first.
+            if current_chars + line_chars > budget {
+                flush(&mut chunks, &mut current, &mut current_chars);
+            }
+            current.push_str(&line);
+            current_chars += line_chars;
+        }
+
+        flush(&mut chunks, &mut current, &mut current_chars);
+        chunks
+    }
+
     /// Append raw terminal output bytes to the renderer's buffer. Cheap and
     /// allocation-light; the bridge calls `take_pending()` on a tick to actually
     /// produce a message.
@@ -628,6 +699,12 @@ impl TuiRenderer {
     }
 
     fn render_screen(&self) -> String {
+        // Render only the live virtual screen. Scrollback is drained
+        // separately by `take_scrollback_chunks` and posted as its own
+        // Slack message(s) — once posted, the renderer forgets about it
+        // so the live frame stays bounded in size and never re-emits
+        // history that's already in the channel.
+        //
         // Trim trailing all-blank rows: TUI apps often resize themselves
         // larger than they actually use (Claude Code asks for 30 rows but
         // only paints into 25), and Slack's monospace block wraps anything
@@ -640,15 +717,6 @@ impl TuiRenderer {
             .unwrap_or(0);
 
         let mut output = String::from("```\n");
-        // Scrollback first — rows that have scrolled off the top of the
-        // live screen since the last anchor reset. Already trimmed of
-        // trailing whitespace when captured.
-        for row in &self.scrollback {
-            for &c in row {
-                output.push(c);
-            }
-            output.push('\n');
-        }
         for row in &self.screen[..last_nonblank] {
             let line: String = row.iter().collect();
             output.push_str(line.trim_end());
@@ -1330,20 +1398,76 @@ mod tests {
     }
 
     #[test]
-    fn test_scrollback_renders_above_live_frame() {
+    fn test_scrollback_drained_separately_from_live_frame() {
+        // Once drained, scrollback is gone — the live frame stays bounded
+        // and the same history isn't re-rendered into the next message.
         let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
         renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hold");
         renderer.process(b"\x1b[2;1Hkeep");
         renderer.process(b"\n"); // 'old' scrolls off
         renderer.process(b"new");
+
+        // Drain scrollback first.
+        let scrollback = renderer.take_scrollback_chunks(40_000);
+        assert_eq!(scrollback.len(), 1);
+        assert!(scrollback[0].contains("old"));
+
+        // Live frame contains only 'keep' + 'new'.
         let rendered = renderer.take_pending().unwrap();
-        // Both old (scrollback) and new content present, in chronological order.
-        let old_pos = rendered.text.find("old").expect("scrollback missing");
-        let keep_pos = rendered.text.find("keep").expect("live row missing");
-        let new_pos = rendered.text.find("new").expect("live row missing");
-        assert!(old_pos < keep_pos);
-        assert!(keep_pos < new_pos);
+        assert!(rendered.text.contains("keep"));
+        assert!(rendered.text.contains("new"));
+        assert!(
+            !rendered.text.contains("old"),
+            "live frame must not re-render drained scrollback"
+        );
+
+        // No further scrollback after drain.
+        assert!(renderer.take_scrollback_chunks(40_000).is_empty());
+    }
+
+    #[test]
+    fn test_scrollback_chunks_split_at_size_limit() {
+        // Push lines until many are in scrollback; verify the chunks
+        // collectively contain every scrolled-off line, each chunk is
+        // under budget, and nothing is left in the renderer afterward.
+        let mut renderer = TuiRenderer::with_scrollback(10, 2, 100);
+        renderer.tui_mode = true;
+        // 50 \r\n-delimited writes → 49 lines scroll off (the 50th is still
+        // on the live screen). Plenty for multi-chunk splitting.
+        for i in 0..50 {
+            renderer.process(format!("line{i:02}\r\n").as_bytes());
+        }
+        let scrolled_off_before = renderer.scrollback.len();
+        assert!(scrolled_off_before >= 40);
+
+        let budget = 50;
+        let chunks = renderer.take_scrollback_chunks(budget);
+        assert!(chunks.len() >= 2, "got {} chunks", chunks.len());
+        let mut total_lines = 0;
+        for c in &chunks {
+            assert!(
+                c.chars().count() <= budget,
+                "chunk too long: {} chars",
+                c.chars().count()
+            );
+            assert!(c.starts_with("```"));
+            assert!(c.ends_with("```"));
+            total_lines += c.matches("line").count();
+        }
+        assert_eq!(
+            total_lines, scrolled_off_before,
+            "chunks dropped scrolled-off lines"
+        );
+        assert!(renderer.take_scrollback_chunks(40_000).is_empty());
+    }
+
+    #[test]
+    fn test_scrollback_chunks_empty_when_no_history() {
+        let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
+        renderer.tui_mode = true;
+        renderer.process(b"hello");
+        assert!(renderer.take_scrollback_chunks(40_000).is_empty());
     }
 
     #[test]
