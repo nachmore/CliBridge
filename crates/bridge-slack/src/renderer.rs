@@ -17,6 +17,18 @@ pub struct TuiRenderer {
     /// Cursor position
     cursor_row: usize,
     cursor_col: usize,
+    /// "Pending wrap" / last-column-wrap flag (xterm-compatible behavior).
+    /// When the cursor is in the rightmost column and a printable char is
+    /// written, we put the char and set this flag *without* advancing
+    /// past the right edge or wrapping. Only the NEXT printable char
+    /// triggers the actual wrap. CR/LF/cursor-positioning clear it.
+    ///
+    /// Without this, an exactly-screen-width write (e.g. a 120-char
+    /// separator on a 120-col screen) eagerly wraps to the next row and
+    /// — if we were at the bottom — scrolls. Modern TUIs (Claude Code)
+    /// rely on this not happening: they fill the bottom row exactly, then
+    /// expect cursor positioning to reach the same content again.
+    pending_wrap: bool,
     /// Saved cursor position from the last DECSC (`\x1b 7`) or SCP (`\x1b[s`).
     /// Restored by DECRC / RCP. Apps drive spinner animations off this:
     /// "save here, write text, [later] restore and overwrite" each frame.
@@ -53,6 +65,7 @@ impl TuiRenderer {
             rows,
             cursor_row: 0,
             cursor_col: 0,
+            pending_wrap: false,
             saved_cursor: None,
             tui_mode: false,
             line_buffer: String::new(),
@@ -258,6 +271,14 @@ impl TuiRenderer {
     }
 
     fn handle_csi(&mut self, params: &str, cmd: char) {
+        // Trace the dispatch with cursor before/after so a captured PTY log
+        // replayed under RUST_LOG=bridge_slack=trace is grep-able for the
+        // exact moment a row drift starts.
+        let before = (self.cursor_row, self.cursor_col);
+        // Any explicit cursor movement clears the pending-wrap flag —
+        // pending wrap only applies to the *implicit* "next char wraps"
+        // semantics; jumping somewhere new resets that.
+        self.pending_wrap = false;
         // Strip a leading private-marker byte if present (?, <, >, =) so the
         // numeric arg parses cleanly. We don't actually act on private CSIs;
         // this just keeps `nums` from absorbing an empty entry that would
@@ -457,11 +478,28 @@ impl TuiRenderer {
                 // most apps degrade gracefully without one.
             }
             't' => {
-                // XTWINOPS — window manipulation / size queries. Subcodes
-                // include "resize to NxM" (8), "report size" (14, 18),
-                // "raise/lower window" (5/6), etc. We don't have a real
-                // window to manipulate; the host terminal already chose the
-                // size. Silently consume.
+                // XTWINOPS. Subcode 8 is "resize window to <rows>;<cols>";
+                // some TUIs (Claude Code) emit this and then proceed to
+                // render assuming the new size, ignoring whatever the PTY
+                // told them at startup. If we don't honor it, the app draws
+                // outside our virtual-screen bounds and rows collide on the
+                // bottom (the "ghost row of mixed-state text" artifact).
+                //
+                // We only resize our renderer; we deliberately do NOT touch
+                // the underlying PTY because the local attach terminal owns
+                // that size. Cap to keep a buggy app from asking for 65k
+                // rows and making the rendered Slack message useless.
+                const MAX_DIM: usize = 500;
+                if let Some(&8) = nums.first() {
+                    let new_rows = nums.get(1).copied().unwrap_or(self.rows).min(MAX_DIM);
+                    let new_cols = nums.get(2).copied().unwrap_or(self.cols).min(MAX_DIM);
+                    if new_rows >= 1 && new_cols >= 1 {
+                        self.resize(new_cols as u16, new_rows as u16);
+                    }
+                }
+                // Other subcodes (report size, raise/lower, etc.) silently
+                // consumed — we have no real window to manipulate and most
+                // apps have a back-channel-free degradation.
             }
             'q' => {
                 // XTVERSION query (`>0q`) and DECSCUSR cursor-shape (`<n> q`).
@@ -476,11 +514,16 @@ impl TuiRenderer {
                 tracing::debug!("TUI parser dropped CSI: \\x1b[{params}{cmd}");
             }
         }
+        let after = (self.cursor_row, self.cursor_col);
+        if before != after {
+            tracing::trace!("CSI \\x1b[{params}{cmd}: cursor {before:?} -> {after:?}");
+        }
     }
 
     fn put_char(&mut self, ch: char) {
         match ch {
             '\n' => {
+                self.pending_wrap = false;
                 self.cursor_row += 1;
                 if self.cursor_row >= self.rows {
                     // Scroll up
@@ -490,21 +533,28 @@ impl TuiRenderer {
                 }
             }
             '\r' => {
+                self.pending_wrap = false;
                 self.cursor_col = 0;
             }
             '\x08' => {
                 // Backspace
+                self.pending_wrap = false;
                 self.cursor_col = self.cursor_col.saturating_sub(1);
             }
             '\t' => {
                 // Tab — advance to next 8-column boundary
+                self.pending_wrap = false;
                 let next_tab = (self.cursor_col / 8 + 1) * 8;
                 self.cursor_col = next_tab.min(self.cols - 1);
             }
             c if !c.is_control() && self.cursor_col < self.cols && self.cursor_row < self.rows => {
-                self.screen[self.cursor_row][self.cursor_col] = c;
-                self.cursor_col += 1;
-                if self.cursor_col >= self.cols {
+                // xterm-style pending-wrap: if the previous printable char
+                // already filled the rightmost column, NOW we wrap and
+                // place this char on the next line. This is what TUIs
+                // expect when filling exactly cols-wide content (e.g. a
+                // separator line that exactly equals the screen width).
+                if self.pending_wrap {
+                    self.pending_wrap = false;
                     self.cursor_col = 0;
                     self.cursor_row += 1;
                     if self.cursor_row >= self.rows {
@@ -513,14 +563,33 @@ impl TuiRenderer {
                         self.cursor_row = self.rows - 1;
                     }
                 }
+                self.screen[self.cursor_row][self.cursor_col] = c;
+                if self.cursor_col + 1 >= self.cols {
+                    // Park at the right edge and defer the wrap until the
+                    // *next* printable arrives. CR/LF/positioning clear it.
+                    self.pending_wrap = true;
+                } else {
+                    self.cursor_col += 1;
+                }
             }
             _ => {}
         }
     }
 
     fn render_screen(&self) -> String {
+        // Trim trailing all-blank rows: TUI apps often resize themselves
+        // larger than they actually use (Claude Code asks for 30 rows but
+        // only paints into 25), and Slack's monospace block wraps anything
+        // we emit, so empty rows just inflate the message.
+        let last_nonblank = self
+            .screen
+            .iter()
+            .rposition(|row| row.iter().any(|&c| c != ' '))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
         let mut output = String::from("```\n");
-        for row in &self.screen {
+        for row in &self.screen[..last_nonblank] {
             let line: String = row.iter().collect();
             output.push_str(line.trim_end());
             output.push('\n');
@@ -1181,6 +1250,62 @@ mod tests {
         renderer.process(b"Z");
         // Cursor stayed at row 2 col 5 (we wrote no save), so Z lands there.
         assert_eq!(renderer.screen[1][4], 'Z');
+    }
+
+    #[test]
+    fn test_pending_wrap_does_not_scroll_at_bottom() {
+        // Regression: writing exactly cols-wide content on the bottom row
+        // used to wrap eagerly to a non-existent next row, scrolling the
+        // screen up. xterm-style pending-wrap defers the wrap until the
+        // *next* printable, so apps that fill the bottom row exactly
+        // (Claude Code's separator lines) don't trigger spurious scrolls.
+        let mut renderer = TuiRenderer::new(5, 3);
+        renderer.tui_mode = true;
+        // Pin "anch" on row 0 so we can detect a scroll.
+        renderer.process(b"\x1b[1;1Hanch");
+        // Move to bottom row, write exactly 5 chars (one full row).
+        renderer.process(b"\x1b[3;1Habcde");
+        // Anchor must still be on row 0 — no scroll yet.
+        let line0: String = renderer.screen[0].iter().collect();
+        assert!(
+            line0.starts_with("anch"),
+            "scroll happened too early: row 0 = {line0:?}"
+        );
+        // The 6th printable arrives — NOW we wrap. Since we're on the
+        // bottom row, the wrap scrolls.
+        renderer.process(b"X");
+        let line0: String = renderer.screen[0].iter().collect();
+        assert!(
+            !line0.starts_with("anch"),
+            "expected scroll after the deferred wrap, but anchor still on row 0"
+        );
+    }
+
+    #[test]
+    fn test_pending_wrap_cleared_by_cursor_position() {
+        // After a deferred-wrap fill, an explicit cursor-position must clear
+        // the pending flag — otherwise the next printable would jump to the
+        // wrong row.
+        let mut renderer = TuiRenderer::new(5, 3);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Habcde"); // row 0 full, pending wrap
+        renderer.process(b"\x1b[2;1HX"); // jump to row 1 col 0, write X
+        // X should land at row 1 col 0, NOT row 1 col 0 after a wrap.
+        assert_eq!(renderer.screen[1][0], 'X');
+        // Row 0 still has "abcde".
+        let line0: String = renderer.screen[0].iter().collect();
+        assert_eq!(line0, "abcde");
+    }
+
+    #[test]
+    fn test_pending_wrap_cleared_by_cr() {
+        // CR also clears pending wrap.
+        let mut renderer = TuiRenderer::new(5, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Habcde"); // row 0 full
+        renderer.process(b"\rX"); // CR + X — should overwrite col 0 of row 0
+        assert_eq!(renderer.screen[0][0], 'X');
+        assert_eq!(renderer.screen[0][1], 'b');
     }
 
     #[test]
