@@ -1394,6 +1394,30 @@ mod tests {
     }
 
     #[test]
+    fn test_csi_position_clamps_out_of_bounds() {
+        // \x1b[<r>;<c>H with values past the screen size must clamp,
+        // not panic or render outside the buffer.
+        let mut renderer = TuiRenderer::new(20, 5);
+        renderer.tui_mode = true;
+        // Way past bottom-right.
+        renderer.process(b"\x1b[999;999HX");
+        // Char must land inside the screen.
+        let bottom_right_row = renderer.rows - 1;
+        let bottom_right_col = renderer.cols - 1;
+        assert_eq!(renderer.screen[bottom_right_row][bottom_right_col], 'X');
+    }
+
+    #[test]
+    fn test_csi_position_clamps_zero() {
+        // \x1b[0;0H is technically out-of-spec (params are 1-indexed) but
+        // some apps emit it. We must not underflow.
+        let mut renderer = TuiRenderer::new(10, 3);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[0;0HZ");
+        assert_eq!(renderer.screen[0][0], 'Z');
+    }
+
+    #[test]
     fn test_pending_wrap_does_not_scroll_at_bottom() {
         // Regression: writing exactly cols-wide content on the bottom row
         // used to wrap eagerly to a non-existent next row, scrolling the

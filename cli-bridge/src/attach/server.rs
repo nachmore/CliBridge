@@ -513,4 +513,78 @@ mod tests {
             panic!("server accepted bad token");
         }
     }
+
+    #[tokio::test]
+    async fn server_rejects_protocol_version_mismatch() {
+        // Future-proof: a client built against a newer protocol must be
+        // refused without a HelloOk so it can fall back / surface an error
+        // rather than silently mis-interpreting a session.
+        let server = AttachServer::start().await.unwrap();
+        let addr = server.addr;
+        let token = server.token.clone();
+
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = sock.split();
+        protocol::write_frame(
+            &mut wr,
+            &Message::Hello {
+                version: protocol::PROTOCOL_VERSION + 99,
+                cols: 80,
+                rows: 24,
+                token,
+            },
+        )
+        .await
+        .unwrap();
+
+        let frame =
+            tokio::time::timeout(Duration::from_secs(2), protocol::read_frame(&mut rd)).await;
+        if let Ok(Ok(Some(Message::HelloOk))) = frame {
+            panic!("server accepted a mismatched protocol version");
+        }
+    }
+
+    #[tokio::test]
+    async fn server_handles_goodbye_from_client() {
+        // A well-behaved client sends Goodbye before disconnecting. The
+        // server must accept that frame quietly (no panics, no errors)
+        // and tear down the per-client task.
+        let mut server = AttachServer::start().await.unwrap();
+        let addr = server.addr;
+        let token = server.token.clone();
+        let mut events = std::mem::replace(&mut server.events, mpsc::channel(1).1);
+
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = sock.split();
+        protocol::write_frame(
+            &mut wr,
+            &Message::Hello {
+                version: protocol::PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                token,
+            },
+        )
+        .await
+        .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(2), protocol::read_frame(&mut rd))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp, Message::HelloOk);
+
+        // Drain the initial Resize event so it doesn't sit in the channel.
+        let _ = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
+
+        // Now say Goodbye and close. The server's reader task should
+        // exit cleanly; no further events should arrive.
+        protocol::write_frame(&mut wr, &Message::Goodbye)
+            .await
+            .unwrap();
+        // Brief wait for the server to react. No panic / no error to
+        // propagate is the contract; the socket closes when `sock`
+        // drops at end of test scope.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
