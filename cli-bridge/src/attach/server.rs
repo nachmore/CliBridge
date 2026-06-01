@@ -243,7 +243,16 @@ async fn handle_client(
                 let _ = wr.flush().await;
                 break;
             }
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => {
+                // Server is shutting down (shell exited or bridge interrupted).
+                // Send an explicit Goodbye so the client's reader loop breaks
+                // immediately rather than waiting for the TCP close to
+                // propagate — without this, the local terminal window can sit
+                // there for a beat after Ctrl+C on the bridge.
+                let _ = protocol::write_frame(&mut wr, &Message::Goodbye).await;
+                let _ = wr.flush().await;
+                break;
+            }
         }
     }
 

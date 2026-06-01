@@ -238,7 +238,11 @@ async fn run_session(
     let mut messages_since_anchor: u32 = 0;
 
     // Split the attach server so we can both forward output and drain events.
-    let attach_output = attach.as_ref().map(|a| a.output_tx.clone());
+    // Both `attach` and `attach_output` need to be droppable so that all
+    // broadcast senders can be released — only when *no senders* remain do
+    // subscribers see RecvError::Closed and write their final Goodbye to the
+    // attach client.
+    let mut attach_output = attach.as_ref().map(|a| a.output_tx.clone());
     let mut attach_events = attach
         .as_mut()
         .map(|a| std::mem::replace(&mut a.events, tokio::sync::mpsc::channel(1).1));
@@ -266,12 +270,11 @@ async fn run_session(
                     }
                     None => {
                         info!("Shell output channel closed (shell exited)");
-                        // Dropping the AttachServer also drops its output_tx
-                        // sender; attach_output is the only other clone, and
-                        // it goes out of scope when this loop returns. Once
-                        // both are gone, broadcast::Receiver returns Closed
-                        // and each client task writes Goodbye + disconnects.
+                        // Drop both broadcast senders so client tasks see
+                        // RecvError::Closed and write Goodbye immediately —
+                        // before we block on the trailing Slack post.
                         let _ = attach.take();
+                        let _ = attach_output.take();
 
                         if let Some(rendered) = renderer.take_pending() {
                             post_or_edit(slack, channel, rendered, &mut current_message_id).await;
@@ -307,15 +310,24 @@ async fn run_session(
             }
 
             // Local Ctrl+C: end the whole bridge run (not just this session).
+            // Tear down in this order so the local terminal window closes
+            // promptly rather than waiting for the Slack post to finish:
+            //   1. Drop both broadcast senders. Client writer tasks see
+            //      RecvError::Closed, send Goodbye, and exit; client
+            //      processes return and the spawned terminal windows close.
+            //   2. Kill the PTY child so the shell doesn't outlive us.
+            //   3. Best-effort post any pending renderer output to Slack.
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl+C received, shutting down");
+                let _ = attach.take();
+                let _ = attach_output.take();
+                let _ = pty.kill();
                 if let Some(rendered) = renderer.take_pending() {
                     let _ = tokio::time::timeout(
                         SHUTDOWN_POST_TIMEOUT,
                         post_or_edit(slack, channel, rendered, &mut current_message_id),
                     ).await;
                 }
-                let _ = pty.kill();
                 break SessionEnd::Interrupted;
             }
 
