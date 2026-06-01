@@ -429,6 +429,19 @@ impl TuiRenderer {
                 // We don't have a back-channel to the PTY for replies and
                 // most apps degrade gracefully without one.
             }
+            't' => {
+                // XTWINOPS — window manipulation / size queries. Subcodes
+                // include "resize to NxM" (8), "report size" (14, 18),
+                // "raise/lower window" (5/6), etc. We don't have a real
+                // window to manipulate; the host terminal already chose the
+                // size. Silently consume.
+            }
+            'q' => {
+                // XTVERSION query (`>0q`) and DECSCUSR cursor-shape (`<n> q`).
+                // Neither needs emulation: we have no back-channel for the
+                // version reply, and Slack code blocks don't render cursor
+                // shapes anyway.
+            }
             _ => {
                 // Anything else: log at debug so users with RUST_LOG=trace
                 // (or debug) can see what we're dropping. If an unhandled
