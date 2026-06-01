@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use wry::{WebViewBuilder, http::Request};
 
 use bridge_core::types::Credentials;
+use bridge_core::url::origin_of;
 
 const SIGNIN_URL: &str = "https://slack.com/signin";
 
@@ -272,35 +273,10 @@ fn collect_slack_cookies(webview: &wry::WebView, href: Option<&str>) -> Result<S
     Ok(parts.join("; "))
 }
 
-fn origin_of(url: &str) -> Option<String> {
-    let scheme_end = url.find("://")?;
-    let after = &url[scheme_end + 3..];
-    let host_end = after.find('/').unwrap_or(after.len());
-    Some(format!("{}://{}", &url[..scheme_end], &after[..host_end]))
-}
-
 fn workspace_url_from_href(href: &str) -> Option<String> {
     // Examples:
     //   https://app.slack.com/client/T01ABC/C01DEF  -> https://app.slack.com
     //   https://acme.slack.com/messages/...          -> https://acme.slack.com
     //   https://acme.enterprise.slack.com/...        -> https://acme.enterprise.slack.com
     origin_of(href)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_origin_of() {
-        assert_eq!(
-            origin_of("https://app.slack.com/client/T1/C1"),
-            Some("https://app.slack.com".to_string())
-        );
-        assert_eq!(
-            origin_of("https://acme.enterprise.slack.com/messages"),
-            Some("https://acme.enterprise.slack.com".to_string())
-        );
-        assert_eq!(origin_of("not-a-url"), None);
-    }
 }

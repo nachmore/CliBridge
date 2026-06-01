@@ -110,8 +110,15 @@ fn launch_attempts(exe: &str, addr: &str, token: &str, title: &str) -> Vec<Launc
 
 #[cfg(target_os = "macos")]
 fn launch_attempts(exe: &str, addr: &str, token: &str, _title: &str) -> Vec<LaunchAttempt> {
-    // AppleScript: tell Terminal to open a new window running our attach command.
-    // Quoting is fiddly — the script is one big string passed to osascript -e.
+    // AppleScript: tell Terminal to open a new window running our attach
+    // command. Quoting is fiddly — the script is one big string passed to
+    // osascript -e.
+    //
+    // We don't bother setting the window title here. The bridge sends an
+    // OSC 0 ("set window title") frame to the attach client immediately on
+    // handshake, which the terminal renders natively. So Terminal.app picks
+    // up the session name within milliseconds of the window opening — same
+    // user-visible result as Windows-side --title plumbing.
     let script = format!(
         r#"tell application "Terminal" to do script "'{exe}' --attach {addr} --attach-token {token}""#
     );

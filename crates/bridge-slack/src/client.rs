@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,6 +11,7 @@ use tracing::{debug, error, warn};
 use bridge_core::error::BridgeError;
 use bridge_core::messaging::MessagingClient;
 use bridge_core::types::{Credentials, IncomingMessage};
+use bridge_core::url::origin_of;
 
 use crate::rate_limiter::RateLimiter;
 
@@ -28,9 +29,48 @@ pub struct SlackClient {
     /// user typing in Slack, so we can't use it to filter "our own" messages —
     /// we track posted ts's instead (see `posted_ts`).
     self_user_id: Option<String>,
-    /// Timestamps of messages we ourselves posted via chat.postMessage / chat.update.
-    /// The poller skips these so we don't echo terminal output back into the PTY.
-    posted_ts: Arc<Mutex<HashSet<String>>>,
+    /// Timestamps of messages we ourselves posted via chat.postMessage /
+    /// chat.update. The poller skips these so we don't echo our own output
+    /// back into the PTY.
+    ///
+    /// Bounded: long-running sessions could otherwise leak memory linearly
+    /// in the number of messages posted. Once `MAX_POSTED_TS` is exceeded we
+    /// evict the oldest entry. The window is more than enough for the
+    /// `oldest=` cursor in conversations.history (which only ever queries
+    /// recent messages) to clear before the corresponding ts is forgotten.
+    posted_ts: Arc<Mutex<PostedTsRing>>,
+}
+
+/// Maximum number of self-posted timestamps to remember. At our 1.1s tick
+/// rate this is over an hour of consecutive activity — far longer than any
+/// Slack conversations.history poll could plausibly look back.
+const MAX_POSTED_TS: usize = 4096;
+
+/// Bounded set with eviction-by-oldest semantics. Membership is O(1),
+/// insertion + eviction is O(1).
+#[derive(Default)]
+struct PostedTsRing {
+    set: HashSet<String>,
+    queue: VecDeque<String>,
+}
+
+impl PostedTsRing {
+    fn insert(&mut self, ts: String) {
+        if self.set.contains(&ts) {
+            return;
+        }
+        if self.queue.len() >= MAX_POSTED_TS
+            && let Some(oldest) = self.queue.pop_front()
+        {
+            self.set.remove(&oldest);
+        }
+        self.set.insert(ts.clone());
+        self.queue.push_back(ts);
+    }
+
+    fn contains(&self, ts: &str) -> bool {
+        self.set.contains(ts)
+    }
 }
 
 #[derive(Deserialize)]
@@ -71,13 +111,13 @@ impl SlackClient {
             rate_limiter: RateLimiter::new(Duration::from_millis(1100)),
             api_base: DEFAULT_API_BASE.to_string(),
             self_user_id: None,
-            posted_ts: Arc::new(Mutex::new(HashSet::new())),
+            posted_ts: Arc::new(Mutex::new(PostedTsRing::default())),
         }
     }
 
     fn remember_posted(&self, ts: &str) {
-        if let Ok(mut set) = self.posted_ts.lock() {
-            set.insert(ts.to_string());
+        if let Ok(mut ring) = self.posted_ts.lock() {
+            ring.insert(ts.to_string());
         }
     }
 
@@ -325,8 +365,14 @@ impl MessagingClient for SlackClient {
         debug!("Subscribed to channel {channel}, last_ts seed: {last_ts:?}");
 
         tokio::spawn(async move {
+            // Exponential backoff state for transient failures (network
+            // hiccups, Slack 5xx, etc.). Without this a persistent issue
+            // spams the log and hammers the API at the poll rate.
+            let max_backoff = Duration::from_secs(60);
+            let mut backoff = POLL_INTERVAL;
+
             loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                tokio::time::sleep(backoff).await;
 
                 let mut form: Vec<(&str, String)> = vec![
                     ("token", credentials.token.clone()),
@@ -348,6 +394,7 @@ impl MessagingClient for SlackClient {
                     Ok(r) => r,
                     Err(e) => {
                         error!("Failed to poll messages: {e}");
+                        backoff = (backoff * 2).min(max_backoff);
                         continue;
                     }
                 };
@@ -356,14 +403,19 @@ impl MessagingClient for SlackClient {
                     Ok(h) => h,
                     Err(e) => {
                         error!("Failed to parse conversations.history: {e}");
+                        backoff = (backoff * 2).min(max_backoff);
                         continue;
                     }
                 };
 
                 if !history.ok {
                     warn!("conversations.history error: {:?}", history.error);
+                    backoff = (backoff * 2).min(max_backoff);
                     continue;
                 }
+
+                // Success — reset backoff to the normal poll cadence.
+                backoff = POLL_INTERVAL;
 
                 let Some(messages) = history.messages else {
                     continue;
@@ -414,13 +466,6 @@ impl MessagingClient for SlackClient {
     }
 }
 
-fn origin_of(url: &str) -> Option<String> {
-    let scheme_end = url.find("://")?;
-    let after = &url[scheme_end + 3..];
-    let host_end = after.find('/').unwrap_or(after.len());
-    Some(format!("{}://{}", &url[..scheme_end], &after[..host_end]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,10 +498,27 @@ mod tests {
     }
 
     #[test]
-    fn test_origin_of() {
-        assert_eq!(
-            origin_of("https://acme.enterprise.slack.com/messages/foo"),
-            Some("https://acme.enterprise.slack.com".to_string())
-        );
+    fn test_posted_ts_ring_evicts_oldest() {
+        let mut ring = PostedTsRing::default();
+        // Fill past the cap so the eviction path runs.
+        for i in 0..(MAX_POSTED_TS + 100) {
+            ring.insert(format!("{i}.0"));
+        }
+        assert_eq!(ring.queue.len(), MAX_POSTED_TS);
+        assert_eq!(ring.set.len(), MAX_POSTED_TS);
+        // Oldest 100 entries gone, newest 100 still present.
+        assert!(!ring.contains("0.0"));
+        assert!(!ring.contains("99.0"));
+        assert!(ring.contains(&format!("{}.0", MAX_POSTED_TS + 50)));
+    }
+
+    #[test]
+    fn test_posted_ts_ring_dedupes() {
+        let mut ring = PostedTsRing::default();
+        ring.insert("1.0".to_string());
+        ring.insert("1.0".to_string());
+        ring.insert("1.0".to_string());
+        assert_eq!(ring.queue.len(), 1);
+        assert!(ring.contains("1.0"));
     }
 }

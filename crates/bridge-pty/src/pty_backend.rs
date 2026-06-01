@@ -108,8 +108,10 @@ impl TerminalBackend for PtyBackend {
                         }
                     }
                     Err(e) => {
-                        // On Windows, ERROR_BROKEN_PIPE (109) means the child exited
-                        if e.raw_os_error() == Some(109) {
+                        // Treat the various "child exited / pipe closed"
+                        // codes as benign — they happen on every clean exit.
+                        // Anything else is a real error worth surfacing.
+                        if is_child_exit_error(&e) {
                             debug!("PTY reader: child process exited");
                         } else {
                             error!("PTY reader error: {e}");
@@ -172,6 +174,26 @@ fn build_command(command: &str) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(command);
     cmd.env("TERM", "xterm-256color");
     cmd
+}
+
+/// Identify the OS-specific error codes the PTY surfaces when the child
+/// exits cleanly. Treated as a normal end-of-session signal, not an error.
+///
+/// - Windows: ERROR_BROKEN_PIPE (109) — ConPTY closes its read end.
+/// - Unix: EIO (5) is what Linux/macOS PTYs return when the slave is closed
+///   and EPIPE (32) shows up on writes; either should be benign here.
+///   `ErrorKind::BrokenPipe` covers EPIPE portably; raw 5 covers EIO.
+fn is_child_exit_error(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        return true;
+    }
+    match e.raw_os_error() {
+        #[cfg(windows)]
+        Some(109) => true,
+        #[cfg(unix)]
+        Some(5) => true, // EIO
+        _ => false,
+    }
 }
 
 /// Spawn a task that polls `try_wait()` on the child and fires `exit_tx`

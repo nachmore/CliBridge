@@ -340,6 +340,57 @@ async fn run_session(
         };
 
         tokio::select! {
+            // `biased`: shutdown branches (Ctrl+C, child exit, exit-grace
+            // expiry) are checked first when multiple are ready. Without
+            // this, tokio's random selection means a steady stream of PTY
+            // output or attach traffic can starve the signal handler for
+            // arbitrary long.
+            biased;
+
+            // Local Ctrl+C: end the whole bridge run. Highest priority so
+            // the user can always interrupt. See teardown order below.
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl+C received, shutting down");
+                // Drop both broadcast senders. Client writer tasks see
+                // RecvError::Closed, send Goodbye, and exit; client
+                // processes return and the spawned terminal windows close.
+                let _ = attach.take();
+                let _ = attach_output.take();
+                // Kill the PTY child so the shell doesn't outlive us.
+                let _ = pty.kill();
+                // Best-effort post any pending renderer output to Slack.
+                if let Some(rendered) = renderer.take_pending() {
+                    let _ = tokio::time::timeout(
+                        SHUTDOWN_POST_TIMEOUT,
+                        post_or_edit(slack, channel, rendered, &mut current_message_id),
+                    ).await;
+                }
+                break SessionEnd::Interrupted;
+            }
+
+            // Grace period elapsed after shell exit: tear down the session.
+            _ = exit_grace_done, if shell_exited_at.is_some() => {
+                info!("Shell exit grace elapsed, tearing down session");
+                let _ = attach.take();
+                let _ = attach_output.take();
+                if let Some(rendered) = renderer.take_pending() {
+                    post_or_edit(slack, channel, rendered, &mut current_message_id).await;
+                }
+                break SessionEnd::ShellExited;
+            }
+
+            // Child exited: mark the time so the grace timer starts. Don't
+            // tear down yet — keep the loop alive for SHELL_EXIT_GRACE so
+            // trailing PTY output (slow-to-flush on Windows ConPTY) makes it
+            // into Slack and the attach window before we close everything.
+            _ = exit_signal => {
+                if shell_exited_at.is_none() {
+                    info!("PTY child reaped");
+                    exit_rx = None;
+                    shell_exited_at = Some(tokio::time::Instant::now());
+                }
+            }
+
             // PTY output: forward to renderer + attach clients. None means
             // the shell process has exited — we drop the attach server (so
             // attached terminal windows close), flush trailing renderer
@@ -400,51 +451,6 @@ async fn run_session(
                 if let Some(rendered) = renderer.take_pending() {
                     post_or_edit(slack, channel, rendered, &mut current_message_id).await;
                 }
-            }
-
-            // Child exited: mark the time so the grace timer starts. Don't
-            // tear down yet — keep the loop alive for SHELL_EXIT_GRACE so
-            // trailing PTY output (slow-to-flush on Windows ConPTY) makes it
-            // into Slack and the attach window before we close everything.
-            _ = exit_signal => {
-                if shell_exited_at.is_none() {
-                    info!("PTY child reaped");
-                    exit_rx = None;
-                    shell_exited_at = Some(tokio::time::Instant::now());
-                }
-            }
-
-            // Grace period elapsed after shell exit: tear down the session.
-            _ = exit_grace_done, if shell_exited_at.is_some() => {
-                info!("Shell exit grace elapsed, tearing down session");
-                let _ = attach.take();
-                let _ = attach_output.take();
-                if let Some(rendered) = renderer.take_pending() {
-                    post_or_edit(slack, channel, rendered, &mut current_message_id).await;
-                }
-                break SessionEnd::ShellExited;
-            }
-
-            // Local Ctrl+C: end the whole bridge run (not just this session).
-            // Tear down in this order so the local terminal window closes
-            // promptly rather than waiting for the Slack post to finish:
-            //   1. Drop both broadcast senders. Client writer tasks see
-            //      RecvError::Closed, send Goodbye, and exit; client
-            //      processes return and the spawned terminal windows close.
-            //   2. Kill the PTY child so the shell doesn't outlive us.
-            //   3. Best-effort post any pending renderer output to Slack.
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C received, shutting down");
-                let _ = attach.take();
-                let _ = attach_output.take();
-                let _ = pty.kill();
-                if let Some(rendered) = renderer.take_pending() {
-                    let _ = tokio::time::timeout(
-                        SHUTDOWN_POST_TIMEOUT,
-                        post_or_edit(slack, channel, rendered, &mut current_message_id),
-                    ).await;
-                }
-                break SessionEnd::Interrupted;
             }
 
             msg = message_rx.recv() => {
@@ -521,6 +527,7 @@ async fn await_new_or_quit(
 ) -> Result<bool> {
     loop {
         tokio::select! {
+            biased;
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl+C while idle, exiting");
                 return Ok(false);
