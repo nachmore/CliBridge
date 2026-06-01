@@ -42,6 +42,9 @@ pub enum SpecialCommand {
     Tab,
     /// Send Escape
     Escape,
+    /// Send a bare carriage return ("press Enter"). Useful when an app is
+    /// waiting on a confirmation prompt and you don't want to type any text.
+    Enter,
     /// Show help for available commands
     Help,
     /// Rename the session — affects the labels in lifecycle banners
@@ -95,6 +98,7 @@ pub fn parse_input(input: &str) -> ParsedInput {
         "help" => ParsedInput::Command(SpecialCommand::Help),
         "tab" => ParsedInput::Command(SpecialCommand::Tab),
         "esc" | "escape" => ParsedInput::Command(SpecialCommand::Escape),
+        "enter" | "return" | "cr" => ParsedInput::Command(SpecialCommand::Enter),
         "up" => ParsedInput::Command(SpecialCommand::Arrow(ArrowDirection::Up)),
         "down" => ParsedInput::Command(SpecialCommand::Arrow(ArrowDirection::Down)),
         "left" => ParsedInput::Command(SpecialCommand::Arrow(ArrowDirection::Left)),
@@ -168,6 +172,7 @@ pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
         SpecialCommand::CtrlBackslash => Some(vec![0x1C]),
         SpecialCommand::Tab => Some(vec![0x09]),
         SpecialCommand::Escape => Some(vec![0x1B]),
+        SpecialCommand::Enter => Some(vec![b'\r']),
         SpecialCommand::Arrow(dir) => {
             let seq = match dir {
                 ArrowDirection::Up => b"\x1b[A".to_vec(),
@@ -219,6 +224,7 @@ pub fn help_text() -> String {
 • `--clear` — Re-anchor: end the current edited message, start a fresh one on next output
 • `--tab` — Send Tab key
 • `--esc` — Send Escape key
+• `--enter` — Send a bare Enter (CR), no text. Aliases: `--return`, `--cr`
 • `--up` `--down` `--left` `--right` — Arrow keys
 • `--tmux <key>` — Send tmux prefix + key
 • `--raw <hex>` — Send raw bytes (hex-encoded)
@@ -292,6 +298,22 @@ mod tests {
             parse_input("--unknown"),
             ParsedInput::Text("--unknown".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_enter_aliases() {
+        for alias in ["--enter", "--return", "--cr", "--ENTER"] {
+            assert_eq!(
+                parse_input(alias),
+                ParsedInput::Command(SpecialCommand::Enter),
+                "alias {alias} did not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn test_command_to_bytes_enter() {
+        assert_eq!(command_to_bytes(&SpecialCommand::Enter), Some(vec![b'\r']));
     }
 
     #[test]

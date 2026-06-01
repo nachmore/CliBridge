@@ -85,11 +85,19 @@ struct Cli {
     #[arg(long)]
     pty_log: Option<String>,
 
-    /// How many lines of scrollback to retain above the live TUI frame in
-    /// the rendered Slack message. Lets you read content that scrolled off
-    /// the top before the next anchor. 0 disables. Default: 200.
+    /// How many lines of scroll buffer to retain above the live TUI frame
+    /// in Slack messages. Lets you read content that scrolled off the top
+    /// before the next anchor. 0 disables. Default: 10000.
+    #[arg(long, alias = "scrollback")]
+    scroll_buffer: Option<usize>,
+
+    /// Replace Unicode Block Elements (U+2580–U+259F: █ ▌ ▐ ▛ etc.) with
+    /// spaces in messages sent to Slack. Slack's code-block font lacks
+    /// glyphs for these and falls back to a wider font, which pushes
+    /// box-drawing edges out of column (e.g. the Claude Code welcome
+    /// banner). The local attach window is unaffected. Off by default.
     #[arg(long)]
-    scrollback: Option<usize>,
+    replace_block_chars: bool,
 }
 
 #[tokio::main]
@@ -153,10 +161,11 @@ async fn main() -> Result<()> {
         .name
         .or(config.name.clone())
         .unwrap_or_else(|| "CliBridge".to_string());
-    let scrollback = cli
-        .scrollback
-        .or(config.scrollback)
-        .unwrap_or(bridge_slack::DEFAULT_SCROLLBACK_LINES);
+    let scroll_buffer = cli
+        .scroll_buffer
+        .or(config.scroll_buffer)
+        .unwrap_or(bridge_slack::DEFAULT_SCROLL_BUFFER_LINES);
+    let replace_block_chars = cli.replace_block_chars || config.replace_block_chars.unwrap_or(false);
 
     bridge::run(
         &channel_or_name,
@@ -168,7 +177,8 @@ async fn main() -> Result<()> {
         anchor_refresh,
         name,
         cli.pty_log,
-        scrollback,
+        scroll_buffer,
+        replace_block_chars,
     )
     .await
 }

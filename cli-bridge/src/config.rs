@@ -24,8 +24,14 @@ pub struct AppConfig {
     pub anchor_refresh: Option<u32>,
     /// Friendly display name for the session, used in lifecycle banners.
     pub name: Option<String>,
-    /// Lines of scrollback to retain above the live TUI frame. 0 disables.
-    pub scrollback: Option<usize>,
+    /// Lines of scroll buffer to retain above the live TUI frame.
+    /// 0 disables. Old key name `scrollback` is still accepted.
+    #[serde(alias = "scrollback")]
+    pub scroll_buffer: Option<usize>,
+    /// Replace Unicode Block Elements with spaces when sending to Slack.
+    /// Default: false. Avoids column drift in box-drawing layouts where
+    /// Slack's font fallback renders block chars wider than one cell.
+    pub replace_block_chars: Option<bool>,
 }
 
 impl AppConfig {

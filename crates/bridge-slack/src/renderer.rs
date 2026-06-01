@@ -1,21 +1,34 @@
-/// Default scrollback line cap. Slack chat.update tops out around 40 KB; at
-/// 120 cols × 200 lines that's ~24 KB even with all cells filled, leaving
-/// room for the live frame on top. Tunable via `--scrollback`.
-pub const DEFAULT_SCROLLBACK_LINES: usize = 200;
+/// Default scroll-buffer line cap. Each scrolled-off row is eventually
+/// posted to Slack as part of a 📜 Scroll buffer or 📚 History message
+/// via the bridge's tick-paced drain. The cap bounds how many rows we'll
+/// buffer between ticks; once it's hit, the oldest rows are silently
+/// evicted — **lost from the rendered output entirely**.
+///
+/// We want this large enough that a fast burst (e.g. an LLM dumping 1000+
+/// lines in one second) doesn't overflow before the bridge has had a
+/// chance to drain it. At 120 cols × 8 bytes/cell average that's ~1 MB
+/// per 1000 lines; 10,000 is comfortably under any sensible memory bound
+/// and gives us ~10x headroom over a typical "long answer" burst.
+pub const DEFAULT_SCROLL_BUFFER_LINES: usize = 10_000;
 
 /// Renders terminal output for display in Slack messages.
 ///
-/// Strategy:
+/// Strategy (log-segment model):
 /// - Accumulates terminal output as it arrives. `process()` does not render.
 /// - Detects "TUI mode" only when an app enables the alternate screen buffer
 ///   (vim, htop, less, tmux). Plain output stays in streaming mode.
 /// - Streaming mode: appends to a buffer that the bridge drains on a fixed
 ///   tick via `take_pending()` and posts as a new message.
-/// - TUI mode: maintains a virtual screen and renders the full frame on tick;
-///   the bridge edits the existing message.
-/// - Rows that scroll off the top of the virtual screen are captured into a
-///   bounded scrollback ring and rendered above the live frame, so users can
-///   see content that the app pushed past the top.
+/// - TUI mode: the live frame is *just the current screen*. The bridge edits
+///   one Slack message with this each tick. Bounded by cols × rows so the
+///   message stays well under Slack's 4000-char chat.update cap in practice.
+/// - Rows that scroll off the top become append-only history. They are NOT
+///   re-rendered into the live frame. Instead the bridge drains them via
+///   `drain_scroll_buffer_rows()` and writes them into one of two kinds of
+///   Slack message: an "active" 📜 Scroll buffer (still being extended each
+///   tick) or a "locked" 📚 History (sealed once active fills up). This
+///   structurally rules out duplication: each row lives in exactly one
+///   Slack message forever.
 pub struct TuiRenderer {
     /// Current screen buffer (rows x cols)
     screen: Vec<Vec<char>>,
@@ -59,29 +72,39 @@ pub struct TuiRenderer {
     /// We stash any incomplete trailing bytes here and prepend them to the next
     /// chunk so the parser only ever sees complete units.
     input_carry: Vec<u8>,
-    /// Rows that scrolled off the top of the live screen since the last anchor
-    /// reset. Capped at `scrollback_max` lines; oldest evicted first. Rendered
-    /// above the live frame in the same Slack message so users can scroll back
-    /// to text the app pushed past the top.
+    /// Rows that scrolled off the top of the live screen since the last
+    /// anchor reset. Capped at `scroll_buffer_max` lines; oldest evicted
+    /// first. Drained by the bridge each tick into 📜 *Scroll buffer* /
+    /// 📚 *History* Slack messages — they're not re-rendered into the
+    /// live frame.
     ///
     /// Captures legitimate scrolls (LF past bottom, auto-wrap past bottom,
     /// CSI S "scroll up"). Skips deletions (CSI M, CSI 2J) — those are
     /// intentional content removal, not scrolled-off history.
-    scrollback: std::collections::VecDeque<Vec<char>>,
-    /// Maximum scrollback lines to retain. 0 disables scrollback entirely
-    /// (rows that scroll off are dropped — original behavior).
-    scrollback_max: usize,
+    scroll_buffer: std::collections::VecDeque<Vec<char>>,
+    /// Maximum scroll-buffer lines to retain. 0 disables the buffer
+    /// entirely (rows that scroll off are dropped — original behavior).
+    scroll_buffer_max: usize,
     /// Whether the TUI screen has changed since the last `take_pending`.
     dirty: bool,
+    /// When true, replace Unicode Block Elements (U+2580–U+259F: █ ▌ ▐ ▛
+    /// ▜ ▝ ▟ etc.) with ASCII spaces in text we send to Slack. Slack's
+    /// code-block font lacks glyphs for these and falls back to a font
+    /// that renders them wider than one cell, which pushes every glyph
+    /// to their right out of column — visible as misaligned table edges
+    /// in the Claude Code welcome banner. The local attach window
+    /// renders raw PTY bytes and is unaffected; this only sanitizes
+    /// what we hand to Slack.
+    replace_block_chars: bool,
 }
 
 impl TuiRenderer {
     pub fn new(cols: u16, rows: u16) -> Self {
-        Self::with_scrollback(cols, rows, DEFAULT_SCROLLBACK_LINES)
+        Self::with_scroll_buffer(cols, rows, DEFAULT_SCROLL_BUFFER_LINES)
     }
 
-    /// Build a renderer with an explicit scrollback cap. `0` disables.
-    pub fn with_scrollback(cols: u16, rows: u16, scrollback_max: usize) -> Self {
+    /// Build a renderer with an explicit scroll-buffer cap. `0` disables.
+    pub fn with_scroll_buffer(cols: u16, rows: u16, scroll_buffer_max: usize) -> Self {
         let cols = cols as usize;
         let rows = rows as usize;
         Self {
@@ -96,88 +119,71 @@ impl TuiRenderer {
             line_buffer: String::new(),
             pending_handoff: None,
             input_carry: Vec::new(),
-            scrollback: std::collections::VecDeque::with_capacity(scrollback_max.min(1024)),
-            scrollback_max,
+            scroll_buffer: std::collections::VecDeque::with_capacity(
+                scroll_buffer_max.min(1024),
+            ),
+            scroll_buffer_max,
             dirty: false,
+            replace_block_chars: false,
         }
     }
 
-    /// Drop all scrollback. Called by the bridge when it re-anchors a Slack
-    /// message (start of session, `--clear`, anchor-refresh threshold) so the
-    /// next message starts with a clean slate.
-    pub fn clear_scrollback(&mut self) {
-        self.scrollback.clear();
+    /// Toggle the Block Elements → space substitution. See the
+    /// `replace_block_chars` field documentation for context.
+    pub fn set_replace_block_chars(&mut self, replace: bool) {
+        self.replace_block_chars = replace;
     }
 
-    /// Drain pending scrollback into one or more Slack-ready code-block
-    /// chunks, each guaranteed to be at most `max_chars` Unicode scalars.
-    /// Each chunk is wrapped in a ```` ``` ```` fence so it renders as a
-    /// monospace block.
+    /// Drop all pending scroll-buffer rows. Called by the bridge on
+    /// re-anchor (`--clear`, anchor-refresh) so future ticks don't post
+    /// history that the user has explicitly asked to flush.
+    pub fn clear_scroll_buffer(&mut self) {
+        self.scroll_buffer.clear();
+    }
+
+    /// Drain pending scroll-buffer rows. Returns oldest-first; each row
+    /// is the (already-trimmed-of-trailing-blanks) char vec captured when
+    /// it scrolled off the top of the screen. Empties the ring.
     ///
-    /// Returns an empty Vec when there's no scrollback. After calling this,
-    /// the renderer no longer holds the drained lines — the next render
-    /// produces only the live frame plus *new* scrollback that arrives
-    /// after this call. This is what gives the user the "history is posted
-    /// once, then forgotten" property they expect when the live message
-    /// would otherwise grow past Slack's 40 KB chat.update limit.
-    ///
-    /// Splits at line boundaries. A single line longer than `max_chars` is
-    /// hard-split at byte `max_chars` to guarantee progress; that's a degenerate
-    /// case we don't expect with `cols <= 200` but we handle it for safety.
-    pub fn take_scrollback_chunks(&mut self, max_chars: usize) -> Vec<String> {
-        if self.scrollback.is_empty() {
-            return Vec::new();
-        }
-        // Reserve budget for the surrounding code-block fences.
-        const FENCE_OVERHEAD: usize = "```\n".len() + "```".len();
-        let budget = max_chars.saturating_sub(FENCE_OVERHEAD).max(1);
+    /// Renderer no longer chunks for Slack — the bridge owns that,
+    /// because chunking interacts with the active-vs-locked-segment
+    /// policy that only makes sense at the messaging layer.
+    pub fn drain_scroll_buffer_rows(&mut self) -> Vec<Vec<char>> {
+        let replace = self.replace_block_chars;
+        self.scroll_buffer
+            .drain(..)
+            .map(|row| sanitize_row_for_slack(row, replace))
+            .collect()
+    }
 
-        let mut chunks: Vec<String> = Vec::new();
-        let mut current = String::new();
-        let mut current_chars: usize = 0;
+    /// How many rows are currently buffered in the scroll-buffer ring.
+    /// Used by the bridge for backpressure decisions.
+    pub fn scroll_buffer_pending(&self) -> usize {
+        self.scroll_buffer.len()
+    }
 
-        let flush = |chunks: &mut Vec<String>, current: &mut String, current_chars: &mut usize| {
-            if !current.is_empty() {
-                chunks.push(format!("```\n{current}```"));
-                current.clear();
-                *current_chars = 0;
-            }
-        };
+    /// Borrow the oldest pending scroll-buffer row without removing it.
+    /// Returns `None` when the ring is empty.
+    pub fn peek_first_scroll_buffer_row(&self) -> Option<&[char]> {
+        self.scroll_buffer.front().map(|v| v.as_slice())
+    }
 
-        while let Some(row) = self.scrollback.pop_front() {
-            // Build the line text + trailing newline once.
-            let mut line: String = row.iter().collect();
-            line.push('\n');
-            let mut line_chars = line.chars().count();
+    /// Remove the oldest pending scroll-buffer row. Used by the bridge
+    /// to commit a row to a Slack edit only after measuring whether it
+    /// fits in the per-message size budget.
+    pub fn pop_first_scroll_buffer_row(&mut self) -> Option<Vec<char>> {
+        let replace = self.replace_block_chars;
+        self.scroll_buffer
+            .pop_front()
+            .map(|row| sanitize_row_for_slack(row, replace))
+    }
 
-            // Hard-split lines that exceed the per-chunk budget on their
-            // own. Splits at a char boundary so we never produce invalid
-            // UTF-8.
-            while line_chars > budget {
-                flush(&mut chunks, &mut current, &mut current_chars);
-                let split = line
-                    .char_indices()
-                    .nth(budget)
-                    .map(|(i, _)| i)
-                    .unwrap_or(line.len());
-                let head = line[..split].to_string();
-                let tail = line[split..].to_string();
-                chunks.push(format!("```\n{head}```"));
-                line = tail;
-                line_chars = line.chars().count();
-            }
-
-            // If adding this line would push the current chunk past the
-            // budget, flush the current chunk first.
-            if current_chars + line_chars > budget {
-                flush(&mut chunks, &mut current, &mut current_chars);
-            }
-            current.push_str(&line);
-            current_chars += line_chars;
-        }
-
-        flush(&mut chunks, &mut current, &mut current_chars);
-        chunks
+    /// Push a row onto the *front* of the scroll-buffer ring (i.e. as
+    /// the new oldest). Used by the bridge to put back the tail of a
+    /// row it had to hard-split at a UTF-16 boundary mid-content; the
+    /// next drain picks up where the split left off.
+    pub fn push_front_scroll_buffer_row(&mut self, row: Vec<char>) {
+        self.scroll_buffer.push_front(row);
     }
 
     /// Append raw terminal output bytes to the renderer's buffer. Cheap and
@@ -220,8 +226,16 @@ impl TuiRenderer {
     }
 
     /// Drain whatever output has accumulated since the last call.
-    /// In streaming mode this empties the buffer; in TUI mode it returns
-    /// the current screen and clears the dirty flag.
+    /// In streaming mode this empties the buffer; in TUI mode it
+    /// **always** returns the current screen — the bridge dedupes
+    /// identical content at the Slack-call layer.
+    ///
+    /// We deliberately don't gate on a `dirty` flag in TUI mode: rows
+    /// that scrolled off the screen during a long burst aren't reflected
+    /// by `dirty` (which only fires when the renderer's `process` is
+    /// called), so a quiet renderer can still have a stale live frame
+    /// in Slack relative to the actual screen. Returning the current
+    /// frame every tick lets the bridge keep the live message in sync.
     pub fn take_pending(&mut self) -> Option<RenderedOutput> {
         // Drain any leftover streaming text that was buffered before we
         // transitioned into TUI mode. Always return it as a fresh post.
@@ -233,9 +247,6 @@ impl TuiRenderer {
         }
 
         if self.tui_mode {
-            if !self.dirty {
-                return None;
-            }
             self.dirty = false;
             Some(RenderedOutput {
                 text: self.render_screen(),
@@ -533,7 +544,7 @@ impl TuiRenderer {
             }
             'S' => {
                 // SU — Scroll Up by N lines (drop the top N, append blanks).
-                // Each dropped row goes into scrollback.
+                // Each dropped row goes into the scroll buffer.
                 let n = nums.first().copied().unwrap_or(1).max(1);
                 for _ in 0..n.min(self.rows) {
                     self.scroll_off_top();
@@ -624,23 +635,23 @@ impl TuiRenderer {
         }
     }
 
-    /// Drop the top row off the screen, capturing it into scrollback, and
+    /// Drop the top row off the screen, capturing it into the scroll buffer, and
     /// append a fresh blank row at the bottom. Called by the three real-scroll
     /// paths (LF past bottom, auto-wrap past bottom, CSI S "scroll up").
     fn scroll_off_top(&mut self) {
         let dropped = self.screen.remove(0);
         self.screen.push(vec![' '; self.cols]);
-        if self.scrollback_max > 0 {
+        if self.scroll_buffer_max > 0 {
             // Skip rows that are all blanks — they're padding, not content.
             // Also skip the trailing run of blanks on real rows so we don't
-            // pad scrollback with right-edge whitespace.
+            // pad the scroll buffer with right-edge whitespace.
             let last_nonblank = dropped.iter().rposition(|&c| c != ' ');
             if let Some(end) = last_nonblank {
                 let trimmed: Vec<char> = dropped[..=end].to_vec();
-                if self.scrollback.len() >= self.scrollback_max {
-                    self.scrollback.pop_front();
+                if self.scroll_buffer.len() >= self.scroll_buffer_max {
+                    self.scroll_buffer.pop_front();
                 }
-                self.scrollback.push_back(trimmed);
+                self.scroll_buffer.push_back(trimmed);
             }
         }
     }
@@ -699,16 +710,14 @@ impl TuiRenderer {
     }
 
     fn render_screen(&self) -> String {
-        // Render only the live virtual screen. Scrollback is drained
-        // separately by `take_scrollback_chunks` and posted as its own
-        // Slack message(s) — once posted, the renderer forgets about it
-        // so the live frame stays bounded in size and never re-emits
-        // history that's already in the channel.
+        // Live frame is *only* the current virtual screen. Scrolled-off
+        // rows (in `self.scroll_buffer`) are drained separately by the
+        // bridge and posted as their own sealed messages — never included
+        // here. That's what makes the per-row-deduplication problem
+        // disappear: each row lives in exactly one Slack message.
         //
         // Trim trailing all-blank rows: TUI apps often resize themselves
-        // larger than they actually use (Claude Code asks for 30 rows but
-        // only paints into 25), and Slack's monospace block wraps anything
-        // we emit, so empty rows just inflate the message.
+        // larger than they use, and empty rows just inflate the message.
         let last_nonblank = self
             .screen
             .iter()
@@ -716,15 +725,81 @@ impl TuiRenderer {
             .map(|i| i + 1)
             .unwrap_or(0);
 
-        let mut output = String::from("```\n");
+        let mut output = String::new();
+        output.push_str("🟢 *Live*\n```\n");
         for row in &self.screen[..last_nonblank] {
-            let line: String = row.iter().collect();
+            let line: String = row.iter().map(|&c| sanitize_for_slack(c, self.replace_block_chars)).collect();
             output.push_str(line.trim_end());
             output.push('\n');
         }
         output.push_str("```");
         output
     }
+}
+
+/// Replace a single character with its Slack-safe form, if requested.
+///
+/// Slack's code-block font renders Unicode Block Elements
+/// (U+2580–U+259F: █ ▌ ▐ ▛ ▜ ▝ ▘ ▟ ▙ etc.) wider than one cell because
+/// it falls back to a font that has glyphs for them. Every glyph after
+/// such a character on a row drifts right, breaking column alignment of
+/// box-drawing layouts (the Claude Code welcome banner is the canonical
+/// example).
+///
+/// When `replace` is true we substitute each block char with a single-
+/// cell ASCII glyph chosen to roughly evoke where in the cell the
+/// original sits — `#` for solid, `'` for upper, `,` for lower, `[` /
+/// `]` for left/right, `/` `\` for diagonals, `.` `:` for shades. The
+/// silhouette of a logo (Claude Code's banner, htop's bars) reads as
+/// blocky-but-recognizable instead of vanishing into whitespace.
+///
+/// Box-drawing characters (U+2500–U+257F: │ ─ ╭ ╮ etc.) are NOT in the
+/// Block Elements range — Slack renders those at the right width — so
+/// they pass through untouched.
+fn sanitize_for_slack(c: char, replace: bool) -> char {
+    if !replace {
+        return c;
+    }
+    match c {
+        // Full block and dark shade — fully filled.
+        '\u{2588}' | '\u{2593}' => '#',
+        // Medium shade — half-tone.
+        '\u{2592}' => ':',
+        // Light shade — sparse.
+        '\u{2591}' => '.',
+        // Lower fractions (1/8 .. 7/8 filling from the bottom).
+        // 'baseline' chars sit visually at the bottom of the line.
+        '\u{2581}'..='\u{2587}' => '_',
+        // Upper fractions — sit at the top of the line.
+        '\u{2580}' | '\u{2594}' => '\'',
+        // Left fractions (left half + 1/8..7/8).
+        '\u{2589}'..='\u{258F}' => '[',
+        // Right fractions (right half + right 1/8).
+        '\u{2590}' | '\u{2595}' => ']',
+        // Quadrants — maps roughly to where they sit in the cell.
+        '\u{2596}' => ',',  // lower left
+        '\u{2597}' => ',',  // lower right
+        '\u{2598}' => '\'', // upper left
+        '\u{2599}' => '[',  // upper-left + lower (L-shape on the left)
+        '\u{259A}' => '\\', // upper-left + lower-right diagonal
+        '\u{259B}' => '[',  // upper + lower-left
+        '\u{259C}' => ']',  // upper + lower-right
+        '\u{259D}' => '\'', // upper right
+        '\u{259E}' => '/',  // upper-right + lower-left diagonal
+        '\u{259F}' => ']',  // upper-right + lower (L-shape on the right)
+        _ => c,
+    }
+}
+
+/// Sanitize an entire row in place if `replace` is true; otherwise
+/// return it unchanged.
+fn sanitize_row_for_slack(mut row: Vec<char>, replace: bool) -> Vec<char> {
+    if replace {
+        for c in &mut row {
+            *c = sanitize_for_slack(*c, true);
+        }
+    }
+    row
 }
 
 /// Output from the renderer, indicating whether to post a new message or edit existing.
@@ -1381,37 +1456,62 @@ mod tests {
     }
 
     #[test]
-    fn test_scrollback_captures_lf_scroll() {
+    fn test_scroll_buffer_captures_lf_scroll() {
         // Wider than content + room for the trailing write so we don't
         // accidentally trigger an extra auto-wrap scroll.
-        let mut renderer = TuiRenderer::with_scrollback(20, 2, 50);
+        let mut renderer = TuiRenderer::with_scroll_buffer(20, 2, 50);
         renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hfirst");
         renderer.process(b"\x1b[2;1Hsecond");
         // Position to end of "second" then LF past bottom — row 0 ("first")
-        // scrolls off into scrollback.
+        // scrolls off into scroll buffer.
         renderer.process(b"\x1b[2;7H\n");
         renderer.process(b"third");
-        assert_eq!(renderer.scrollback.len(), 1);
-        let s: String = renderer.scrollback[0].iter().collect();
+        assert_eq!(renderer.scroll_buffer.len(), 1);
+        let s: String = renderer.scroll_buffer[0].iter().collect();
         assert_eq!(s, "first");
     }
 
     #[test]
-    fn test_scrollback_drained_separately_from_live_frame() {
-        // Once drained, scrollback is gone — the live frame stays bounded
-        // and the same history isn't re-rendered into the next message.
-        let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
+    fn test_live_frame_excludes_scroll_buffer() {
+        // Log-segment model: scrolled-off rows are *not* re-rendered into
+        // the live frame. They live only in `self.scroll_buffer`, which the
+        // bridge drains separately and posts as sealed messages.
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
         renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hold");
         renderer.process(b"\x1b[2;1Hkeep");
         renderer.process(b"\n"); // 'old' scrolls off
         renderer.process(b"new");
 
-        // Drain scrollback first.
-        let scrollback = renderer.take_scrollback_chunks(40_000);
-        assert_eq!(scrollback.len(), 1);
-        assert!(scrollback[0].contains("old"));
+        let rendered = renderer.take_pending().unwrap();
+        assert!(rendered.text.contains("keep"));
+        assert!(rendered.text.contains("new"));
+        assert!(
+            !rendered.text.contains("old"),
+            "live frame must not include scrolled-off content: {:?}",
+            rendered.text
+        );
+        // Scroll buffer is still queued for the bridge to drain.
+        assert_eq!(renderer.scroll_buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_scroll_buffer_drained_separately_from_live_frame() {
+        // Once drained, scroll buffer is gone — the live frame stays bounded
+        // and the same history isn't re-rendered into the next message.
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Hold");
+        renderer.process(b"\x1b[2;1Hkeep");
+        renderer.process(b"\n"); // 'old' scrolls off
+        renderer.process(b"new");
+
+        // Drain scroll buffer first.
+        let rows = renderer.drain_scroll_buffer_rows();
+        assert_eq!(rows.len(), 1);
+        let s: String = rows[0].iter().collect();
+        assert!(s.contains("old"));
 
         // Live frame contains only 'keep' + 'new'.
         let rendered = renderer.take_pending().unwrap();
@@ -1419,102 +1519,83 @@ mod tests {
         assert!(rendered.text.contains("new"));
         assert!(
             !rendered.text.contains("old"),
-            "live frame must not re-render drained scrollback"
+            "live frame must not re-render drained scroll buffer"
         );
 
-        // No further scrollback after drain.
-        assert!(renderer.take_scrollback_chunks(40_000).is_empty());
+        // No further scroll buffer after drain.
+        assert!(renderer.drain_scroll_buffer_rows().is_empty());
     }
 
     #[test]
-    fn test_scrollback_chunks_split_at_size_limit() {
-        // Push lines until many are in scrollback; verify the chunks
-        // collectively contain every scrolled-off line, each chunk is
-        // under budget, and nothing is left in the renderer afterward.
-        let mut renderer = TuiRenderer::with_scrollback(10, 2, 100);
+    fn test_drain_scroll_buffer_rows_returns_oldest_first() {
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
         renderer.tui_mode = true;
-        // 50 \r\n-delimited writes → 49 lines scroll off (the 50th is still
-        // on the live screen). Plenty for multi-chunk splitting.
-        for i in 0..50 {
-            renderer.process(format!("line{i:02}\r\n").as_bytes());
+        for i in 0..5 {
+            renderer.process(format!("line{i}\r\n").as_bytes());
         }
-        let scrolled_off_before = renderer.scrollback.len();
-        assert!(scrolled_off_before >= 40);
-
-        let budget = 50;
-        let chunks = renderer.take_scrollback_chunks(budget);
-        assert!(chunks.len() >= 2, "got {} chunks", chunks.len());
-        let mut total_lines = 0;
-        for c in &chunks {
-            assert!(
-                c.chars().count() <= budget,
-                "chunk too long: {} chars",
-                c.chars().count()
-            );
-            assert!(c.starts_with("```"));
-            assert!(c.ends_with("```"));
-            total_lines += c.matches("line").count();
-        }
-        assert_eq!(
-            total_lines, scrolled_off_before,
-            "chunks dropped scrolled-off lines"
-        );
-        assert!(renderer.take_scrollback_chunks(40_000).is_empty());
+        let rows = renderer.drain_scroll_buffer_rows();
+        // First scrolled-off should be oldest ("line0"); last should be
+        // most recently scrolled.
+        let first: String = rows.first().unwrap().iter().collect();
+        let last: String = rows.last().unwrap().iter().collect();
+        assert!(first.starts_with("line0"), "got first: {first:?}");
+        assert!(last.starts_with("line"), "got last: {last:?}");
+        assert!(renderer.drain_scroll_buffer_rows().is_empty());
     }
 
     #[test]
-    fn test_scrollback_chunks_empty_when_no_history() {
-        let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
+    fn test_drain_scroll_buffer_rows_empty_when_no_history() {
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
         renderer.tui_mode = true;
         renderer.process(b"hello");
-        assert!(renderer.take_scrollback_chunks(40_000).is_empty());
+        assert!(renderer.drain_scroll_buffer_rows().is_empty());
     }
 
     #[test]
-    fn test_scrollback_capped_at_max() {
-        let mut renderer = TuiRenderer::with_scrollback(10, 2, 3);
+    fn test_scroll_buffer_capped_at_max() {
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 3);
         renderer.tui_mode = true;
         // Push 10 rows through (CRLF line-discipline-style so col resets).
         for i in 0..10 {
             renderer.process(format!("row{i}\r\n").as_bytes());
         }
-        assert_eq!(renderer.scrollback.len(), 3);
+        assert_eq!(renderer.scroll_buffer.len(), 3);
         // Last entry should be one of the most recent rows.
-        let last: String = renderer.scrollback.back().unwrap().iter().collect();
+        let last: String = renderer.scroll_buffer.back().unwrap().iter().collect();
         assert!(last.starts_with("row"), "got: {last:?}");
     }
 
     #[test]
-    fn test_scrollback_disabled_when_max_zero() {
-        let mut renderer = TuiRenderer::with_scrollback(10, 2, 0);
+    fn test_scroll_buffer_disabled_when_max_zero() {
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 0);
         renderer.tui_mode = true;
         for i in 0..5 {
             renderer.process(format!("row{i}\r\n").as_bytes());
         }
-        assert!(renderer.scrollback.is_empty());
+        assert!(renderer.scroll_buffer.is_empty());
     }
 
     #[test]
-    fn test_scrollback_clear() {
-        let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
+    fn test_scroll_buffer_clear() {
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
         renderer.tui_mode = true;
         for i in 0..3 {
             renderer.process(format!("r{i}\r\n").as_bytes());
         }
-        assert!(!renderer.scrollback.is_empty());
-        renderer.clear_scrollback();
-        assert!(renderer.scrollback.is_empty());
+        assert!(!renderer.scroll_buffer.is_empty());
+        renderer.clear_scroll_buffer();
+        assert!(renderer.scroll_buffer.is_empty());
     }
 
     #[test]
-    fn test_scrollback_skips_blank_rows() {
-        // Scrolling off a row that's all blanks shouldn't pollute scrollback
+    fn test_scroll_buffer_skips_blank_rows() {
+        // Scrolling off a row that's all blanks shouldn't pollute scroll buffer
         // — those are padding, not user content.
-        let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
         renderer.tui_mode = true;
         // Start with two blank rows. \n past bottom scrolls a blank off.
         renderer.process(b"\n\n");
-        assert!(renderer.scrollback.is_empty());
+        assert!(renderer.scroll_buffer.is_empty());
     }
 
     #[test]
@@ -1595,6 +1676,139 @@ mod tests {
         renderer.process(b"\rX"); // CR + X — should overwrite col 0 of row 0
         assert_eq!(renderer.screen[0][0], 'X');
         assert_eq!(renderer.screen[0][1], 'b');
+    }
+
+    #[test]
+    fn test_render_includes_live_header() {
+        // Every TUI render should mark the live region for the user, so the
+        // 🟢 *Live* label appears even with no scroll buffer or spill.
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Hhello");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("🟢 *Live*"), "got: {:?}", out.text);
+        assert!(out.text.contains("hello"));
+        // The renderer never emits a scroll-buffer header — the bridge
+        // adds that when it posts a separate scroll-buffer message.
+        assert!(!out.text.contains("📜 *Scroll buffer*"));
+    }
+
+    #[test]
+    fn test_render_never_includes_scroll_buffer_header() {
+        // The renderer's job is *only* the live frame. The scroll buffer
+        // header is added by the bridge when it posts sealed scroll buffer
+        // messages — it must not appear in a render_screen output.
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Hold");
+        renderer.process(b"\x1b[2;1Hkeep");
+        renderer.process(b"\n"); // 'old' scrolls off
+        renderer.process(b"new");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("🟢 *Live*"));
+        assert!(
+            !out.text.contains("📜 *Scroll buffer*"),
+            "renderer must not emit a scroll buffer section: {:?}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn test_repaint_after_drain_renders_full_screen() {
+        // After the bridge has drained scroll buffer (and posted it as a
+        // sealed message), the live frame keeps showing the full current
+        // screen — there's no per-row dirty bookkeeping anymore.
+        let mut renderer = TuiRenderer::with_scroll_buffer(20, 4, 50);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Hbanner line");
+        renderer.process(b"\x1b[2;1Hsubtitle");
+        renderer.process(b"\x1b[3;1Hresponse text");
+        let _ = renderer.take_pending().unwrap();
+        // Bridge drains scroll buffer (none here) and posts the live frame.
+        // On the next render the screen is what it is — every row.
+        renderer.process(b"\x1b[4;1Hmore"); // touch screen so dirty=true
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("banner"));
+        assert!(out.text.contains("subtitle"));
+        assert!(out.text.contains("response"));
+        assert!(out.text.contains("more"));
+    }
+
+    #[test]
+    fn test_clear_scroll_buffer_drops_pending_history() {
+        // clear_scroll buffer is called on `--clear` / anchor-refresh: the
+        // user has explicitly asked to drop pending history rather than
+        // posting it. After it, take_scroll buffer_chunks returns empty.
+        let mut renderer = TuiRenderer::with_scroll_buffer(20, 2, 50);
+        renderer.tui_mode = true;
+        for i in 0..5 {
+            renderer.process(format!("row{i}\r\n").as_bytes());
+        }
+        assert!(!renderer.scroll_buffer.is_empty());
+        renderer.clear_scroll_buffer();
+        assert!(renderer.drain_scroll_buffer_rows().is_empty());
+    }
+
+    #[test]
+    fn test_replace_block_chars_off_by_default() {
+        // Block characters pass through unchanged unless explicitly enabled.
+        let mut renderer = TuiRenderer::new(20, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Hlogo:\xe2\x96\x90\xe2\x96\x9b"); // "logo:▐▛"
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains('▐'), "got: {:?}", out.text);
+        assert!(out.text.contains('▛'));
+    }
+
+    #[test]
+    fn test_replace_block_chars_swaps_to_ascii() {
+        // With the flag on, U+2580..U+259F become single-cell ASCII
+        // approximations so Slack's font fallback can't push the row's
+        // right edge out of column. Non-block chars (incl. box-drawing)
+        // pass through.
+        let mut renderer = TuiRenderer::new(20, 2);
+        renderer.set_replace_block_chars(true);
+        renderer.tui_mode = true;
+        // "│▐▛x│" — block chars between two box-drawing pipes.
+        // ▐ (right half block) → ']'; ▛ (upper-left + lower-left → "[").
+        renderer.process(b"\x1b[1;1H\xe2\x94\x82\xe2\x96\x90\xe2\x96\x9bx\xe2\x94\x82");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("│][x│"), "got: {:?}", out.text);
+        assert!(!out.text.contains('▐'));
+        assert!(!out.text.contains('▛'));
+    }
+
+    #[test]
+    fn test_replace_block_chars_silhouette_kept_for_full_block() {
+        // Solid blocks (█) become '#' so a filled logo still reads as a
+        // filled silhouette rather than disappearing into whitespace.
+        let mut renderer = TuiRenderer::new(10, 1);
+        renderer.set_replace_block_chars(true);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1H\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("###"), "got: {:?}", out.text);
+    }
+
+    #[test]
+    fn test_replace_block_chars_applies_to_scroll_buffer() {
+        // Rows scrolled into the buffer must get the same sanitization as
+        // the live frame — otherwise scroll-buffer messages still misalign.
+        let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
+        renderer.set_replace_block_chars(true);
+        renderer.tui_mode = true;
+        renderer.process(b"\xe2\x96\x90\xe2\x96\x9b\r\n"); // "▐▛\r\n"
+        renderer.process(b"\xe2\x96\x9c\xe2\x96\x9d\r\n"); // "▜▝\r\n"
+        renderer.process(b"\xe2\x96\x9e\r\n"); // "▞\r\n" (one more to push first into buffer)
+        let rows = renderer.drain_scroll_buffer_rows();
+        for row in &rows {
+            for &c in row {
+                assert!(
+                    !matches!(c, '\u{2580}'..='\u{259F}'),
+                    "block char leaked through drain_scroll_buffer_rows: {c:?}"
+                );
+            }
+        }
     }
 
     #[test]

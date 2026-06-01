@@ -18,6 +18,17 @@ use crate::rate_limiter::RateLimiter;
 const DEFAULT_API_BASE: &str = "https://slack.com/api";
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Prefix prepended to every Slack message this bridge posts. Used as a
+/// definitive "this is from us, never feed it back into the PTY" marker.
+/// More robust than ts/text matching — covers ConPTY echo races, partial
+/// reposts, edits, and any future scenario where the bridge's own output
+/// might re-enter the channel.
+///
+/// Visible to the user as a 🌉 (bridge) emoji at the start of every
+/// bridge-authored message. Picks something the user is overwhelmingly
+/// unlikely to start their own input with.
+pub const SELF_MARKER: &str = "🌉 ";
+
 /// Slack implementation of the MessagingClient trait.
 /// Uses user tokens (xoxc-) with the d cookie for authentication.
 pub struct SlackClient {
@@ -49,12 +60,26 @@ pub struct SlackClient {
     /// `oldest=` cursor in conversations.history (which only ever queries
     /// recent messages) to clear before the corresponding ts is forgotten.
     posted_ts: Arc<Mutex<PostedTsRing>>,
+    /// Text bodies of messages we've recently posted, captured *before* the
+    /// network call. This closes the race between Slack storing our message
+    /// (so it shows up in `conversations.history`) and us learning the `ts`
+    /// from the response (so we can put it in `posted_ts`). Without this
+    /// belt-and-suspenders, the poller can fetch our own message, miss the
+    /// ts filter (because we haven't recorded it yet), and feed our own
+    /// message text into the PTY as user input — a self-feeding loop.
+    posted_texts: Arc<Mutex<PostedTextRing>>,
 }
 
 /// Maximum number of self-posted timestamps to remember. At our 1.1s tick
 /// rate this is over an hour of consecutive activity — far longer than any
 /// Slack conversations.history poll could plausibly look back.
 const MAX_POSTED_TS: usize = 4096;
+
+/// Maximum number of self-posted text bodies to remember. Smaller than
+/// `MAX_POSTED_TS` because the text ring only needs to cover the window
+/// between us calling chat.postMessage and the response coming back —
+/// O(1 second) — not the full conversations.history lookback.
+const MAX_POSTED_TEXTS: usize = 64;
 
 /// Bounded set with eviction-by-oldest semantics. Membership is O(1),
 /// insertion + eviction is O(1).
@@ -80,6 +105,34 @@ impl PostedTsRing {
 
     fn contains(&self, ts: &str) -> bool {
         self.set.contains(ts)
+    }
+}
+
+/// Same shape as `PostedTsRing`, but keyed by message text body. Used to
+/// suppress self-echo during the race window between posting and learning
+/// our own ts. Bound is small — the window is sub-second.
+#[derive(Default)]
+struct PostedTextRing {
+    set: HashSet<String>,
+    queue: VecDeque<String>,
+}
+
+impl PostedTextRing {
+    fn insert(&mut self, text: String) {
+        if self.set.contains(&text) {
+            return;
+        }
+        if self.queue.len() >= MAX_POSTED_TEXTS
+            && let Some(oldest) = self.queue.pop_front()
+        {
+            self.set.remove(&oldest);
+        }
+        self.set.insert(text.clone());
+        self.queue.push_back(text);
+    }
+
+    fn contains(&self, text: &str) -> bool {
+        self.set.contains(text)
     }
 }
 
@@ -156,12 +209,19 @@ impl SlackClient {
             team_id: None,
             enterprise_id: None,
             posted_ts: Arc::new(Mutex::new(PostedTsRing::default())),
+            posted_texts: Arc::new(Mutex::new(PostedTextRing::default())),
         }
     }
 
     fn remember_posted(&self, ts: &str) {
         if let Ok(mut ring) = self.posted_ts.lock() {
             ring.insert(ts.to_string());
+        }
+    }
+
+    fn remember_posted_text(&self, text: &str) {
+        if let Ok(mut ring) = self.posted_texts.lock() {
+            ring.insert(text.to_string());
         }
     }
 
@@ -442,6 +502,18 @@ impl MessagingClient for SlackClient {
         let headers = self.headers()?;
         let creds = self.credentials.as_ref().unwrap();
 
+        // Tag every bridge-authored message with the self-marker so the
+        // poller can identify it on sight. This is the primary defense
+        // against self-echo; ts and text rings are belt-and-suspenders.
+        let marked = format!("{SELF_MARKER}{content}");
+
+        // Remember the text BEFORE the network call. The Slack API can store
+        // our message and have it visible to conversations.history before
+        // chat.postMessage's response (with `ts`) returns to us — without
+        // this, the poller can fetch our own message and feed it back into
+        // the PTY in that gap.
+        self.remember_posted_text(&marked);
+
         let resp: SlackResponse = self
             .http
             .post(format!("{}/chat.postMessage", self.api_base))
@@ -449,7 +521,7 @@ impl MessagingClient for SlackClient {
             .form(&[
                 ("token", creds.token.as_str()),
                 ("channel", channel),
-                ("text", content),
+                ("text", marked.as_str()),
             ])
             .send()
             .await
@@ -482,6 +554,15 @@ impl MessagingClient for SlackClient {
         let headers = self.headers()?;
         let creds = self.credentials.as_ref().unwrap();
 
+        let marked = format!("{SELF_MARKER}{content}");
+
+        // Same race-closing belt as send_message: an edit also makes the
+        // new text visible via conversations.history before our HTTP call
+        // returns. Bridge re-anchoring constantly demotes prior live
+        // messages into 📜 *Scroll buffer* via edits, so without this every
+        // such edit gets fed back into the PTY.
+        self.remember_posted_text(&marked);
+
         let resp: SlackResponse = self
             .http
             .post(format!("{}/chat.update", self.api_base))
@@ -490,7 +571,7 @@ impl MessagingClient for SlackClient {
                 ("token", creds.token.as_str()),
                 ("channel", channel),
                 ("ts", message_id),
-                ("text", content),
+                ("text", marked.as_str()),
             ])
             .send()
             .await
@@ -523,6 +604,7 @@ impl MessagingClient for SlackClient {
         let http = self.http.clone();
         let api_base = self.api_base.clone();
         let posted_ts = self.posted_ts.clone();
+        let posted_texts = self.posted_texts.clone();
 
         let build_headers = |creds: &Credentials| -> HeaderMap {
             let mut headers = HeaderMap::new();
@@ -652,11 +734,54 @@ impl MessagingClient for SlackClient {
                         continue;
                     }
 
-                    // Skip messages we ourselves posted — chat.postMessage
-                    // returns under the same user_id as the human, so we
-                    // can't filter by user; we keyed on ts at post time.
+                    // Primary self-echo defense: bridge-authored messages
+                    // are tagged with distinctive markers. If we see *any*
+                    // of these markers in the text, the message is ours
+                    // and must never reach the PTY. We check both unicode
+                    // and Slack shortcode forms because conversations.history
+                    // can return either depending on Slack-side normalization.
+                    // (Confirmed empirically: messages we post with raw 🌉
+                    // unicode have come back as `:bridge_at_night:` in the
+                    // history response, defeating a unicode-only check.)
+                    //
+                    // We use `contains` not `starts_with` so leading
+                    // whitespace, mentions, or other Slack pre-processing
+                    // can't slip our own content past the filter. The
+                    // false-positive cost — dropping a user message that
+                    // happens to mention "🌉" or "*Scroll buffer*" — is
+                    // dramatically smaller than the cost of feeding our own
+                    // output back into the PTY (a self-amplifying loop).
+                    if let Some(text) = &msg.text
+                        && (text.contains("🌉")
+                            || text.contains(":bridge_at_night:")
+                            || text.contains("📜 *Scroll buffer*")
+                            || text.contains(":scroll: *Scroll buffer*")
+                            // Old label, kept here for sessions that
+                            // started under a previous build still in
+                            // the bridge's poll window.
+                            || text.contains("📜 *Scrollback*")
+                            || text.contains(":scroll: *Scrollback*")
+                            || text.contains("📚 *History*")
+                            || text.contains(":books: *History*")
+                            || text.contains("🟢 *Live*")
+                            || text.contains(":large_green_circle: *Live*"))
+                    {
+                        continue;
+                    }
+
+                    // Belt-and-suspenders: posted ts ring (definitive once
+                    // chat.postMessage returns) and posted text ring (covers
+                    // the post→ts-recorded race). Both should be redundant
+                    // given the marker, but they protect against bugs where
+                    // a code path posts without going through send_message
+                    // or against marker tampering.
                     let is_self_post = posted_ts.lock().map(|s| s.contains(ts)).unwrap_or(false);
                     if is_self_post {
+                        continue;
+                    }
+                    if let Some(text) = &msg.text
+                        && posted_texts.lock().map(|s| s.contains(text)).unwrap_or(false)
+                    {
                         continue;
                     }
 
@@ -735,5 +860,25 @@ mod tests {
         ring.insert("1.0".to_string());
         assert_eq!(ring.queue.len(), 1);
         assert!(ring.contains("1.0"));
+    }
+
+    #[test]
+    fn test_posted_text_ring_evicts_oldest() {
+        let mut ring = PostedTextRing::default();
+        for i in 0..(MAX_POSTED_TEXTS + 10) {
+            ring.insert(format!("body-{i}"));
+        }
+        assert_eq!(ring.queue.len(), MAX_POSTED_TEXTS);
+        assert!(!ring.contains("body-0"));
+        assert!(ring.contains(&format!("body-{}", MAX_POSTED_TEXTS + 5)));
+    }
+
+    #[test]
+    fn test_posted_text_ring_dedupes() {
+        let mut ring = PostedTextRing::default();
+        ring.insert("hello".to_string());
+        ring.insert("hello".to_string());
+        assert_eq!(ring.queue.len(), 1);
+        assert!(ring.contains("hello"));
     }
 }

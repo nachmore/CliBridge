@@ -17,9 +17,10 @@ mirrors everything bidirectionally.
 - **Local terminal mirror** — auto-spawns a real OS terminal that mirrors the
   bridge. Type locally too; both Slack and the local window show the same
   shell.
-- **Scrollback** — content that scrolls off the live frame is posted into the
-  Slack channel as separate frozen messages, then forgotten by the renderer
-  so the live message never grows past Slack's chat.update size limit.
+- **Scroll buffer** — content that scrolls off the live frame is posted into
+  the Slack channel as a 📜 *Scroll buffer* message that fills as new rows
+  arrive; once full it locks as 📚 *History* and a fresh scroll buffer
+  opens. The live message never grows past Slack's chat.update size limit.
 - **Browser-based login** — embedded WebView captures your `xoxc-` token + `d`
   cookie. No bot setup needed.
 - **Channel by name OR ID** — pass `--channel general` and we look it up,
@@ -79,11 +80,17 @@ Session:
 Display:
       --cols <COLS>            Terminal width in columns. Default: 120.
       --rows <ROWS>            Terminal height in rows. Default: 24.
-      --scrollback <N>         Scrollback lines retained. Default: 200.
-                               0 disables.
+      --scroll-buffer <N>      Scroll buffer lines retained. Default: 10000.
+                               0 disables. (alias: --scrollback)
       --anchor-refresh <N>     Re-anchor the live message every N inbound
                                Slack messages (default: 10, 0 to disable).
       --no-local               Skip auto-opening a local terminal mirror.
+      --replace-block-chars    Replace U+2580–U+259F (█ ▌ ▐ ▛ etc.) with
+                               spaces in Slack output. Slack's font
+                               fallback renders these wider than one cell
+                               and pushes box-drawing layouts (e.g. the
+                               Claude Code banner) out of column. The
+                               local attach window is unaffected.
 
 Commands:
       --login                  Open a browser to sign in to Slack and save

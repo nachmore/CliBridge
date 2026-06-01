@@ -33,7 +33,14 @@
 # Can be changed at runtime with `--name <text>` from Slack.
 # name = "build server"
 
-# Lines of scrollback to keep above the live TUI frame in the rendered
+# Lines of scroll buffer to keep above the live TUI frame in the rendered
 # Slack message. Lets you scroll back to content the app pushed past the
-# top of the screen. 0 disables. Default: 200.
-# scrollback = 200
+# top of the screen. 0 disables. Default: 10000.
+# scroll_buffer = 10000
+
+# Replace Unicode Block Elements (U+2580–U+259F: █ ▌ ▐ ▛ etc.) with spaces
+# in messages sent to Slack. Slack's code-block font lacks glyphs for
+# these and falls back to a wider font, which pushes box-drawing layouts
+# out of column (e.g. the Claude Code welcome banner). The local attach
+# window is unaffected. Default: false.
+# replace_block_chars = false
