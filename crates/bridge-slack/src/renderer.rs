@@ -32,6 +32,15 @@ pub const DEFAULT_SCROLL_BUFFER_LINES: usize = 10_000;
 pub struct TuiRenderer {
     /// Current screen buffer (rows x cols)
     screen: Vec<Vec<char>>,
+    /// Parallel to `screen`: per-cell "inverse video" flag. True if the
+    /// cell was written while the SGR-7 attribute was active. Modern
+    /// TUIs (Claude Code is the canonical example) draw their own cursor
+    /// as `\x1b[7m \x1b[27m` — an inverse-video space — once they've
+    /// hidden the OS cursor with `?25l`. Without tracking this, our
+    /// rendered frame loses the cursor entirely. We surface inverse
+    /// cells as `█` in render_screen, which doubles as a "hey, this is
+    /// where the cursor is" indicator with no application cooperation.
+    inverse: Vec<Vec<bool>>,
     /// Terminal dimensions
     cols: usize,
     rows: usize,
@@ -66,6 +75,10 @@ pub struct TuiRenderer {
     /// pre-TUI output. Held separately because once `tui_mode` is on, the next
     /// `take_pending` would otherwise return a TUI frame.
     pending_handoff: Option<String>,
+    /// Currently-active inverse-video SGR (set by `\x1b[7m`, cleared by
+    /// `\x1b[27m` or `\x1b[0m` / bare `\x1b[m`). Written cells inherit
+    /// this into the parallel `inverse` grid.
+    inverse_active: bool,
     /// Bytes carried over from the previous `process()` call. ConPTY (and PTYs
     /// in general) chunk output without regard to escape-sequence or UTF-8
     /// boundaries — a chunk can end mid-`\x1b[1;4;2m`, mid-OSC, or mid-codepoint.
@@ -103,6 +116,15 @@ pub struct TuiRenderer {
     /// skipped. Honors `replace_block_chars`: if that's on, the overlay
     /// is `#` instead of █ so it stays one cell wide in Slack's font.
     show_cursor: bool,
+    /// DECTCEM (`\x1b[?25h` show / `\x1b[?25l` hide). Apps that paint
+    /// their own UI on top of the cursor (Claude Code is the prototype)
+    /// hide it so the underlying terminal doesn't draw a competing
+    /// marker — and they leave the PTY cursor parked on whatever cell
+    /// they happened to write last (often somewhere unrelated to where
+    /// typing actually goes). Rendering an overlay there is misleading,
+    /// so when this is `false` we suppress the cursor regardless of
+    /// `show_cursor`. Default: true.
+    cursor_visible: bool,
 }
 
 impl TuiRenderer {
@@ -116,6 +138,7 @@ impl TuiRenderer {
         let rows = rows as usize;
         Self {
             screen: vec![vec![' '; cols]; rows],
+            inverse: vec![vec![false; cols]; rows],
             cols,
             rows,
             cursor_row: 0,
@@ -125,6 +148,7 @@ impl TuiRenderer {
             tui_mode: false,
             line_buffer: String::new(),
             pending_handoff: None,
+            inverse_active: false,
             input_carry: Vec::new(),
             scroll_buffer: std::collections::VecDeque::with_capacity(
                 scroll_buffer_max.min(1024),
@@ -133,6 +157,7 @@ impl TuiRenderer {
             dirty: false,
             replace_block_chars: false,
             show_cursor: true,
+            cursor_visible: true,
         }
     }
 
@@ -308,8 +333,12 @@ impl TuiRenderer {
         let new_cols = cols as usize;
         let new_rows = rows as usize;
         self.screen.resize(new_rows, vec![' '; new_cols]);
+        self.inverse.resize(new_rows, vec![false; new_cols]);
         for row in &mut self.screen {
             row.resize(new_cols, ' ');
+        }
+        for row in &mut self.inverse {
+            row.resize(new_cols, false);
         }
         self.cols = new_cols;
         self.rows = new_rows;
@@ -489,24 +518,32 @@ impl TuiRenderer {
                 let mode = nums.first().copied().unwrap_or(0);
                 match mode {
                     2 | 3 => {
-                        // Clear entire screen
                         for row in &mut self.screen {
                             row.fill(' ');
                         }
+                        for row in &mut self.inverse {
+                            row.fill(false);
+                        }
                     }
                     0 => {
-                        // Clear from cursor to end
                         self.screen[self.cursor_row][self.cursor_col..].fill(' ');
+                        self.inverse[self.cursor_row][self.cursor_col..].fill(false);
                         for row in &mut self.screen[self.cursor_row + 1..] {
                             row.fill(' ');
                         }
+                        for row in &mut self.inverse[self.cursor_row + 1..] {
+                            row.fill(false);
+                        }
                     }
                     1 => {
-                        // Clear from start to cursor
                         for row in &mut self.screen[..self.cursor_row] {
                             row.fill(' ');
                         }
+                        for row in &mut self.inverse[..self.cursor_row] {
+                            row.fill(false);
+                        }
                         self.screen[self.cursor_row][..=self.cursor_col].fill(' ');
+                        self.inverse[self.cursor_row][..=self.cursor_col].fill(false);
                     }
                     _ => {}
                 }
@@ -515,9 +552,18 @@ impl TuiRenderer {
                 // Erase in line
                 let mode = nums.first().copied().unwrap_or(0);
                 match mode {
-                    0 => self.screen[self.cursor_row][self.cursor_col..].fill(' '),
-                    1 => self.screen[self.cursor_row][..=self.cursor_col].fill(' '),
-                    2 => self.screen[self.cursor_row].fill(' '),
+                    0 => {
+                        self.screen[self.cursor_row][self.cursor_col..].fill(' ');
+                        self.inverse[self.cursor_row][self.cursor_col..].fill(false);
+                    }
+                    1 => {
+                        self.screen[self.cursor_row][..=self.cursor_col].fill(' ');
+                        self.inverse[self.cursor_row][..=self.cursor_col].fill(false);
+                    }
+                    2 => {
+                        self.screen[self.cursor_row].fill(' ');
+                        self.inverse[self.cursor_row].fill(false);
+                    }
                     _ => {}
                 }
             }
@@ -531,6 +577,7 @@ impl TuiRenderer {
                 let n = nums.first().copied().unwrap_or(1).max(1);
                 let end = (self.cursor_col + n).min(self.cols);
                 self.screen[self.cursor_row][self.cursor_col..end].fill(' ');
+                self.inverse[self.cursor_row][self.cursor_col..end].fill(false);
             }
             'P' => {
                 // DCH — Delete Character: drop N chars at the cursor and
@@ -543,6 +590,9 @@ impl TuiRenderer {
                 if n > 0 {
                     row.copy_within(c + n..row_len, c);
                     row[row_len - n..].fill(' ');
+                    let inv = &mut self.inverse[self.cursor_row];
+                    inv.copy_within(c + n..row_len, c);
+                    inv[row_len - n..].fill(false);
                 }
             }
             '@' => {
@@ -555,6 +605,9 @@ impl TuiRenderer {
                     let n = n.min(row_len - self.cursor_col);
                     row.copy_within(self.cursor_col..row_len - n, self.cursor_col + n);
                     row[self.cursor_col..self.cursor_col + n].fill(' ');
+                    let inv = &mut self.inverse[self.cursor_row];
+                    inv.copy_within(self.cursor_col..row_len - n, self.cursor_col + n);
+                    inv[self.cursor_col..self.cursor_col + n].fill(false);
                 }
             }
             'L' => {
@@ -567,6 +620,8 @@ impl TuiRenderer {
                 for _ in 0..n.min(self.rows - start) {
                     self.screen.insert(start, vec![' '; cols]);
                     self.screen.pop();
+                    self.inverse.insert(start, vec![false; cols]);
+                    self.inverse.pop();
                 }
             }
             'M' => {
@@ -578,6 +633,8 @@ impl TuiRenderer {
                 for _ in 0..n.min(self.rows - start) {
                     self.screen.remove(start);
                     self.screen.push(vec![' '; cols]);
+                    self.inverse.remove(start);
+                    self.inverse.push(vec![false; cols]);
                 }
             }
             'G' => {
@@ -609,17 +666,51 @@ impl TuiRenderer {
                 for _ in 0..n.min(self.rows) {
                     self.screen.insert(0, vec![' '; cols]);
                     self.screen.pop();
+                    self.inverse.insert(0, vec![false; cols]);
+                    self.inverse.pop();
                 }
             }
             'm' => {
-                // SGR (colors/attributes) — we intentionally ignore these
-                // for text rendering. Slack code blocks don't render inline
-                // styling; tracking SGR state would just bloat the buffer.
+                // SGR (colors/attributes). We track inverse-video (param 7
+                // / 27) because TUIs that hide the OS cursor (?25l) draw
+                // their own as `\x1b[7m \x1b[27m` — an inverse-video
+                // space — and we want to surface that as a visible
+                // cursor in the rendered frame. Other SGR params are
+                // ignored: Slack code blocks don't render inline
+                // styling, and tracking color state would bloat the
+                // renderer for no Slack-side benefit.
+                //
+                // SGR with no args (`\x1b[m`) is the same as `\x1b[0m`:
+                // a full reset, which clears inverse.
+                if nums.is_empty() {
+                    self.inverse_active = false;
+                } else {
+                    for &n in &nums {
+                        match n {
+                            0 => self.inverse_active = false,
+                            7 => self.inverse_active = true,
+                            27 => self.inverse_active = false,
+                            _ => {}
+                        }
+                    }
+                }
             }
             'h' | 'l' => {
-                // DECSET / DECRST mode set/reset (e.g. ?25h show cursor,
-                // ?25l hide, ?2004h bracketed paste). We don't emulate any
-                // mode the parser cares about, so silently consume.
+                // DECSET / DECRST mode set/reset. Most modes we don't
+                // care about (?2004 bracketed paste, ?1049 alt-screen,
+                // ?1000 mouse, …); `?25` (DECTCEM) we honor so we don't
+                // overlay a cursor marker on a cell where the
+                // application has explicitly hidden the cursor (e.g.
+                // Claude Code parks the PTY cursor wherever it last
+                // painted and hides it; rendering █ there is wrong).
+                if params.starts_with('?') {
+                    let show = cmd == 'h';
+                    for &n in &nums {
+                        if n == 25 {
+                            self.cursor_visible = show;
+                        }
+                    }
+                }
             }
             'r' => {
                 // DECSTBM — set scrolling region. We always treat the whole
@@ -695,6 +786,12 @@ impl TuiRenderer {
     fn scroll_off_top(&mut self) {
         let dropped = self.screen.remove(0);
         self.screen.push(vec![' '; self.cols]);
+        // Inverse grid moves in lockstep. The scroll buffer stores
+        // characters only — inverse attributes don't survive scrollback
+        // (the scroll-buffer renderer would just be a fenced code block;
+        // there's no way to express inverse video in Slack mrkdwn).
+        self.inverse.remove(0);
+        self.inverse.push(vec![false; self.cols]);
         if self.scroll_buffer_max > 0 {
             // Skip rows that are all blanks — they're padding, not content.
             // Also skip the trailing run of blanks on real rows so we don't
@@ -751,6 +848,7 @@ impl TuiRenderer {
                     }
                 }
                 self.screen[self.cursor_row][self.cursor_col] = c;
+                self.inverse[self.cursor_row][self.cursor_col] = self.inverse_active;
                 if self.cursor_col + 1 >= self.cols {
                     // Park at the right edge and defer the wrap until the
                     // *next* printable arrives. CR/LF/positioning clear it.
@@ -770,36 +868,51 @@ impl TuiRenderer {
         // here. That's what makes the per-row-deduplication problem
         // disappear: each row lives in exactly one Slack message.
         //
-        // Trim trailing all-blank rows: TUI apps often resize themselves
-        // larger than they use, and empty rows just inflate the message.
-        let last_nonblank = self
-            .screen
-            .iter()
-            .rposition(|row| row.iter().any(|&c| c != ' '))
+        // Trim trailing all-blank rows. A row is "blank" only if every
+        // cell is a space AND has no inverse-video attribute — modern
+        // TUIs draw their cursor as `\x1b[7m \x1b[27m` (inverse-video
+        // space), which we render as █; trimming on `c != ' '` alone
+        // would erase that cursor mark.
+        let last_nonblank = (0..self.screen.len())
+            .rev()
+            .find(|&i| {
+                self.screen[i]
+                    .iter()
+                    .zip(self.inverse[i].iter())
+                    .any(|(&c, &inv)| c != ' ' || inv)
+            })
             .map(|i| i + 1)
             .unwrap_or(0);
 
-        // The cursor overlay extends the rendered region down to the
-        // cursor's row when it's parked below the last non-blank row —
-        // otherwise driving the prompt around with arrow keys makes the
-        // marker disappear off the bottom of the rendered frame.
-        let render_until = if self.show_cursor && self.cursor_row < self.rows {
+        // Cursor is rendered only when the user wants it AND the
+        // application hasn't hidden it via DECTCEM (`\x1b[?25l`).
+        // Without the DECTCEM check, apps that paint their own UI
+        // (Claude Code) leave a stale cursor at wherever they last
+        // wrote, and we'd render `█` over an unrelated cell. Apps that
+        // hide the OS cursor and draw their own as inverse-video space
+        // still get a visible cursor via the inverse-grid path below.
+        let render_cursor = self.show_cursor && self.cursor_visible;
+
+        // Extend the render region to include the cursor's row when
+        // it's parked below the last non-blank row, so arrow-key
+        // navigation keeps the marker visible.
+        let render_until = if render_cursor && self.cursor_row < self.rows {
             last_nonblank.max(self.cursor_row + 1)
         } else {
             last_nonblank
         };
 
-        // Cursor glyph: prefer █ (U+2588 FULL BLOCK) — the standard
-        // "block cursor" look. When the user has asked us to replace
-        // block chars (because Slack's font fallback widens them), use
-        // `#` so the marker stays one cell wide and doesn't push the
-        // surrounding glyphs out of column.
-        let cursor_glyph = if self.replace_block_chars { '#' } else { '\u{2588}' };
+        // Cursor glyph is always █ — it's a single, distinctive marker
+        // and we deliberately don't honor `replace_block_chars` for it.
+        // The user's complaint was the cursor showing as `#` even when
+        // they wanted block chars sanitized in *content*; the cursor is
+        // a UI annotation we add ourselves, not a payload character.
+        const CURSOR_GLYPH: char = '\u{2588}';
 
         let mut output = String::new();
         output.push_str("🟢 *Live*\n```\n");
         for (row_idx, row) in self.screen[..render_until].iter().enumerate() {
-            let cursor_col = if self.show_cursor
+            let cursor_col = if render_cursor
                 && row_idx == self.cursor_row
                 && self.cursor_col < self.cols
             {
@@ -812,10 +925,24 @@ impl TuiRenderer {
             // trim trailing blanks. Doing the trim in char space avoids
             // UTF-8 boundary footguns when the row contains multi-byte
             // glyphs like █, ▛, etc.
+            //
+            // Inverse-video handling: a *contiguous inverse run* of
+            // pure spaces (no non-space chars in the run) is treated as
+            // an application-drawn cursor (Claude Code: `\x1b[7m \x1b[27m`)
+            // and rendered as █; any inverse run that contains real
+            // content is a highlighted region (status bars, workspace
+            // banners) — those keep their characters because we can't
+            // express the styling in a Slack code block but at least
+            // the text stays readable. Edge case: an inverse run of
+            // spaces *embedded inside* a longer inverse region of text
+            // (e.g. `\x1b[7mAccessing workspace:\x1b[27m`) renders the
+            // embedded spaces as plain spaces, not █, so the text
+            // doesn't become `Accessing█workspace`.
+            let inverse_runs = inverse_runs_for_row(&row[..], &self.inverse[row_idx]);
             let mut cells: Vec<char> = Vec::with_capacity(row.len());
             for (col_idx, &c) in row.iter().enumerate() {
-                if cursor_col == Some(col_idx) {
-                    cells.push(cursor_glyph);
+                if cursor_col == Some(col_idx) || inverse_runs.contains(&col_idx) {
+                    cells.push(CURSOR_GLYPH);
                 } else {
                     cells.push(sanitize_for_slack(c, self.replace_block_chars));
                 }
@@ -839,6 +966,35 @@ impl TuiRenderer {
         output.push_str("```");
         output
     }
+}
+
+/// Walk a row and return the column indices of cells that should
+/// render as a cursor block — i.e. cells inside a contiguous inverse-
+/// video run that contains *only* spaces. An inverse run with any
+/// non-space character is a highlighted region (status bar, workspace
+/// banner, selection) and gets no substitution.
+fn inverse_runs_for_row(row: &[char], inverse: &[bool]) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < inverse.len() {
+        if !inverse[i] {
+            i += 1;
+            continue;
+        }
+        // Find the end of this inverse run.
+        let start = i;
+        while i < inverse.len() && inverse[i] {
+            i += 1;
+        }
+        let end = i;
+        // Pure-spaces run? Mark every column for substitution.
+        if row[start..end].iter().all(|&c| c == ' ') {
+            for col in start..end {
+                out.insert(col);
+            }
+        }
+    }
+    out
 }
 
 /// Replace a single character with its Slack-safe form, if requested.
@@ -1929,16 +2085,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_overlay_uses_hash_with_replace_block_chars() {
-        // When --replace-block-chars is on, the cursor uses '#' so it
-        // stays one cell wide in Slack's font.
+    fn test_cursor_overlay_unaffected_by_replace_block_chars() {
+        // The cursor glyph is always █, even with --replace-block-chars
+        // on. Rationale: replace_block_chars sanitizes *content* the
+        // application emitted; the cursor is a UI annotation we add
+        // ourselves, and the user wants it to look like a cursor.
+        // Content block chars on the same row still get sanitized —
+        // only the cursor glyph itself is exempt.
         let mut renderer = TuiRenderer::new(10, 2);
         renderer.set_replace_block_chars(true);
         renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Habc");
         let out = renderer.take_pending().unwrap();
-        assert!(out.text.contains("abc#"), "got: {:?}", out.text);
-        assert!(!out.text.contains('\u{2588}'));
+        assert!(out.text.contains("abc\u{2588}"), "got: {:?}", out.text);
     }
 
     #[test]
@@ -1953,6 +2112,74 @@ mod tests {
         let out = renderer.take_pending().unwrap();
         // Row 0 should now read "a█cd" — the 'b' is hidden by the cursor.
         assert!(out.text.contains("a\u{2588}cd"), "got: {:?}", out.text);
+    }
+
+    #[test]
+    fn test_inverse_video_space_renders_as_block() {
+        // Claude Code draws its cursor as `\x1b[7m \x1b[27m` —
+        // inverse-video space — once it's hidden the OS cursor with
+        // ?25l. Surface that as █ so the user sees the cursor in the
+        // rendered Slack frame even with DECTCEM hiding the regular
+        // cursor overlay.
+        let mut renderer = TuiRenderer::new(20, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[?25l\x1b[1;1H\xe2\x9d\xaf\x1b[7m \x1b[27m");
+        let out = renderer.take_pending().unwrap();
+        // The "❯" plus inverse-video space → "❯█" in the rendered output.
+        assert!(out.text.contains("\u{276F}\u{2588}"), "got: {:?}", out.text);
+    }
+
+    #[test]
+    fn test_inverse_video_non_space_keeps_char() {
+        // TUIs also use inverse video to highlight whole regions of
+        // text — status bars, workspace banners, selections. We can't
+        // express the styling in a Slack code block, but substituting
+        // every cell with `█` would destroy the content (Claude Code's
+        // workspace banner used to render as a row of solid blocks).
+        // Inverse-video non-space cells therefore keep their actual
+        // character.
+        let mut renderer = TuiRenderer::new(30, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1H\x1b[7mAccessing workspace:\x1b[27m");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("Accessing workspace:"), "got: {:?}", out.text);
+        assert!(!out.text.contains("\u{2588}\u{2588}"), "got: {:?}", out.text);
+    }
+
+    #[test]
+    fn test_inverse_cleared_by_sgr_reset() {
+        // \x1b[m (full reset) clears the inverse flag — subsequent
+        // writes are normal characters, not block markers.
+        let mut renderer = TuiRenderer::new(20, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1H\x1b[7m \x1b[mhello");
+        let out = renderer.take_pending().unwrap();
+        // First cell should be █ (inverse space); rest should be "hello".
+        assert!(out.text.contains("\u{2588}hello"), "got: {:?}", out.text);
+    }
+
+    #[test]
+    fn test_cursor_hidden_by_dectcem() {
+        // App emits `\x1b[?25l` to hide the cursor (Claude Code does
+        // this throughout). Rendering should suppress the overlay even
+        // if show_cursor is on — the PTY cursor at that point is
+        // wherever the app last wrote, not where the user is "typing".
+        let mut renderer = TuiRenderer::new(10, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[?25l\x1b[1;1Habc");
+        let out = renderer.take_pending().unwrap();
+        assert!(!out.text.contains('\u{2588}'), "got: {:?}", out.text);
+        assert!(out.text.contains("abc"));
+    }
+
+    #[test]
+    fn test_cursor_visibility_toggled_back() {
+        // ?25l hides, ?25h re-shows. Cursor reappears.
+        let mut renderer = TuiRenderer::new(10, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[?25l\x1b[1;1Habc\x1b[?25h");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains('\u{2588}'), "got: {:?}", out.text);
     }
 
     #[test]

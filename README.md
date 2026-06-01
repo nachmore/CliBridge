@@ -9,22 +9,31 @@ mirrors everything bidirectionally.
 ## Features
 
 - **Bidirectional shell over Slack** — type commands in a channel, see output
-  streamed and re-rendered as it changes.
+  streamed and re-rendered as it changes. Bridge messages are tagged with a
+  🌉 prefix so they're easy to spot and never echo back into the shell.
 - **TUI emulation** — full virtual screen with ANSI escape support
   (CSI movement, ECH/DCH/ICH/IL/DL, scroll regions, save/restore cursor,
-  pending wrap, OSC, DCS); the live frame edits a single Slack message,
-  rate-limited to 1 update/sec.
+  xterm-style pending wrap, OSC, DCS, bracketed paste, DECTCEM cursor
+  visibility, SGR-7 inverse-video tracking for app-drawn cursors).
+  The live frame edits a single Slack message, rate-limited to ~1/sec.
 - **Local terminal mirror** — auto-spawns a real OS terminal that mirrors the
   bridge. Type locally too; both Slack and the local window show the same
   shell.
-- **Scroll buffer** — content that scrolls off the live frame is posted into
-  the Slack channel as a 📜 *Scroll buffer* message that fills as new rows
-  arrive; once full it locks as 📚 *History* and a fresh scroll buffer
-  opens. The live message never grows past Slack's chat.update size limit.
+- **Two-level scroll buffer** — content that scrolls off the live frame is
+  posted into the channel as a 📜 *Scroll buffer* message that fills as new
+  rows arrive; once full it locks as 📚 *History* and a fresh scroll buffer
+  opens. Each row lives in exactly one Slack message — no duplication, no
+  data loss on long bursts.
+- **Runtime config from Slack** — `--config <key> <value>` from the channel
+  flips knobs (cursor visibility, scroll-buffer size, anchor-refresh cadence,
+  block-char replacement, …) without restarting. `--help config` lists them.
 - **Browser-based login** — embedded WebView captures your `xoxc-` token + `d`
-  cookie. No bot setup needed.
+  cookie. No bot setup, no admin approval. Works with enterprise grids.
+- **Portable credentials** — `--export-login` writes a single file you can
+  copy or pipe to another machine (handy for SSH boxes that can't open a
+  browser); `--import-login` reads it back.
 - **Channel by name OR ID** — pass `--channel general` and we look it up,
-  or `--channel-id C0123456789` to skip the API roundtrip.
+  or `--channel C0123456789` to skip the API roundtrip.
 - **Cross-platform** — Windows (ConPTY), macOS (Unix PTY + Terminal.app
   launcher), Linux (Unix PTY + GNOME Terminal/konsole/alacritty/xterm).
 
@@ -36,9 +45,11 @@ mirrors everything bidirectionally.
 cargo run -- --login
 ```
 
-A WebView2 window opens at `slack.com/signin`. Sign in normally; the window
-captures your token + cookies on the first authenticated API call and saves
-them to `~/.config/cli-bridge/credentials.json` (or the platform equivalent).
+A native WebView window opens at `slack.com/signin` (WebView2 on Windows,
+WKWebView on macOS, WebKitGTK on Linux). Sign in normally; the window
+captures your token + cookies on the first authenticated API call and
+saves them to `~/.config/cli-bridge/credentials.json` (or the platform
+equivalent).
 
 ### 2. Run the bridge
 
@@ -56,6 +67,36 @@ For a release build:
 cargo build --release
 ./target/release/cli-bridge --workspace acme --channel general
 ```
+
+### Running on a remote box (SSH)
+
+`--login` opens a real browser window via WebView, which won't work over
+SSH. Sign in once on a machine with a display, then move the credentials:
+
+```sh
+# On your laptop (where you can run a browser):
+cli-bridge --login
+cli-bridge --export-login - | ssh devbox 'cli-bridge --import-login -'
+
+# Now on devbox:
+ssh devbox
+cli-bridge --workspace acme --channel general --no-local
+```
+
+`--no-local` skips the local-terminal mirror, which doesn't make sense over
+SSH anyway. The Slack channel becomes your only view of the shell.
+
+If you'd rather not pipe over the wire:
+
+```sh
+cli-bridge --export-login slack-creds.json
+scp slack-creds.json devbox:~/
+ssh devbox 'cli-bridge --import-login slack-creds.json && rm slack-creds.json'
+```
+
+The export file holds your `xoxc-` token + `d` cookie — enough to act as
+you in Slack indefinitely. **Treat it like a password**: don't commit it,
+don't email it, delete it after import.
 
 ## CLI Usage
 
@@ -86,21 +127,38 @@ Display:
                                Slack messages (default: 10, 0 to disable).
       --no-local               Skip auto-opening a local terminal mirror.
       --replace-block-chars    Replace U+2580–U+259F (█ ▌ ▐ ▛ etc.) with
-                               spaces in Slack output. Slack's font
-                               fallback renders these wider than one cell
-                               and pushes box-drawing layouts (e.g. the
-                               Claude Code banner) out of column. The
-                               local attach window is unaffected.
+                               single-cell ASCII approximations (#, [,
+                               ], ', ., :, /, \, _) in Slack output.
+                               Slack's font fallback renders these
+                               wider than one cell and pushes box-
+                               drawing layouts (e.g. the Claude Code
+                               banner) out of column. The local attach
+                               window is unaffected. The cursor mark
+                               itself stays as █ regardless.
       --hide-cursor            Don't render the cursor in the live frame.
                                By default the cursor cell is shown as █
                                so you can see where it sits when driving
                                the session via Slack (e.g. arrow-key
-                               navigation in a line editor).
+                               navigation in a line editor). Apps that
+                               hide the OS cursor (Claude Code via
+                               DECTCEM) are honored automatically; their
+                               app-drawn cursors (inverse-video space)
+                               surface as █ via SGR-7 tracking.
 
 Commands:
       --login                  Open a browser to sign in to Slack and save
                                credentials.
       --list-workspaces        List saved workspaces.
+      --export-login <PATH>    Export saved credentials for a workspace
+                               to a single file you can copy to another
+                               machine (e.g. for SSH use). Use `-` for
+                               stdout. Pair with --workspace <name> to
+                               disambiguate when multiple are saved.
+                               File contains a long-lived token + auth
+                               cookie — treat it like a password.
+      --import-login <PATH>    Import credentials previously written by
+                               --export-login. Use `-` for stdin (e.g.
+                               `cat creds.json | cli-bridge --import-login -`).
 
 Slack:
       --url <URL>              Slack API base URL (for enterprise grids
@@ -110,7 +168,10 @@ Slack:
 Debug:
       --pty-log <PATH>         Capture every byte of PTY output to file for
                                offline replay via the pty_replay example.
-      --config <PATH>          Path to a TOML config file.
+      --config <PATH>          Path to a TOML config file. (Note: from
+                               *inside* a Slack channel, `--config` means
+                               something different — runtime setting
+                               read/write — see Special Commands below.)
   -h, --help                   Print help.
 ```
 
@@ -132,15 +193,23 @@ intercepts slash commands client-side).
 | `--clear` | End the current live message and start a new one on next output |
 | `--tab` | Send Tab |
 | `--esc` | Send Escape |
+| `--enter` (aliases `--return`, `--cr`) | Send a bare Enter, no text |
 | `--up` `--down` `--left` `--right` | Arrow keys |
 | `--tmux <key>` | Send tmux prefix (Ctrl+B) + key |
 | `--raw <hex>` | Send raw bytes (hex-encoded) |
 | `--slash <name>` | Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code) |
-| `--name <text>` | Rename the session (updates banners + local terminal title) |
+| `--name <text>` | Rename the session (shortcut for `--config name <text>`) |
+| `--config` | List runtime-mutable settings + current values |
+| `--config <key>` | Show one setting with its description |
+| `--config <key> <value>` | Set one (e.g. `--config show_cursor off`) |
 | `--help` | Show this help |
+| `--help config` | List every configurable setting with descriptions |
 
-Any other text is sent verbatim to the shell, with a CR appended so the line
-is submitted.
+Any other text is sent verbatim to the shell, wrapped in bracketed-paste
+markers (`\x1b[200~ ... \x1b[201~`) with a trailing CR. The bracketed-paste
+wrapping makes Enter work correctly with TUI editors like Claude Code that
+keep paste mode permanently enabled — without it, the line ends up in the
+editor's buffer but never submits.
 
 ## Local terminal mirror
 
@@ -159,11 +228,25 @@ process puts the local terminal into raw mode and forwards bytes both ways.
 ## Configuration
 
 CliBridge looks for config in this order:
-1. `--config <path>` CLI argument
+1. `--config <path>` CLI argument (file selection — note the long form takes a path here)
 2. `./cli-bridge.toml` (current directory)
 3. `~/.config/cli-bridge/config.toml` (or platform equivalent)
 
 See [`cli-bridge.example.toml`](cli-bridge.example.toml) for all options.
+
+A subset of the same keys is **runtime-mutable from Slack** without
+restarting the bridge. Send `--config` in the channel to list them, or
+`--help config` for descriptions:
+
+```
+--config show_cursor off
+--config anchor_refresh 5
+--config scroll_buffer 5000
+--config name "build server"
+```
+
+Currently runtime-mutable: `replace_block_chars`, `show_cursor`,
+`anchor_refresh`, `scroll_buffer`, `name`.
 
 ## Logging
 
@@ -206,11 +289,11 @@ See [`cli-bridge.example.toml`](cli-bridge.example.toml) for all options.
 
 | Crate | Purpose |
 |-------|---------|
-| `bridge-core` | `TerminalBackend` / `MessagingClient` traits, command parsing, URL helpers, shared types |
+| `bridge-core` | `TerminalBackend` / `MessagingClient` traits, command parser (incl. `--config`/`--help` topic dispatch), URL helpers, shared types |
 | `bridge-pty` | `portable-pty` wrapper: ConPTY on Windows, Unix PTY on macOS/Linux |
-| `bridge-auth` | Browser-based Slack login (wry + tao) and credential storage |
-| `bridge-slack` | Slack HTTP client (chat.postMessage, chat.update, conversations.history, users.conversations) + TUI renderer + rate limiter |
-| `cli-bridge` | Binary: wires the crates together, owns the supervising loop and the local-attach server/client |
+| `bridge-auth` | Browser-based Slack login (wry + tao), credential storage, portable export/import (`LoginExport`) |
+| `bridge-slack` | Slack HTTP client (chat.postMessage, chat.update, conversations.history, users.conversations + edge-search fallback for enterprise grids), TUI renderer (full CSI/SGR/DECTCEM/inverse-video tracking), two-level scroll buffer, rate limiter, self-echo defenses (🌉 prefix + ts ring + text ring) |
+| `cli-bridge` | Binary: wires the crates together. Modules: `bridge` (supervising loop), `attach` (local-terminal protocol/server/client), `settings` (runtime `--config` registry), plus startup `config.rs` (TOML loader) |
 
 ### Adding a new messaging client
 
@@ -225,17 +308,30 @@ The `MessagingClient` trait requires `connect`/`disconnect`,
 
 ```
 # Tests
-cargo test
+cargo test --workspace
 
 # Format check
 cargo fmt --check
 
 # Lint (workspace)
-cargo clippy -p bridge-slack -p cli-bridge -p bridge-pty -p bridge-core --tests -- -D warnings
+cargo clippy --workspace --all-targets
 
 # Replay a captured PTY log through the renderer (debug rendering issues)
 cargo run -p bridge-slack --example pty_replay -- pty.bin 120 24
 ```
+
+When debugging rendering bugs, the workflow that keeps paying off is:
+
+1. Run with `--pty-log pty.bin` to capture the raw byte stream.
+2. Reproduce the bug in Slack.
+3. Inspect `pty.bin` to find the exact escape sequence Claude Code (or
+   whatever app) emitted at the moment the bug appeared.
+4. Add a regression test that feeds the offending bytes through `process()`.
+5. Replay the captured log through the renderer offline via
+   `cargo run -p bridge-slack --example pty_replay` to verify the fix.
+
+Several existing tests originated this way; grep for `pty.bin` in commit
+messages for examples.
 
 CI runs build + test on Windows / macOS / Linux on every push and PR.
 

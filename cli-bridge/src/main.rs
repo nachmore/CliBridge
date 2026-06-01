@@ -55,6 +55,24 @@ struct Cli {
     #[arg(long)]
     list_workspaces: bool,
 
+    /// Export a workspace's saved credentials (token + d cookie) to a
+    /// portable file you can copy to another machine — useful for
+    /// running cli-bridge over SSH on a host that can't open a browser
+    /// for `--login`. Pass a path, or `-` for stdout. Pair with
+    /// `--workspace <name>` to choose which workspace to export when
+    /// you have more than one saved.
+    ///
+    /// **Treat the resulting file like a password.** It contains the
+    /// same xoxc token + d cookie that grant full access to your
+    /// Slack workspace.
+    #[arg(long, value_name = "PATH")]
+    export_login: Option<String>,
+
+    /// Import credentials previously written by `--export-login`. Pass
+    /// a path, or `-` for stdin. The workspace name comes from the file.
+    #[arg(long, value_name = "PATH")]
+    import_login: Option<String>,
+
     /// Run as an attach client connected to a running bridge. The bridge
     /// process passes this when it auto-spawns the local terminal window —
     /// users normally don't pass it directly.
@@ -139,6 +157,14 @@ async fn main() -> Result<()> {
         return commands::list_workspaces();
     }
 
+    if let Some(path) = cli.export_login.as_deref() {
+        return commands::export_login(path, cli.workspace.as_deref());
+    }
+
+    if let Some(path) = cli.import_login.as_deref() {
+        return commands::import_login(path);
+    }
+
     // `--channel` (or `channel` in TOML) accepts either a Slack ID
     // (`C0123456789`) or a channel name (`general`). The bridge's
     // `looks_like_channel_id` heuristic discriminates and the API is only
@@ -204,8 +230,10 @@ fn default_shell() -> String {
 }
 
 mod commands {
-    use anyhow::Result;
-    use bridge_auth::{CredentialStore, login as browser_login};
+    use std::io::{Read, Write};
+
+    use anyhow::{Context, Result};
+    use bridge_auth::{CredentialStore, LoginExport, login as browser_login};
     use tracing::info;
 
     pub fn login() -> Result<()> {
@@ -250,6 +278,125 @@ mod commands {
                 println!("  • {ws}");
             }
         }
+        Ok(())
+    }
+
+    /// Export the user's saved credentials for a single workspace as
+    /// a portable JSON file.
+    ///
+    /// `workspace` is optional: if omitted and the user has exactly one
+    /// saved workspace, we pick it; if there are multiple, we error
+    /// out so the user has to be explicit.
+    ///
+    /// `path` is `-` for stdout (handy for piping over SSH) or a real
+    /// filesystem path. On non-Windows targets the file is created with
+    /// 0o600 permissions because the export contains the equivalent of
+    /// a long-lived password to the user's Slack workspace.
+    pub fn export_login(path: &str, workspace: Option<&str>) -> Result<()> {
+        let store = CredentialStore::new()?;
+
+        // Resolve which workspace to export.
+        let target = match workspace {
+            Some(w) => w.to_string(),
+            None => {
+                let names = store.list_workspaces()?;
+                match names.len() {
+                    0 => anyhow::bail!(
+                        "No saved workspaces to export. Run --login first."
+                    ),
+                    1 => names.into_iter().next().unwrap(),
+                    _ => anyhow::bail!(
+                        "Multiple saved workspaces ({}). Pass --workspace <name> \
+                         to choose which to export.",
+                        names.join(", ")
+                    ),
+                }
+            }
+        };
+
+        let export = store.export(&target)?.with_context(|| {
+            format!("No saved credentials for workspace '{target}'")
+        })?;
+        let json = serde_json::to_string_pretty(&export)?;
+
+        if path == "-" {
+            // Pipe to stdout; the caller is responsible for keeping it
+            // off-disk (typical pattern: `ssh remote cli-bridge --import-login -`).
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            handle.write_all(json.as_bytes())?;
+            handle.write_all(b"\n")?;
+            // Don't print the security warning to stdout — it would
+            // pollute the JSON. Send the warning to stderr.
+            eprintln!(
+                "⚠️ Credentials are sensitive: anyone with this file/stream can act \
+                 as you in Slack. Don't store it in cleartext or in version control."
+            );
+        } else {
+            write_export_file(path, json.as_bytes())?;
+            eprintln!(
+                "✓ Wrote credentials for workspace '{}' to {path}.",
+                export.workspace_name
+            );
+            eprintln!(
+                "⚠️ Treat this file like a password. Anyone who reads it can act \
+                 as you in Slack. Delete it after importing on the target machine."
+            );
+        }
+        info!("Exported login for workspace '{}'", export.workspace_name);
+        Ok(())
+    }
+
+    /// Read an export file and store it in the local credential store.
+    /// `path` is `-` for stdin or a filesystem path.
+    pub fn import_login(path: &str) -> Result<()> {
+        let json = if path == "-" {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        } else {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading import file {path}"))?
+        };
+
+        let export: LoginExport = serde_json::from_str(&json)
+            .context("parsing login export — was the file written by --export-login?")?;
+
+        let store = CredentialStore::new()?;
+        let name = store.import(&export)?;
+        eprintln!("✓ Imported credentials for workspace '{name}'.");
+        eprintln!(
+            "Run: cli-bridge --workspace \"{name}\" --channel <channel-id-or-name>"
+        );
+        info!("Imported login for workspace '{name}'");
+        Ok(())
+    }
+
+    /// Write an export to disk with restrictive permissions where the
+    /// platform supports them. The export contains a long-lived
+    /// session token + auth cookie; we don't want it to be
+    /// world-readable on shared hosts.
+    #[cfg(unix)]
+    fn write_export_file(path: &str, contents: &[u8]) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn write_export_file(path: &str, contents: &[u8]) -> Result<()> {
+        // Windows: there's no portable equivalent of 0o600 without
+        // pulling in WinAPI to set DACLs. We rely on the user to put
+        // the file in a sensible location (their own profile dir, not
+        // a shared drive). The eprintln! warning at the call site is
+        // the only mitigation here.
+        std::fs::write(path, contents)?;
         Ok(())
     }
 
