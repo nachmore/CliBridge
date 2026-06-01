@@ -1,108 +1,111 @@
 # CliBridge
 
-Bridge your local CLI to Slack. Interact with your terminal from anywhere — type commands in Slack, see output streamed back in real-time, with full TUI support via message edits.
+Bridge your local CLI to Slack. Drive a real shell from a Slack channel — type
+commands in Slack, watch output stream back, and run TUI apps (vim, htop,
+Claude Code) inside an emulated screen that renders live in a code block.
+Optionally also see the same shell in a fresh local terminal window that
+mirrors everything bidirectionally.
 
 ## Features
 
-- **Bidirectional terminal access** — Send commands from Slack, see output streamed back
-- **TUI support** — Full-screen apps (vim, htop, tmux) render via message edits at 1 update/sec
-- **Local terminal mirror** — Auto-spawns a real local terminal that mirrors the bridge; type locally, watch from Slack
-- **Special commands** — Send Ctrl+C, resize, arrow keys, tmux prefix, slash commands, and more from Slack
-- **Browser-based login** — Embedded WebView captures your Slack token + cookies (no bot setup needed)
-- **Modular architecture** — Platform (Windows/macOS/Linux) and client (Slack/future: Teams) abstractions
-- **Cross-platform** — Windows (ConPTY), macOS (Unix PTY), and Linux (Unix PTY)
+- **Bidirectional shell over Slack** — type commands in a channel, see output
+  streamed and re-rendered as it changes.
+- **TUI emulation** — full virtual screen with ANSI escape support
+  (CSI movement, ECH/DCH/ICH/IL/DL, scroll regions, save/restore cursor,
+  pending wrap, OSC, DCS); the live frame edits a single Slack message,
+  rate-limited to 1 update/sec.
+- **Local terminal mirror** — auto-spawns a real OS terminal that mirrors the
+  bridge. Type locally too; both Slack and the local window show the same
+  shell.
+- **Scrollback** — content that scrolls off the live frame is posted into the
+  Slack channel as separate frozen messages, then forgotten by the renderer
+  so the live message never grows past Slack's chat.update size limit.
+- **Browser-based login** — embedded WebView captures your `xoxc-` token + `d`
+  cookie. No bot setup needed.
+- **Channel by name OR ID** — pass `--channel general` and we look it up,
+  or `--channel-id C0123456789` to skip the API roundtrip.
+- **Cross-platform** — Windows (ConPTY), macOS (Unix PTY + Terminal.app
+  launcher), Linux (Unix PTY + GNOME Terminal/konsole/alacritty/xterm).
 
 ## Quick Start
 
-### 1. Extract your Slack token
+### 1. Sign in to Slack
 
-```bash
-cli-bridge --extract-tokens
+```
+cargo run -- --login
 ```
 
-This reads your `xoxc-` token and `d` cookie from the Slack desktop app's local storage. **Slack must be closed** while running this command.
+A WebView2 window opens at `slack.com/signin`. Sign in normally; the window
+captures your token + cookies on the first authenticated API call and saves
+them to `~/.config/cli-bridge/credentials.json` (or the platform equivalent).
 
 ### 2. Run the bridge
 
-```bash
-cli-bridge --workspace "My Workspace" --channel C0123456789
+```
+cargo run -- --workspace acme --channel general
 ```
 
-### 3. Interact from Slack
+(Substitute your workspace name as saved by `--login` and the channel name
+or ID you want to bridge to.) A new local terminal window opens running your
+shell; everything you type there or in Slack ends up in the same shell.
 
-Type in the configured channel. Your messages are sent as terminal input. Output streams back as code-formatted messages.
+For a release build:
 
-## Installation
-
-### From releases
-
-Download the latest binary from [GitHub Releases](https://github.com/nachmore/CliBridge/releases).
-
-### From source
-
-```bash
-git clone https://github.com/nachmore/CliBridge.git
-cd CliBridge
+```
 cargo build --release
+./target/release/cli-bridge --workspace acme --channel general
 ```
-
-Binary will be at `target/release/cli-bridge` (or `.exe` on Windows).
-
-## Configuration
-
-CliBridge looks for config in this order:
-1. `--config <path>` CLI argument
-2. `./cli-bridge.toml` (current directory)
-3. `~/.config/cli-bridge/config.toml` (user config dir)
-
-See [`cli-bridge.example.toml`](cli-bridge.example.toml) for all options.
-
-### Environment variables
-
-| Variable | Description |
-|----------|-------------|
-| `CLI_BRIDGE_TOKEN` | Slack token (alternative to --extract-tokens) |
-| `CLI_BRIDGE_COOKIE` | Slack `d` cookie value |
-| `RUST_LOG` | Log level (e.g., `info`, `debug`, `trace`) |
 
 ## CLI Usage
 
 ```
 cli-bridge [OPTIONS]
 
-Options:
-  -c, --channel <CHANNEL>      Slack channel ID
-  -s, --shell <SHELL>          Shell to spawn (default: platform shell)
-  -w, --workspace <WORKSPACE>  Workspace name or URL
-      --url <URL>              Slack API base URL (for enterprise grids)
-      --cols <COLS>            Terminal width in columns (default: 120)
-      --rows <ROWS>            Terminal height in rows (default: 24)
-      --no-local               Skip auto-opening a local terminal mirror
-      --pty-log <PATH>         Capture every byte of PTY output to file (debug)
-      --scrollback <N>         Lines of scrollback to keep above the live TUI frame (default: 200, 0 to disable)
-      --anchor-refresh <N>     Re-anchor the live TUI message every N inbound Slack messages (default: 10, 0 to disable)
-      --name <NAME>            Display name for this session (used in banners and the local terminal title)
-      --config <CONFIG>        Path to config file
-      --login                  Open browser to sign in to Slack
-      --list-workspaces        List saved workspaces
-  -h, --help                   Print help
+  -c, --channel <CHANNEL>      Slack channel — accepts either an ID
+                               (e.g. C0123456789, G…, D…) or a name
+                               (e.g. general or #general). IDs are used
+                               verbatim; names are resolved via the Slack
+                               API at startup.
+
+Session:
+  -w, --workspace <WORKSPACE>  Workspace name (saved by --login). If only one
+                               workspace is saved, this is optional.
+  -s, --shell <SHELL>          Shell to spawn (default: cmd.exe on Windows,
+                               $SHELL on macOS/Linux).
+      --name <NAME>            Display name for this session. Shows up in
+                               banners and the local terminal title.
+                               Default: "CliBridge".
+
+Display:
+      --cols <COLS>            Terminal width in columns. Default: 120.
+      --rows <ROWS>            Terminal height in rows. Default: 24.
+      --scrollback <N>         Scrollback lines retained. Default: 200.
+                               0 disables.
+      --anchor-refresh <N>     Re-anchor the live message every N inbound
+                               Slack messages (default: 10, 0 to disable).
+      --no-local               Skip auto-opening a local terminal mirror.
+
+Commands:
+      --login                  Open a browser to sign in to Slack and save
+                               credentials.
+      --list-workspaces        List saved workspaces.
+
+Slack:
+      --url <URL>              Slack API base URL (for enterprise grids
+                               that don't auto-derive from the workspace
+                               URL — usually unneeded).
+
+Debug:
+      --pty-log <PATH>         Capture every byte of PTY output to file for
+                               offline replay via the pty_replay example.
+      --config <PATH>          Path to a TOML config file.
+  -h, --help                   Print help.
 ```
-
-## Local terminal mirror
-
-By default the bridge auto-opens a fresh terminal window that mirrors the shell:
-keystrokes go to the same shell that's bridged to Slack, and shell output is
-visible both locally and in Slack. Ctrl+C in the mirror window kills the
-foreground shell job (as you'd expect); Ctrl+C in the bridge window quits the
-bridge entirely. Pass `--no-local` to disable.
-
-When the shell exits (you type `exit`, the process dies, etc.) the local
-mirror window closes automatically and the bridge waits for `--new` from
-Slack to start a new shell. Ctrl+C on the bridge while idle quits.
 
 ## Special Commands
 
-When typing in Slack, prefix with `--` for special commands. (We avoid `/` because Slack treats those as native slash commands and never delivers them.)
+Type these in the Slack channel. Prefix is `--` (not `/`, because Slack
+intercepts slash commands client-side).
 
 | Command | Action |
 |---------|--------|
@@ -112,101 +115,118 @@ When typing in Slack, prefix with `--` for special commands. (We avoid `/` becau
 | `--ctrl+l` | Clear screen |
 | `--ctrl+\` | Send SIGQUIT |
 | `--kill` | Kill the shell process |
-| `--restart` / `--new` | (Re)spawn the shell. While a shell is alive, asks for confirmation; reply `--new force` to terminate and start fresh. After the shell has exited, plain `--new` works. |
-| `--resize 120x40` | Resize terminal |
-| `--clear` | Re-anchor: end the current edited message and start a new one on the next output |
-| `--tab` | Send Tab key |
-| `--esc` | Send Escape key |
+| `--restart` / `--new` | (Re)spawn the shell. While alive, asks for confirmation; reply `--new force` to proceed. After exit, plain `--new` works. |
+| `--resize 120x40` | Resize terminal (cols x rows) |
+| `--clear` | End the current live message and start a new one on next output |
+| `--tab` | Send Tab |
+| `--esc` | Send Escape |
 | `--up` `--down` `--left` `--right` | Arrow keys |
 | `--tmux <key>` | Send tmux prefix (Ctrl+B) + key |
 | `--raw <hex>` | Send raw bytes (hex-encoded) |
 | `--slash <name>` | Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code) |
-| `--name <text>` | Rename the session (shows up in start / exit / restart banners) |
-| `--help` | Show command help |
+| `--name <text>` | Rename the session (updates banners + local terminal title) |
+| `--help` | Show this help |
 
-Any other text is sent directly as terminal input with a newline appended.
+Any other text is sent verbatim to the shell, with a CR appended so the line
+is submitted.
+
+## Local terminal mirror
+
+Default-on. The bridge opens a fresh terminal window — Windows Terminal if
+installed, falling back to `cmd /c start`; Terminal.app on macOS via
+`osascript`; gnome-terminal/konsole/alacritty/xterm on Linux — running
+`cli-bridge --attach 127.0.0.1:<port> --attach-token <secret>`. That client
+process puts the local terminal into raw mode and forwards bytes both ways.
+
+- Ctrl+C in the **mirror** window → kills the foreground shell job.
+- Ctrl+C in the **bridge** window → quits the bridge entirely.
+- When the shell exits (you type `exit`, the process dies), the mirror
+  window closes and the bridge waits for `--new` from Slack.
+- Pass `--no-local` to skip the mirror (Slack-only).
+
+## Configuration
+
+CliBridge looks for config in this order:
+1. `--config <path>` CLI argument
+2. `./cli-bridge.toml` (current directory)
+3. `~/.config/cli-bridge/config.toml` (or platform equivalent)
+
+See [`cli-bridge.example.toml`](cli-bridge.example.toml) for all options.
+
+## Logging
+
+`RUST_LOG` controls verbosity. `info` is the default. Useful filters:
+
+- `RUST_LOG=cli_bridge=debug,bridge_slack=debug` — bridge + renderer detail,
+  no noise from `hyper`/`reqwest`.
+- `RUST_LOG=bridge_slack=trace` — every CSI dispatch with cursor before/after.
+  Pair with `--pty-log pty.bin` and the `pty_replay` example to debug
+  rendering issues offline.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    cli-bridge                         │
-│                  (binary crate)                       │
-├─────────────────────────────────────────────────────┤
-│                                                      │
-│  ┌──────────┐    ┌──────────────┐    ┌───────────┐  │
-│  │bridge-pty│◄──►│  bridge-core │◄──►│bridge-slack│  │
-│  │(ConPTY/  │    │  (traits &   │    │(HTTP API + │  │
-│  │ Unix PTY)│    │   commands)  │    │ TUI render)│  │
-│  └──────────┘    └──────────────┘    └───────────┘  │
-│                         ▲                            │
-│                         │                            │
-│                  ┌──────┴──────┐                     │
-│                  │ bridge-auth │                     │
-│                  │(LevelDB +   │                     │
-│                  │ credential  │                     │
-│                  │  storage)   │                     │
-│                  └─────────────┘                     │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                       cli-bridge                            │
+│                     (binary crate)                          │
+├────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────────────┐      │
+│  │bridge-pty│◄►│ bridge-core  │◄►│   bridge-slack    │      │
+│  │ ConPTY / │  │  traits +    │  │ HTTP API client + │      │
+│  │  Unix PTY│  │  url/cmd/    │  │  TUI renderer +   │      │
+│  │          │  │  types       │  │  rate limiter     │      │
+│  └──────────┘  └──────┬───────┘  └──────────────────┘      │
+│                       │                                     │
+│                ┌──────▼──────┐                              │
+│                │ bridge-auth │                              │
+│                │ wry/tao     │                              │
+│                │ browser flow│                              │
+│                │ + storage   │                              │
+│                └─────────────┘                              │
+│                                                             │
+│  attach/  protocol + server + client + per-OS launcher      │
+│           (the local terminal mirror lives here)            │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ### Crates
 
 | Crate | Purpose |
 |-------|---------|
-| `bridge-core` | Trait definitions (`TerminalBackend`, `MessagingClient`), command parsing, shared types |
-| `bridge-pty` | PTY implementation using `portable-pty` (ConPTY on Windows, Unix PTY on macOS) |
-| `bridge-auth` | Slack token extraction from LevelDB + encrypted credential storage |
-| `bridge-slack` | Slack API client (chat.postMessage, chat.update) + TUI renderer + rate limiter |
-| `cli-bridge` | Binary that wires everything together |
+| `bridge-core` | `TerminalBackend` / `MessagingClient` traits, command parsing, URL helpers, shared types |
+| `bridge-pty` | `portable-pty` wrapper: ConPTY on Windows, Unix PTY on macOS/Linux |
+| `bridge-auth` | Browser-based Slack login (wry + tao) and credential storage |
+| `bridge-slack` | Slack HTTP client (chat.postMessage, chat.update, conversations.history, users.conversations) + TUI renderer + rate limiter |
+| `cli-bridge` | Binary: wires the crates together, owns the supervising loop and the local-attach server/client |
 
-### Adding a new messaging client (e.g., Teams)
+### Adding a new messaging client
 
 1. Create `crates/bridge-teams/`
 2. Implement the `MessagingClient` trait from `bridge-core`
-3. Wire it into `cli-bridge/src/main.rs` as an alternative to `SlackClient`
+3. Wire it into `cli-bridge/src/main.rs` alongside `SlackClient`
 
-The `MessagingClient` trait requires:
-- `connect()` / `disconnect()`
-- `send_message()` / `edit_message()`
-- `subscribe()` (returns a channel of incoming messages)
-
-### TUI Rendering Strategy
-
-The renderer detects full-screen applications by looking for ANSI escape sequences (alternate screen buffer, cursor positioning, screen clears). When detected:
-
-1. Maintains a virtual screen buffer matching terminal dimensions
-2. Processes ANSI escape sequences to update the buffer
-3. Renders the buffer as a Slack code block
-4. Edits the previous message (instead of posting new ones)
-5. Throttled to 1 update/second (Slack's rate limit)
-
-For regular streaming output, new messages are posted with content wrapped in code blocks.
+The `MessagingClient` trait requires `connect`/`disconnect`,
+`send_message`/`edit_message`, and `subscribe`.
 
 ## Development
 
-```bash
-# Build (fast debug)
-cargo build
-
-# Run tests
+```
+# Tests
 cargo test
 
-# Run with logging
-RUST_LOG=debug cargo run -- --channel C123 --workspace "My WS"
-
-# Check formatting
+# Format check
 cargo fmt --check
 
-# Lint
-cargo clippy -- -D warnings
+# Lint (workspace)
+cargo clippy -p bridge-slack -p cli-bridge -p bridge-pty -p bridge-core --tests -- -D warnings
+
+# Replay a captured PTY log through the renderer (debug rendering issues)
+cargo run -p bridge-slack --example pty_replay -- pty.bin 120 24
 ```
 
-## CI/CD
-
-- **CI** (`ci.yml`): Runs on every push to main and PRs. Builds + tests on Windows, macOS ARM, and Linux. Uploads debug artifacts. Auto-dispatches nightly release on green.
-- **Release** (`release.yml`): Stable releases via `v*.*.*` tags. Nightly releases auto-rotated (keeps latest + previous).
+CI runs build + test on Windows / macOS / Linux on every push and PR.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE).

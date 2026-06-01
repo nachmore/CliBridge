@@ -103,6 +103,25 @@ struct SlackMessage {
     subtype: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ConversationsListResponse {
+    ok: bool,
+    error: Option<String>,
+    channels: Option<Vec<ChannelMeta>>,
+    response_metadata: Option<ResponseMetadata>,
+}
+
+#[derive(Deserialize)]
+struct ChannelMeta {
+    id: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponseMetadata {
+    next_cursor: Option<String>,
+}
+
 impl SlackClient {
     pub fn new() -> Self {
         Self {
@@ -150,6 +169,76 @@ impl SlackClient {
         );
 
         Ok(headers)
+    }
+
+    /// Resolve a channel name (e.g. "general") to its ID via the Slack API.
+    /// Iterates `users.conversations` so it covers public, private, and
+    /// group DMs the authenticated user is a member of. Match is exact and
+    /// case-sensitive (Slack channel names are lowercased server-side, so
+    /// the caller should lowercase too if it accepted user input).
+    pub async fn resolve_channel_name(&self, name: &str) -> Result<String, BridgeError> {
+        let needle = name.trim_start_matches('#').to_lowercase();
+        let creds = self.credentials.as_ref().ok_or_else(|| {
+            BridgeError::Messaging("resolve_channel_name: not connected".to_string())
+        })?;
+        let headers = self.headers()?;
+
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut form: Vec<(&str, String)> = vec![
+                ("token", creds.token.clone()),
+                ("limit", "200".to_string()),
+                (
+                    "types",
+                    "public_channel,private_channel,mpim,im".to_string(),
+                ),
+            ];
+            if let Some(ref c) = cursor {
+                form.push(("cursor", c.clone()));
+            }
+
+            let resp_text = self
+                .http
+                .post(format!("{}/users.conversations", self.api_base))
+                .headers(headers.clone())
+                .form(&form)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Messaging(format!("HTTP error: {e}")))?
+                .text()
+                .await
+                .map_err(|e| BridgeError::Messaging(format!("Response read error: {e}")))?;
+
+            let parsed: ConversationsListResponse = serde_json::from_str(&resp_text)
+                .map_err(|e| BridgeError::Messaging(format!("JSON parse error: {e}")))?;
+
+            if !parsed.ok {
+                return Err(BridgeError::Messaging(format!(
+                    "users.conversations failed: {}",
+                    parsed.error.unwrap_or_default()
+                )));
+            }
+
+            for ch in parsed.channels.unwrap_or_default() {
+                if let (Some(id), Some(n)) = (ch.id, ch.name)
+                    && n.to_lowercase() == needle
+                {
+                    return Ok(id);
+                }
+            }
+
+            cursor = parsed
+                .response_metadata
+                .and_then(|m| m.next_cursor)
+                .filter(|c| !c.is_empty());
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Err(BridgeError::Messaging(format!(
+            "channel '{name}' not found (or not visible to this user)"
+        )))
     }
 }
 

@@ -11,7 +11,11 @@ use crate::config::AppConfig;
 #[derive(Parser)]
 #[command(name = "cli-bridge", about = "Bridge your CLI to messaging platforms")]
 struct Cli {
-    /// Channel ID to use for communication
+    /// Slack channel — either an ID (e.g. `C0123456789`, `G017KTQLT5M`,
+    /// `D01ABCDEFGH`) or a name (e.g. `general` or `#general`). IDs are
+    /// used verbatim; names are resolved via the Slack API at startup.
+    /// The heuristic: starts with C/G/D and is otherwise uppercase
+    /// alphanumeric → treated as an ID; anything else → treated as a name.
     #[arg(short, long)]
     channel: Option<String>,
 
@@ -119,10 +123,15 @@ async fn main() -> Result<()> {
         return commands::list_workspaces();
     }
 
-    let channel = cli
-        .channel
-        .or(config.channel.clone())
-        .expect("Channel is required. Use --channel or set it in config.");
+    // `--channel` (or `channel` in TOML) accepts either a Slack ID
+    // (`C0123456789`) or a channel name (`general`). The bridge's
+    // `looks_like_channel_id` heuristic discriminates and the API is only
+    // hit when a name is given.
+    let channel_or_name = cli.channel.or(config.channel.clone()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Channel is required. Use --channel <id-or-name> or set `channel` in config."
+        )
+    })?;
 
     let shell = cli
         .shell
@@ -150,7 +159,7 @@ async fn main() -> Result<()> {
         .unwrap_or(bridge_slack::DEFAULT_SCROLLBACK_LINES);
 
     bridge::run(
-        &channel,
+        &channel_or_name,
         &shell,
         workspace.as_deref(),
         cli.url.as_deref(),

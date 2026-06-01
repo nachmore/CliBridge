@@ -3,8 +3,10 @@
 #   ./cli-bridge.toml (project-local)
 #   ~/.config/cli-bridge/config.toml (user-global)
 
-# Slack channel ID to bridge to (required)
-# Find this in Slack: right-click channel > View channel details > scroll to bottom
+# Slack channel to bridge to (required). Either a channel ID like
+# "C0123456789" (resolved without an API call) or a channel name like
+# "general" / "#general" (resolved by listing the channels you're in).
+# channel = "general"
 # channel = "C0123456789"
 
 # Shell command to spawn (default: cmd.exe on Windows, $SHELL on Mac/Linux)
