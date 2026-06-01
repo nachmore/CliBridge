@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub anchor_refresh: Option<u32>,
     /// Friendly display name for the session, used in lifecycle banners.
     pub name: Option<String>,
+    /// Lines of scrollback to retain above the live TUI frame. 0 disables.
+    pub scrollback: Option<usize>,
 }
 
 impl AppConfig {

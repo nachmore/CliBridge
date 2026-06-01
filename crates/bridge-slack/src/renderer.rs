@@ -1,3 +1,8 @@
+/// Default scrollback line cap. Slack chat.update tops out around 40 KB; at
+/// 120 cols × 200 lines that's ~24 KB even with all cells filled, leaving
+/// room for the live frame on top. Tunable via `--scrollback`.
+pub const DEFAULT_SCROLLBACK_LINES: usize = 200;
+
 /// Renders terminal output for display in Slack messages.
 ///
 /// Strategy:
@@ -8,6 +13,9 @@
 ///   tick via `take_pending()` and posts as a new message.
 /// - TUI mode: maintains a virtual screen and renders the full frame on tick;
 ///   the bridge edits the existing message.
+/// - Rows that scroll off the top of the virtual screen are captured into a
+///   bounded scrollback ring and rendered above the live frame, so users can
+///   see content that the app pushed past the top.
 pub struct TuiRenderer {
     /// Current screen buffer (rows x cols)
     screen: Vec<Vec<char>>,
@@ -51,12 +59,29 @@ pub struct TuiRenderer {
     /// We stash any incomplete trailing bytes here and prepend them to the next
     /// chunk so the parser only ever sees complete units.
     input_carry: Vec<u8>,
+    /// Rows that scrolled off the top of the live screen since the last anchor
+    /// reset. Capped at `scrollback_max` lines; oldest evicted first. Rendered
+    /// above the live frame in the same Slack message so users can scroll back
+    /// to text the app pushed past the top.
+    ///
+    /// Captures legitimate scrolls (LF past bottom, auto-wrap past bottom,
+    /// CSI S "scroll up"). Skips deletions (CSI M, CSI 2J) — those are
+    /// intentional content removal, not scrolled-off history.
+    scrollback: std::collections::VecDeque<Vec<char>>,
+    /// Maximum scrollback lines to retain. 0 disables scrollback entirely
+    /// (rows that scroll off are dropped — original behavior).
+    scrollback_max: usize,
     /// Whether the TUI screen has changed since the last `take_pending`.
     dirty: bool,
 }
 
 impl TuiRenderer {
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::with_scrollback(cols, rows, DEFAULT_SCROLLBACK_LINES)
+    }
+
+    /// Build a renderer with an explicit scrollback cap. `0` disables.
+    pub fn with_scrollback(cols: u16, rows: u16, scrollback_max: usize) -> Self {
         let cols = cols as usize;
         let rows = rows as usize;
         Self {
@@ -71,8 +96,17 @@ impl TuiRenderer {
             line_buffer: String::new(),
             pending_handoff: None,
             input_carry: Vec::new(),
+            scrollback: std::collections::VecDeque::with_capacity(scrollback_max.min(1024)),
+            scrollback_max,
             dirty: false,
         }
+    }
+
+    /// Drop all scrollback. Called by the bridge when it re-anchors a Slack
+    /// message (start of session, `--clear`, anchor-refresh threshold) so the
+    /// next message starts with a clean slate.
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
     }
 
     /// Append raw terminal output bytes to the renderer's buffer. Cheap and
@@ -428,11 +462,10 @@ impl TuiRenderer {
             }
             'S' => {
                 // SU — Scroll Up by N lines (drop the top N, append blanks).
+                // Each dropped row goes into scrollback.
                 let n = nums.first().copied().unwrap_or(1).max(1);
-                let cols = self.cols;
                 for _ in 0..n.min(self.rows) {
-                    self.screen.remove(0);
-                    self.screen.push(vec![' '; cols]);
+                    self.scroll_off_top();
                 }
             }
             'T' => {
@@ -520,15 +553,34 @@ impl TuiRenderer {
         }
     }
 
+    /// Drop the top row off the screen, capturing it into scrollback, and
+    /// append a fresh blank row at the bottom. Called by the three real-scroll
+    /// paths (LF past bottom, auto-wrap past bottom, CSI S "scroll up").
+    fn scroll_off_top(&mut self) {
+        let dropped = self.screen.remove(0);
+        self.screen.push(vec![' '; self.cols]);
+        if self.scrollback_max > 0 {
+            // Skip rows that are all blanks — they're padding, not content.
+            // Also skip the trailing run of blanks on real rows so we don't
+            // pad scrollback with right-edge whitespace.
+            let last_nonblank = dropped.iter().rposition(|&c| c != ' ');
+            if let Some(end) = last_nonblank {
+                let trimmed: Vec<char> = dropped[..=end].to_vec();
+                if self.scrollback.len() >= self.scrollback_max {
+                    self.scrollback.pop_front();
+                }
+                self.scrollback.push_back(trimmed);
+            }
+        }
+    }
+
     fn put_char(&mut self, ch: char) {
         match ch {
             '\n' => {
                 self.pending_wrap = false;
                 self.cursor_row += 1;
                 if self.cursor_row >= self.rows {
-                    // Scroll up
-                    self.screen.remove(0);
-                    self.screen.push(vec![' '; self.cols]);
+                    self.scroll_off_top();
                     self.cursor_row = self.rows - 1;
                 }
             }
@@ -558,8 +610,7 @@ impl TuiRenderer {
                     self.cursor_col = 0;
                     self.cursor_row += 1;
                     if self.cursor_row >= self.rows {
-                        self.screen.remove(0);
-                        self.screen.push(vec![' '; self.cols]);
+                        self.scroll_off_top();
                         self.cursor_row = self.rows - 1;
                     }
                 }
@@ -589,6 +640,15 @@ impl TuiRenderer {
             .unwrap_or(0);
 
         let mut output = String::from("```\n");
+        // Scrollback first — rows that have scrolled off the top of the
+        // live screen since the last anchor reset. Already trimmed of
+        // trailing whitespace when captured.
+        for row in &self.scrollback {
+            for &c in row {
+                output.push(c);
+            }
+            output.push('\n');
+        }
         for row in &self.screen[..last_nonblank] {
             let line: String = row.iter().collect();
             output.push_str(line.trim_end());
@@ -1250,6 +1310,87 @@ mod tests {
         renderer.process(b"Z");
         // Cursor stayed at row 2 col 5 (we wrote no save), so Z lands there.
         assert_eq!(renderer.screen[1][4], 'Z');
+    }
+
+    #[test]
+    fn test_scrollback_captures_lf_scroll() {
+        // Wider than content + room for the trailing write so we don't
+        // accidentally trigger an extra auto-wrap scroll.
+        let mut renderer = TuiRenderer::with_scrollback(20, 2, 50);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Hfirst");
+        renderer.process(b"\x1b[2;1Hsecond");
+        // Position to end of "second" then LF past bottom — row 0 ("first")
+        // scrolls off into scrollback.
+        renderer.process(b"\x1b[2;7H\n");
+        renderer.process(b"third");
+        assert_eq!(renderer.scrollback.len(), 1);
+        let s: String = renderer.scrollback[0].iter().collect();
+        assert_eq!(s, "first");
+    }
+
+    #[test]
+    fn test_scrollback_renders_above_live_frame() {
+        let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Hold");
+        renderer.process(b"\x1b[2;1Hkeep");
+        renderer.process(b"\n"); // 'old' scrolls off
+        renderer.process(b"new");
+        let rendered = renderer.take_pending().unwrap();
+        // Both old (scrollback) and new content present, in chronological order.
+        let old_pos = rendered.text.find("old").expect("scrollback missing");
+        let keep_pos = rendered.text.find("keep").expect("live row missing");
+        let new_pos = rendered.text.find("new").expect("live row missing");
+        assert!(old_pos < keep_pos);
+        assert!(keep_pos < new_pos);
+    }
+
+    #[test]
+    fn test_scrollback_capped_at_max() {
+        let mut renderer = TuiRenderer::with_scrollback(10, 2, 3);
+        renderer.tui_mode = true;
+        // Push 10 rows through (CRLF line-discipline-style so col resets).
+        for i in 0..10 {
+            renderer.process(format!("row{i}\r\n").as_bytes());
+        }
+        assert_eq!(renderer.scrollback.len(), 3);
+        // Last entry should be one of the most recent rows.
+        let last: String = renderer.scrollback.back().unwrap().iter().collect();
+        assert!(last.starts_with("row"), "got: {last:?}");
+    }
+
+    #[test]
+    fn test_scrollback_disabled_when_max_zero() {
+        let mut renderer = TuiRenderer::with_scrollback(10, 2, 0);
+        renderer.tui_mode = true;
+        for i in 0..5 {
+            renderer.process(format!("row{i}\r\n").as_bytes());
+        }
+        assert!(renderer.scrollback.is_empty());
+    }
+
+    #[test]
+    fn test_scrollback_clear() {
+        let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
+        renderer.tui_mode = true;
+        for i in 0..3 {
+            renderer.process(format!("r{i}\r\n").as_bytes());
+        }
+        assert!(!renderer.scrollback.is_empty());
+        renderer.clear_scrollback();
+        assert!(renderer.scrollback.is_empty());
+    }
+
+    #[test]
+    fn test_scrollback_skips_blank_rows() {
+        // Scrolling off a row that's all blanks shouldn't pollute scrollback
+        // — those are padding, not user content.
+        let mut renderer = TuiRenderer::with_scrollback(10, 2, 50);
+        renderer.tui_mode = true;
+        // Start with two blank rows. \n past bottom scrolls a blank off.
+        renderer.process(b"\n\n");
+        assert!(renderer.scrollback.is_empty());
     }
 
     #[test]

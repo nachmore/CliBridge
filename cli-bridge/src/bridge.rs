@@ -61,6 +61,7 @@ pub async fn run(
     anchor_refresh: u32,
     name: String,
     pty_log_path: Option<String>,
+    scrollback_lines: usize,
 ) -> Result<()> {
     let store = CredentialStore::new()?;
     let credentials = if let Some(ws) = workspace {
@@ -134,6 +135,7 @@ pub async fn run(
             anchor_refresh,
             name.clone(),
             pty_log_writer.clone(),
+            scrollback_lines,
         )
         .await?;
         match outcome {
@@ -231,6 +233,7 @@ async fn run_session(
     anchor_refresh: u32,
     name: std::sync::Arc<std::sync::Mutex<String>>,
     pty_log: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
+    scrollback_lines: usize,
 ) -> Result<SessionEnd> {
     // Start a fresh attach server per session. Old attach clients (from a
     // previous session) have already disconnected because their server was
@@ -281,7 +284,7 @@ async fn run_session(
     // grace period for trailing output and then break out of the session.
     let mut shell_exited_at: Option<tokio::time::Instant> = None;
 
-    let mut renderer = TuiRenderer::new(size.cols, size.rows);
+    let mut renderer = TuiRenderer::with_scrollback(size.cols, size.rows, scrollback_lines);
     let mut current_message_id: Option<String> = None;
     let mut tick = tokio::time::interval(RENDER_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -476,6 +479,10 @@ async fn run_session(
                     if messages_since_anchor >= anchor_refresh {
                         current_message_id = None;
                         messages_since_anchor = 0;
+                        // The new message starts with a clean scrollback so
+                        // we don't repeat history that was already in the
+                        // previous (now-frozen) message.
+                        renderer.clear_scrollback();
                     }
                 } else {
                     // current_message_id is None — either we haven't posted a
@@ -626,6 +633,7 @@ async fn handle_slack_message(
             }
             SpecialCommand::Clear => {
                 *current_message_id = None;
+                renderer.clear_scrollback();
                 let _ = slack
                     .send_message(
                         channel,

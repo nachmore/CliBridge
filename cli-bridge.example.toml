@@ -30,3 +30,8 @@
 # banners and the local terminal window title. Default: "CliBridge".
 # Can be changed at runtime with `--name <text>` from Slack.
 # name = "build server"
+
+# Lines of scrollback to keep above the live TUI frame in the rendered
+# Slack message. Lets you scroll back to content the app pushed past the
+# top of the screen. 0 disables. Default: 200.
+# scrollback = 200

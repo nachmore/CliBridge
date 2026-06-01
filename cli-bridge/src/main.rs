@@ -80,6 +80,12 @@ struct Cli {
     /// through the renderer in a unit test. The file is overwritten each run.
     #[arg(long)]
     pty_log: Option<String>,
+
+    /// How many lines of scrollback to retain above the live TUI frame in
+    /// the rendered Slack message. Lets you read content that scrolled off
+    /// the top before the next anchor. 0 disables. Default: 200.
+    #[arg(long)]
+    scrollback: Option<usize>,
 }
 
 #[tokio::main]
@@ -138,6 +144,10 @@ async fn main() -> Result<()> {
         .name
         .or(config.name.clone())
         .unwrap_or_else(|| "CliBridge".to_string());
+    let scrollback = cli
+        .scrollback
+        .or(config.scrollback)
+        .unwrap_or(bridge_slack::DEFAULT_SCROLLBACK_LINES);
 
     bridge::run(
         &channel,
@@ -149,6 +159,7 @@ async fn main() -> Result<()> {
         anchor_refresh,
         name,
         cli.pty_log,
+        scrollback,
     )
     .await
 }
