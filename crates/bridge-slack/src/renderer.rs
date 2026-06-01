@@ -207,10 +207,19 @@ impl TuiRenderer {
                         chars.next();
                         skip_string_body(&mut chars);
                     }
-                    Some(_) => {
-                        // Single-char escapes (e.g. \x1b=, \x1b>, \x1bM). Drop
-                        // the next char so it doesn't render as a literal.
+                    Some(&c) => {
+                        // Single-char escapes — we drop the introducer so it
+                        // doesn't render as a literal. A few are well-known
+                        // (=/> for application-keypad mode, M reverse-index,
+                        // 7/8 save/restore cursor); anything else gets a
+                        // debug log so we can see if a TUI is using something
+                        // we should be emulating.
+                        let consumed = c;
                         chars.next();
+                        match consumed {
+                            '=' | '>' | 'M' | 'D' | 'E' | 'H' | '7' | '8' | 'c' => {}
+                            _ => tracing::debug!("TUI parser dropped ESC {consumed:?}"),
+                        }
                     }
                     None => {}
                 }
@@ -305,10 +314,127 @@ impl TuiRenderer {
                     _ => {}
                 }
             }
-            'm' => {
-                // SGR (colors/attributes) — we ignore these for text rendering
+            'X' => {
+                // ECH — Erase Character: blank N cells starting at the cursor,
+                // without moving the cursor. Modern TUIs (Claude Code, Ink-
+                // based tools) use this heavily during partial redraws — they
+                // clear out a region by ECH, then write fresh content. Without
+                // handling it, leftover text from earlier frames stays in our
+                // buffer and bleeds through into the next render.
+                let n = nums.first().copied().unwrap_or(1).max(1);
+                let end = (self.cursor_col + n).min(self.cols);
+                self.screen[self.cursor_row][self.cursor_col..end].fill(' ');
             }
-            _ => {}
+            'P' => {
+                // DCH — Delete Character: drop N chars at the cursor and
+                // shift the rest of the line left, padding the tail with spaces.
+                let n = nums.first().copied().unwrap_or(1).max(1);
+                let row = &mut self.screen[self.cursor_row];
+                let row_len = row.len();
+                let c = self.cursor_col.min(row_len);
+                let n = n.min(row_len - c);
+                if n > 0 {
+                    row.copy_within(c + n..row_len, c);
+                    row[row_len - n..].fill(' ');
+                }
+            }
+            '@' => {
+                // ICH — Insert Character: shift the line right by N at the
+                // cursor, padding the gap with spaces.
+                let n = nums.first().copied().unwrap_or(1).max(1);
+                let row = &mut self.screen[self.cursor_row];
+                let row_len = row.len();
+                if self.cursor_col < row_len {
+                    let n = n.min(row_len - self.cursor_col);
+                    row.copy_within(self.cursor_col..row_len - n, self.cursor_col + n);
+                    row[self.cursor_col..self.cursor_col + n].fill(' ');
+                }
+            }
+            'L' => {
+                // IL — Insert Line: insert N blank lines at the cursor row,
+                // pushing existing lines down. Lines that fall off the bottom
+                // are discarded.
+                let n = nums.first().copied().unwrap_or(1).max(1);
+                let cols = self.cols;
+                let start = self.cursor_row;
+                for _ in 0..n.min(self.rows - start) {
+                    self.screen.insert(start, vec![' '; cols]);
+                    self.screen.pop();
+                }
+            }
+            'M' => {
+                // DL — Delete Line: drop N lines at the cursor row, shifting
+                // the rest up. Pad the bottom with blank lines.
+                let n = nums.first().copied().unwrap_or(1).max(1);
+                let cols = self.cols;
+                let start = self.cursor_row;
+                for _ in 0..n.min(self.rows - start) {
+                    self.screen.remove(start);
+                    self.screen.push(vec![' '; cols]);
+                }
+            }
+            'G' => {
+                // CHA — Cursor Horizontal Absolute: move cursor to col N
+                // (1-indexed), keeping the current row.
+                let col = nums.first().copied().unwrap_or(1).saturating_sub(1);
+                self.cursor_col = col.min(self.cols - 1);
+            }
+            'd' => {
+                // VPA — Vertical Position Absolute: move cursor to row N
+                // (1-indexed), keeping the current column.
+                let row = nums.first().copied().unwrap_or(1).saturating_sub(1);
+                self.cursor_row = row.min(self.rows - 1);
+            }
+            'S' => {
+                // SU — Scroll Up by N lines (drop the top N, append blanks).
+                let n = nums.first().copied().unwrap_or(1).max(1);
+                let cols = self.cols;
+                for _ in 0..n.min(self.rows) {
+                    self.screen.remove(0);
+                    self.screen.push(vec![' '; cols]);
+                }
+            }
+            'T' => {
+                // SD — Scroll Down by N lines (insert blanks at top, drop bottom).
+                let n = nums.first().copied().unwrap_or(1).max(1);
+                let cols = self.cols;
+                for _ in 0..n.min(self.rows) {
+                    self.screen.insert(0, vec![' '; cols]);
+                    self.screen.pop();
+                }
+            }
+            'm' => {
+                // SGR (colors/attributes) — we intentionally ignore these
+                // for text rendering. Slack code blocks don't render inline
+                // styling; tracking SGR state would just bloat the buffer.
+            }
+            'h' | 'l' => {
+                // DECSET / DECRST mode set/reset (e.g. ?25h show cursor,
+                // ?25l hide, ?2004h bracketed paste). We don't emulate any
+                // mode the parser cares about, so silently consume.
+            }
+            'r' => {
+                // DECSTBM — set scrolling region. We always treat the whole
+                // screen as the scroll region, which is right for the apps
+                // we care about (vim/htop/Claude Code) where scroll regions
+                // don't materially change layout in the rendered frame.
+            }
+            's' | 'u' => {
+                // SCP / RCP — save/restore cursor. Modern apps tend to use
+                // \x1b 7 / \x1b 8 instead, but some still emit these. We
+                // don't track saved cursor; ignore.
+            }
+            'n' => {
+                // DSR — Device Status Report query (e.g. ?6n cursor position).
+                // We don't have a back-channel to the PTY for replies and
+                // most apps degrade gracefully without one.
+            }
+            _ => {
+                // Anything else: log at debug so users with RUST_LOG=trace
+                // (or debug) can see what we're dropping. If an unhandled
+                // CSI is causing visible artifacts, this is the breadcrumb.
+                tracing::debug!("TUI parser dropped CSI: \\x1b[{params}{cmd}");
+            }
         }
     }
 
@@ -876,5 +1002,119 @@ mod tests {
         renderer.process(b"\x1b[1;1H12345X");
         // 'X' should wrap to next line
         assert_eq!(renderer.screen[1][0], 'X');
+    }
+
+    fn row_str(r: &[char]) -> String {
+        r.iter().collect::<String>().trim_end().to_string()
+    }
+
+    #[test]
+    fn test_csi_ech_erases_in_place() {
+        // ECH (\x1b[<n>X) clears N cells without moving the cursor — used by
+        // partial-redraw TUIs (Claude Code etc.) to scrub a region before
+        // writing fresh content. Without this we'd carry "old" text forward.
+        let mut renderer = TuiRenderer::new(20, 1);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Hold text here");
+        // Move to col 5 ("text"), erase 4 cells.
+        renderer.process(b"\x1b[1;5H\x1b[4X");
+        let line = row_str(&renderer.screen[0]);
+        assert_eq!(line, "old      here");
+    }
+
+    #[test]
+    fn test_csi_dch_deletes_chars() {
+        // Wider than the content so put_char's auto-wrap doesn't trip the
+        // single row into scrolling.
+        let mut renderer = TuiRenderer::new(20, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Habcdefghij");
+        renderer.process(b"\x1b[1;3H\x1b[2P"); // at col 3, delete 2
+        assert_eq!(row_str(&renderer.screen[0]), "abefghij");
+    }
+
+    #[test]
+    fn test_csi_ich_inserts_chars() {
+        // Width 10 row of content lives on a 12-wide / 2-row screen.
+        let mut renderer = TuiRenderer::new(12, 2);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Habcdefghij");
+        renderer.process(b"\x1b[1;3H\x1b[2@"); // at col 3, insert 2 spaces
+        // "ab" + "  " + "cdefghij" (no fall-off since width is 12, but the
+        // tail beyond the original 10 cols stays blank)
+        let line: String = renderer.screen[0].iter().collect();
+        // Trim trailing blanks for the assertion.
+        assert_eq!(line.trim_end(), "ab  cdefghij");
+    }
+
+    #[test]
+    fn test_csi_il_inserts_lines() {
+        // Wider than content so 5-char writes don't auto-wrap.
+        let mut renderer = TuiRenderer::new(10, 4);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Haaaaa");
+        renderer.process(b"\x1b[2;1Hbbbbb");
+        renderer.process(b"\x1b[3;1Hccccc");
+        // At row 2, insert 1 blank line.
+        renderer.process(b"\x1b[2;1H\x1b[1L");
+        assert_eq!(row_str(&renderer.screen[0]), "aaaaa");
+        assert_eq!(row_str(&renderer.screen[1]), ""); // blank
+        assert_eq!(row_str(&renderer.screen[2]), "bbbbb");
+        assert_eq!(row_str(&renderer.screen[3]), "ccccc");
+    }
+
+    #[test]
+    fn test_csi_dl_deletes_lines() {
+        let mut renderer = TuiRenderer::new(10, 4);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1Haaaaa");
+        renderer.process(b"\x1b[2;1Hbbbbb");
+        renderer.process(b"\x1b[3;1Hccccc");
+        renderer.process(b"\x1b[4;1Hddddd");
+        // At row 2, delete 1 line.
+        renderer.process(b"\x1b[2;1H\x1b[1M");
+        assert_eq!(row_str(&renderer.screen[0]), "aaaaa");
+        assert_eq!(row_str(&renderer.screen[1]), "ccccc");
+        assert_eq!(row_str(&renderer.screen[2]), "ddddd");
+        assert_eq!(row_str(&renderer.screen[3]), ""); // blank
+    }
+
+    #[test]
+    fn test_csi_cha_horizontal_absolute() {
+        let mut renderer = TuiRenderer::new(20, 1);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1HABC");
+        renderer.process(b"\x1b[10GZ"); // jump to col 10, write Z
+        assert_eq!(renderer.screen[0][9], 'Z');
+        // Earlier text untouched.
+        assert_eq!(renderer.screen[0][0], 'A');
+    }
+
+    #[test]
+    fn test_csi_vpa_vertical_absolute() {
+        let mut renderer = TuiRenderer::new(5, 4);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1HA");
+        renderer.process(b"\x1b[3dB"); // jump to row 3 (preserving col... col is now 1 after the 'A')
+        // Cursor advanced past A so col=1; row jumps to 2 (0-indexed)
+        assert_eq!(renderer.screen[2][1], 'B');
+    }
+
+    #[test]
+    fn test_csi_su_sd_scroll() {
+        // Wider than the row content so put_char doesn't auto-wrap and
+        // muddy the scroll math.
+        let mut renderer = TuiRenderer::new(5, 3);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[1;1H111\x1b[2;1H222\x1b[3;1H333");
+        renderer.process(b"\x1b[1S"); // scroll up 1
+        assert_eq!(row_str(&renderer.screen[0]), "222");
+        assert_eq!(row_str(&renderer.screen[1]), "333");
+        assert_eq!(row_str(&renderer.screen[2]), "");
+
+        renderer.process(b"\x1b[1T"); // scroll down 1
+        assert_eq!(row_str(&renderer.screen[0]), "");
+        assert_eq!(row_str(&renderer.screen[1]), "222");
+        assert_eq!(row_str(&renderer.screen[2]), "333");
     }
 }
