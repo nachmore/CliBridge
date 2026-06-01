@@ -190,7 +190,18 @@ pub async fn run(addr: &str, token: &str) -> Result<()> {
     }
     stop.store(true, Ordering::Relaxed);
     drop(frame_tx);
-    let _ = writer_handle.await;
+    // Don't await the writer — the stdin reader thread still holds a clone
+    // of frame_tx (it's parked in a blocking read() until the next keystroke,
+    // so we can't make it drop the clone synchronously). With that clone
+    // alive, frame_rx.recv() in the writer will never return None and the
+    // await would hang forever, keeping the process alive after Ctrl+C on
+    // the bridge until the user typed in the local window.
+    //
+    // Aborting is fine: the writer task only flushes pending Input/Resize
+    // frames, and at this point either the bridge is gone (so the socket
+    // would error anyway) or we asked it to disconnect us (Goodbye).
+    writer_handle.abort();
+    // The detached stdin thread will be torn down when the process exits.
 
     Ok(())
 }
