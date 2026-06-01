@@ -17,6 +17,13 @@ pub struct TuiRenderer {
     /// Cursor position
     cursor_row: usize,
     cursor_col: usize,
+    /// Saved cursor position from the last DECSC (`\x1b 7`) or SCP (`\x1b[s`).
+    /// Restored by DECRC / RCP. Apps drive spinner animations off this:
+    /// "save here, write text, [later] restore and overwrite" each frame.
+    /// Without tracking it, every restore was a no-op and each frame wrote
+    /// wherever the cursor happened to be — frames stacked vertically
+    /// instead of overwriting in place.
+    saved_cursor: Option<(usize, usize)>,
     /// Whether we've detected TUI-mode output
     tui_mode: bool,
     /// Accumulated streaming output, drained by `take_pending`.
@@ -46,6 +53,7 @@ impl TuiRenderer {
             rows,
             cursor_row: 0,
             cursor_col: 0,
+            saved_cursor: None,
             tui_mode: false,
             line_buffer: String::new(),
             pending_handoff: None,
@@ -217,7 +225,19 @@ impl TuiRenderer {
                         let consumed = c;
                         chars.next();
                         match consumed {
-                            '=' | '>' | 'M' | 'D' | 'E' | 'H' | '7' | '8' | 'c' => {}
+                            '7' => {
+                                // DECSC — equivalent to CSI s. Spinner
+                                // animations rely on this round-tripping.
+                                self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+                            }
+                            '8' => {
+                                // DECRC — equivalent to CSI u.
+                                if let Some((row, col)) = self.saved_cursor {
+                                    self.cursor_row = row.min(self.rows.saturating_sub(1));
+                                    self.cursor_col = col.min(self.cols.saturating_sub(1));
+                                }
+                            }
+                            '=' | '>' | 'M' | 'D' | 'E' | 'H' | 'c' => {}
                             _ => tracing::debug!("TUI parser dropped ESC {consumed:?}"),
                         }
                     }
@@ -419,10 +439,17 @@ impl TuiRenderer {
                 // we care about (vim/htop/Claude Code) where scroll regions
                 // don't materially change layout in the rendered frame.
             }
-            's' | 'u' => {
-                // SCP / RCP — save/restore cursor. Modern apps tend to use
-                // \x1b 7 / \x1b 8 instead, but some still emit these. We
-                // don't track saved cursor; ignore.
+            's' => {
+                // SCP — Save Cursor Position. See `saved_cursor` field doc
+                // for why we track this (spinner animations break otherwise).
+                self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+            }
+            'u' => {
+                // RCP — Restore Cursor Position.
+                if let Some((row, col)) = self.saved_cursor {
+                    self.cursor_row = row.min(self.rows.saturating_sub(1));
+                    self.cursor_col = col.min(self.cols.saturating_sub(1));
+                }
             }
             'n' => {
                 // DSR — Device Status Report query (e.g. ?6n cursor position).
@@ -1111,6 +1138,49 @@ mod tests {
         renderer.process(b"\x1b[3dB"); // jump to row 3 (preserving col... col is now 1 after the 'A')
         // Cursor advanced past A so col=1; row jumps to 2 (0-indexed)
         assert_eq!(renderer.screen[2][1], 'B');
+    }
+
+    #[test]
+    fn test_save_restore_cursor_csi() {
+        // SCP/RCP must round-trip — apps animate spinners by saving cursor,
+        // writing a frame, restoring, overwriting on the next frame. Without
+        // this, frames stack vertically (the original "Flambéing… /
+        // Cogitated…" double-line bug).
+        let mut renderer = TuiRenderer::new(20, 3);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[2;5H"); // row 2, col 5
+        renderer.process(b"\x1b[s"); // save
+        renderer.process(b"\x1b[1;1Helsewhere"); // move + write
+        renderer.process(b"\x1b[u"); // restore
+        renderer.process(b"X");
+        // X should land at row 1 (0-idx), col 4.
+        assert_eq!(renderer.screen[1][4], 'X');
+    }
+
+    #[test]
+    fn test_save_restore_cursor_decsc_decrc() {
+        // \x1b 7 / \x1b 8 — same effect as SCP/RCP, more common in modern apps.
+        let mut renderer = TuiRenderer::new(20, 3);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[3;10H"); // row 3, col 10
+        renderer.process(b"\x1b7"); // DECSC
+        renderer.process(b"\x1b[1;1Hsomewhere else");
+        renderer.process(b"\x1b8"); // DECRC
+        renderer.process(b"Y");
+        assert_eq!(renderer.screen[2][9], 'Y');
+    }
+
+    #[test]
+    fn test_save_restore_no_op_when_unsaved() {
+        // RCP before SCP: should leave cursor where it was rather than panic
+        // or jump somewhere weird.
+        let mut renderer = TuiRenderer::new(20, 3);
+        renderer.tui_mode = true;
+        renderer.process(b"\x1b[2;5H"); // row 2 col 5
+        renderer.process(b"\x1b[u"); // restore with no save
+        renderer.process(b"Z");
+        // Cursor stayed at row 2 col 5 (we wrote no save), so Z lands there.
+        assert_eq!(renderer.screen[1][4], 'Z');
     }
 
     #[test]
