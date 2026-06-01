@@ -60,6 +60,7 @@ pub async fn run(
     local: bool,
     anchor_refresh: u32,
     name: String,
+    pty_log_path: Option<String>,
 ) -> Result<()> {
     let store = CredentialStore::new()?;
     let credentials = if let Some(ws) = workspace {
@@ -109,6 +110,19 @@ pub async fn run(
     // `--new` from Slack always works even between sessions.
     let mut message_rx = slack.subscribe(channel).await?;
 
+    // If --pty-log was given, open it once for the whole bridge run. Each
+    // session appends. Truncates on open so each cli-bridge invocation
+    // starts fresh — easier to scope a reproduction.
+    let pty_log_writer = match pty_log_path.as_deref() {
+        Some(path) => {
+            let f = std::fs::File::create(path)
+                .with_context(|| format!("opening --pty-log file {path}"))?;
+            info!("PTY output is being captured to {path}");
+            Some(std::sync::Arc::new(std::sync::Mutex::new(f)))
+        }
+        None => None,
+    };
+
     loop {
         let outcome = run_session(
             &slack,
@@ -119,6 +133,7 @@ pub async fn run(
             local,
             anchor_refresh,
             name.clone(),
+            pty_log_writer.clone(),
         )
         .await?;
         match outcome {
@@ -215,6 +230,7 @@ async fn run_session(
     local: bool,
     anchor_refresh: u32,
     name: std::sync::Arc<std::sync::Mutex<String>>,
+    pty_log: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
 ) -> Result<SessionEnd> {
     // Start a fresh attach server per session. Old attach clients (from a
     // previous session) have already disconnected because their server was
@@ -328,6 +344,15 @@ async fn run_session(
             data = output_rx.recv() => {
                 match data {
                     Some(bytes) => {
+                        // Capture raw PTY bytes if --pty-log is on. Best-
+                        // effort: log a warning if the write fails, but
+                        // never let it block real output processing.
+                        if let Some(log) = pty_log.as_ref()
+                            && let Ok(mut f) = log.lock()
+                        {
+                            use std::io::Write;
+                            let _ = f.write_all(&bytes);
+                        }
                         renderer.process(&bytes);
                         if let Some(tx) = attach_output.as_ref() {
                             let _ = tx.send(Arc::new(bytes));

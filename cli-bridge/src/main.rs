@@ -74,6 +74,12 @@ struct Cli {
     /// banners. Can be changed at runtime with `--name <text>` from Slack.
     #[arg(long)]
     name: Option<String>,
+
+    /// Capture every byte of PTY output to this file, verbatim. Useful for
+    /// debugging rendering issues — capture a reproduction, then replay it
+    /// through the renderer in a unit test. The file is overwritten each run.
+    #[arg(long)]
+    pty_log: Option<String>,
 }
 
 #[tokio::main]
@@ -142,6 +148,7 @@ async fn main() -> Result<()> {
         !cli.no_local,
         anchor_refresh,
         name,
+        cli.pty_log,
     )
     .await
 }

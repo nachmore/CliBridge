@@ -78,6 +78,7 @@ Options:
       --cols <COLS>            Terminal width in columns (default: 120)
       --rows <ROWS>            Terminal height in rows (default: 24)
       --no-local               Skip auto-opening a local terminal mirror
+      --pty-log <PATH>         Capture every byte of PTY output to file (debug)
       --anchor-refresh <N>     Re-anchor the live TUI message every N inbound Slack messages (default: 10, 0 to disable)
       --name <NAME>            Display name for this session (used in banners and the local terminal title)
       --config <CONFIG>        Path to config file

@@ -4,3 +4,5 @@
 .env
 credentials.json
 curl
+# PTY captures from --pty-log (debug only)
+pty*.bin
