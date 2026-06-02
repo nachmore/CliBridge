@@ -126,6 +126,21 @@ pub trait TranscriptFormat: Send + Sync + 'static {
     fn fresh_overhead(&self) -> usize {
         self.measure(&self.scroll_body(""))
     }
+
+    /// Split a fully-formatted message body into one or more bodies, each
+    /// within [`size_limit`](Self::size_limit) and individually well-formed
+    /// (e.g. with code fences closed). A body that already fits returns
+    /// `vec![body]`.
+    ///
+    /// This is what prevents over-long live frames / streaming chunks from
+    /// being posted as a single message that the platform truncates or
+    /// splits across bubbles — the bug where a fenced block lost its closing
+    /// fence mid-stream. The default returns the body unchanged, so platforms
+    /// without a hard ceiling need not implement it; any platform with a
+    /// `size_limit` should.
+    fn paginate(&self, body: &str) -> Vec<String> {
+        vec![body.to_string()]
+    }
 }
 
 /// Handle the session loop keeps. Sends are non-blocking: if the dispatcher is
@@ -327,7 +342,19 @@ impl Dispatcher {
                 let Some(Work::Stream(text)) = self.queue.pop_front() else {
                     unreachable!()
                 };
-                if let Err(e) = self.sink.post(&self.channel, &text).await {
+                // Size-bound the body. An over-long chunk becomes multiple
+                // pages, each well-formed (fences closed). Post the first page
+                // now and requeue the rest at the front so they post next, in
+                // order, one rate-limited call apiece.
+                let mut pages = self.fmt.paginate(&text);
+                if pages.is_empty() {
+                    return;
+                }
+                let first = pages.remove(0);
+                for page in pages.into_iter().rev() {
+                    self.queue.push_front(Work::Stream(page));
+                }
+                if let Err(e) = self.sink.post(&self.channel, &first).await {
                     error!("failed to post message: {e}");
                 }
             }
@@ -356,8 +383,18 @@ impl Dispatcher {
         if text.is_empty() {
             return;
         }
+        // The live frame is a single message we edit in place, so it must fit
+        // in one body. If the current screen is too dense to fit (a full
+        // terminal of long lines can exceed the limit once headers/fences are
+        // added), show the *tail* — the bottom of the screen, matching a
+        // terminal viewport and where the action usually is. We dedupe on the
+        // original `text` upstream, so set last_live_body to that, not the
+        // possibly-trimmed page.
+        let pages = self.fmt.paginate(text);
+        let body = pages.last().map(String::as_str).unwrap_or(text);
+
         if let Some(id) = self.current_message_id.clone() {
-            match self.sink.edit(&self.channel, &id, text).await {
+            match self.sink.edit(&self.channel, &id, body).await {
                 Ok(()) => {
                     self.last_live_body = Some(text.to_string());
                     return;
@@ -368,7 +405,7 @@ impl Dispatcher {
                 }
             }
         }
-        match self.sink.post(&self.channel, text).await {
+        match self.sink.post(&self.channel, body).await {
             Ok(ts) => {
                 self.current_message_id = Some(ts);
                 self.last_live_body = Some(text.to_string());
@@ -646,6 +683,25 @@ mod tests {
             let trimmed = existing.strip_suffix(']').unwrap_or(existing);
             format!("{trimmed}{new_rows_text}]")
         }
+        fn paginate(&self, body: &str) -> Vec<String> {
+            // Simple char-count pagination on `\n` boundaries; mirrors what a
+            // real format does, just without fences/headers.
+            if body.chars().count() <= self.limit {
+                return vec![body.to_string()];
+            }
+            let mut pages = Vec::new();
+            let mut cur = String::new();
+            for line in body.split_inclusive('\n') {
+                if cur.chars().count() + line.chars().count() > self.limit && !cur.is_empty() {
+                    pages.push(std::mem::take(&mut cur));
+                }
+                cur.push_str(line);
+            }
+            if !cur.is_empty() {
+                pages.push(cur);
+            }
+            pages
+        }
     }
 
     fn fmt(limit: usize) -> Box<dyn TranscriptFormat> {
@@ -809,5 +865,59 @@ mod tests {
         })
         .await;
         assert!(ops.is_empty(), "empty snapshot should post nothing: {ops:?}");
+    }
+
+    #[tokio::test]
+    async fn overlong_live_frame_posts_last_page_only() {
+        // A live frame larger than the limit must post a single message (it's
+        // edited in place) showing the *tail* — never an over-limit body.
+        let sink = std::sync::Arc::new(MockSink::default());
+        let limit = 20;
+        let big: String = (0..10).map(|i| format!("line{i}\n")).collect();
+        let ops = run_to_completion(sink, fmt(limit), |h| {
+            h.try_send_frame(
+                vec![],
+                Some(LiveFrame {
+                    text: big.clone(),
+                    is_edit: true,
+                }),
+            );
+        })
+        .await;
+        assert_eq!(ops.len(), 1, "live frame is one message: {ops:?}");
+        // The posted body fits the limit and is the tail (contains the last
+        // line, not the first).
+        let posted = &ops[0];
+        let body = posted.strip_prefix("POST#0: ").unwrap();
+        assert!(body.chars().count() <= limit, "over limit: {body:?}");
+        assert!(body.contains("line9"), "should show the tail: {body:?}");
+        assert!(!body.contains("line0"), "tail page shouldn't include the head: {body:?}");
+    }
+
+    #[tokio::test]
+    async fn overlong_streaming_chunk_posts_all_pages() {
+        // A streaming chunk that overflows splits into multiple ordered posts,
+        // none over the limit, with all content preserved.
+        let sink = std::sync::Arc::new(MockSink::default());
+        let limit = 20;
+        let big: String = (0..10).map(|i| format!("row{i}\n")).collect();
+        let ops = run_to_completion(sink, fmt(limit), |h| {
+            h.try_send_frame(
+                vec![],
+                Some(LiveFrame {
+                    text: big.clone(),
+                    is_edit: false,
+                }),
+            );
+        })
+        .await;
+        assert!(ops.len() > 1, "expected multiple pages: {ops:?}");
+        let mut rejoined = String::new();
+        for op in &ops {
+            let body = op.split_once(": ").unwrap().1;
+            assert!(body.chars().count() <= limit, "page over limit: {body:?}");
+            rejoined.push_str(body);
+        }
+        assert_eq!(rejoined, big, "no streaming content may be lost");
     }
 }
