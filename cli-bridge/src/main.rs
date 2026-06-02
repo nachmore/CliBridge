@@ -205,13 +205,15 @@ async fn main() -> Result<()> {
     // route to "off" wins.
     let show_cursor = !cli.hide_cursor && config.show_cursor.unwrap_or(true);
 
+    let local = resolve_local(cli.no_local);
+
     bridge::run(
         &channel_or_name,
         &shell,
         workspace.as_deref(),
         cli.url.as_deref(),
         size,
-        !cli.no_local,
+        local,
         anchor_refresh,
         name,
         cli.pty_log,
@@ -228,6 +230,50 @@ fn default_shell() -> String {
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
     }
+}
+
+/// Decide whether to auto-open the local mirror terminal.
+///
+/// `--no-local` always wins. Otherwise we default it *on* — except where it
+/// can't possibly work, so a remote/headless invocation degrades to Slack-only
+/// instead of spawning a terminal that immediately dies:
+///   - The headless build (no `browser-login` feature) exists for servers and
+///     SSH boxes; auto-spawning a window is never wanted there.
+///   - On X11/Wayland (non-macOS unix), a GUI terminal needs a display. With
+///     neither DISPLAY nor WAYLAND_DISPLAY set (typical over SSH), the spawned
+///     xterm/gnome-terminal would just fail with "Can't open display".
+fn resolve_local(no_local: bool) -> bool {
+    if no_local {
+        return false;
+    }
+    if cfg!(not(feature = "browser-login")) {
+        eprintln!(
+            "Local mirror terminal disabled (headless build). Bridging to Slack only; \
+             use the desktop build for a local window."
+        );
+        return false;
+    }
+    if cfg!(all(unix, not(target_os = "macos"))) && !has_display() {
+        eprintln!(
+            "No display detected (DISPLAY / WAYLAND_DISPLAY unset). Bridging to Slack only; \
+             pass --no-local to silence this."
+        );
+        return false;
+    }
+    true
+}
+
+/// Whether a graphical display is available to open a terminal window into.
+/// Only meaningful on X11/Wayland; callers gate on the platform first.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn has_display() -> bool {
+    let nonempty = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    nonempty("DISPLAY") || nonempty("WAYLAND_DISPLAY")
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn has_display() -> bool {
+    true
 }
 
 mod commands {

@@ -92,11 +92,16 @@ cli-bridge --export-login - | ssh devbox 'cli-bridge --import-login -'
 
 # Now on devbox:
 ssh devbox
-cli-bridge --workspace acme --channel general --no-local
+cli-bridge --workspace acme --channel general
 ```
 
-`--no-local` skips the local-terminal mirror, which doesn't make sense over
-SSH anyway. The Slack channel becomes your only view of the shell.
+The local-terminal mirror (a spawned terminal window) is auto-disabled when
+it can't work: the headless build never opens one, and any build skips it
+when no display is detected (`DISPLAY` / `WAYLAND_DISPLAY` unset, as over
+SSH). So you don't need `--no-local` there — the Slack channel just becomes
+your only view of the shell. Pass `--no-local` explicitly if you want to
+silence the notice or disable the mirror on a machine that *does* have a
+display.
 
 If you'd rather not pipe over the wire:
 
