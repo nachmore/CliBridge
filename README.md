@@ -182,19 +182,14 @@ intercepts slash commands client-side).
 
 | Command | Action |
 |---------|--------|
-| `--ctrl+c` | Send interrupt (SIGINT) |
-| `--ctrl+d` | Send EOF |
-| `--ctrl+z` | Suspend (SIGTSTP) |
-| `--ctrl+l` | Clear screen |
-| `--ctrl+\` | Send SIGQUIT |
+| `--ctrl+<key>` | Send a key with Ctrl, e.g. `--ctrl+c` (SIGINT), `--ctrl+d` (EOF), `--ctrl+z` (suspend), `--ctrl+l` (clear), `--ctrl+\` (SIGQUIT). Shortcuts: `--cc` `--cd` `--cz` `--cl` |
+| `--alt+<key>` / `--shift+<key>` | Send a key with Alt or Shift; combine modifiers, e.g. `--ctrl+alt+del`, `--alt+shift+left` |
+| `--<key>` | Send a named key: `--up` `--down` `--left` `--right`, `--home` `--end`, `--pageup` `--pagedown`, `--insert` `--delete`, `--tab`, `--esc`, `--space`, `--backspace`, `--f1`…`--f12` |
 | `--kill` | Kill the shell process |
 | `--restart` / `--new` | (Re)spawn the shell. While alive, asks for confirmation; reply `--new force` to proceed. After exit, plain `--new` works. |
 | `--resize 120x40` | Resize terminal (cols x rows) |
 | `--clear` | End the current live message and start a new one on next output |
-| `--tab` | Send Tab |
-| `--esc` | Send Escape |
 | `--enter` (aliases `--return`, `--cr`) | Send a bare Enter, no text |
-| `--up` `--down` `--left` `--right` | Arrow keys |
 | `--tmux <key>` | Send tmux prefix (Ctrl+B) + key |
 | `--raw <hex>` | Send raw bytes (hex-encoded) |
 | `--slash <name>` | Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code) |

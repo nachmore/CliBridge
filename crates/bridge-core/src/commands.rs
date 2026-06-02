@@ -5,16 +5,10 @@ use crate::types::TerminalSize;
 /// Special commands that can be sent from the messaging platform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpecialCommand {
-    /// Send Ctrl+C (SIGINT)
-    CtrlC,
-    /// Send Ctrl+D (EOF)
-    CtrlD,
-    /// Send Ctrl+Z (SIGTSTP)
-    CtrlZ,
-    /// Send Ctrl+L (clear screen)
-    CtrlL,
-    /// Send Ctrl+\ (SIGQUIT)
-    CtrlBackslash,
+    /// Send a key press, optionally with modifiers. Covers all of
+    /// `--ctrl+<key>`, `--alt+<key>`, `--shift+<key>` (and combinations) plus
+    /// bare named keys like `--up`, `--pageup`, `--f5`, `--tab`, `--esc`.
+    Key { key: Key, mods: Modifiers },
     /// Kill the shell process
     Kill,
     /// Restart the shell process. The bool `force` distinguishes a plain
@@ -36,12 +30,6 @@ pub enum SpecialCommand {
     Slash(String),
     /// Send tmux prefix (Ctrl+B by default) followed by a key
     Tmux(String),
-    /// Send an arrow key
-    Arrow(ArrowDirection),
-    /// Send Tab
-    Tab,
-    /// Send Escape
-    Escape,
     /// Send a bare carriage return ("press Enter"). Useful when an app is
     /// waiting on a confirmation prompt and you don't want to type any text.
     Enter,
@@ -61,14 +49,6 @@ pub enum SpecialCommand {
         key: Option<String>,
         value: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ArrowDirection {
-    Up,
-    Down,
-    Left,
-    Right,
 }
 
 /// A single keyboard key, independent of modifiers. This is the unit that
@@ -95,17 +75,6 @@ pub enum Key {
     Backspace,
     /// Function key F1–F12.
     F(u8),
-}
-
-impl From<&ArrowDirection> for Key {
-    fn from(dir: &ArrowDirection) -> Self {
-        match dir {
-            ArrowDirection::Up => Key::Up,
-            ArrowDirection::Down => Key::Down,
-            ArrowDirection::Left => Key::Left,
-            ArrowDirection::Right => Key::Right,
-        }
-    }
 }
 
 /// Keyboard modifiers that can accompany a [`Key`]. `none()` means an
@@ -308,11 +277,13 @@ pub fn parse_input(input: &str) -> ParsedInput {
     let arg = parts.get(1).map(|s| s.trim());
 
     match cmd.as_str() {
-        "ctrl+c" | "ctrlc" | "cc" => ParsedInput::Command(SpecialCommand::CtrlC),
-        "ctrl+d" | "ctrld" | "cd" => ParsedInput::Command(SpecialCommand::CtrlD),
-        "ctrl+z" | "ctrlz" | "cz" => ParsedInput::Command(SpecialCommand::CtrlZ),
-        "ctrl+l" | "ctrll" | "cl" => ParsedInput::Command(SpecialCommand::CtrlL),
-        "ctrl+\\" | "ctrlbs" => ParsedInput::Command(SpecialCommand::CtrlBackslash),
+        // Legacy short aliases for the most common control keys. The general
+        // --ctrl+<key> form below also handles these, but cc/cd/cz/cl are
+        // muscle-memory shortcuts worth keeping.
+        "cc" => ParsedInput::Command(key_cmd(Key::Char('c'), ctrl_mods())),
+        "cd" => ParsedInput::Command(key_cmd(Key::Char('d'), ctrl_mods())),
+        "cz" => ParsedInput::Command(key_cmd(Key::Char('z'), ctrl_mods())),
+        "cl" => ParsedInput::Command(key_cmd(Key::Char('l'), ctrl_mods())),
         "kill" => ParsedInput::Command(SpecialCommand::Kill),
         "restart" | "new" => {
             let force = matches!(arg, Some(a) if a.eq_ignore_ascii_case("force"));
@@ -339,13 +310,7 @@ pub fn parse_input(input: &str) -> ParsedInput {
                 }
             }
         }
-        "tab" => ParsedInput::Command(SpecialCommand::Tab),
-        "esc" | "escape" => ParsedInput::Command(SpecialCommand::Escape),
         "enter" | "return" | "cr" => ParsedInput::Command(SpecialCommand::Enter),
-        "up" => ParsedInput::Command(SpecialCommand::Arrow(ArrowDirection::Up)),
-        "down" => ParsedInput::Command(SpecialCommand::Arrow(ArrowDirection::Down)),
-        "left" => ParsedInput::Command(SpecialCommand::Arrow(ArrowDirection::Left)),
-        "right" => ParsedInput::Command(SpecialCommand::Arrow(ArrowDirection::Right)),
         "resize" => {
             if let Some(arg) = arg
                 && let Some(size) = parse_size(arg)
@@ -390,8 +355,105 @@ pub fn parse_input(input: &str) -> ParsedInput {
                 ParsedInput::Text(input.to_string())
             }
         }
-        _ => ParsedInput::Text(input.to_string()),
+        // General key syntax: bare named keys (--up, --pageup, --f5, --tab,
+        // --esc) and modifier combos (--ctrl+c, --alt+shift+left, --ctrl+k).
+        // Tried last so explicit commands above always win.
+        other => match parse_key_combo(other) {
+            Some((key, mods)) => ParsedInput::Command(key_cmd(key, mods)),
+            None => ParsedInput::Text(input.to_string()),
+        },
     }
+}
+
+fn key_cmd(key: Key, mods: Modifiers) -> SpecialCommand {
+    SpecialCommand::Key { key, mods }
+}
+
+fn ctrl_mods() -> Modifiers {
+    Modifiers {
+        ctrl: true,
+        ..Modifiers::none()
+    }
+}
+
+/// Parse a key spec like `ctrl+c`, `alt+shift+left`, `pageup`, or `f5` into a
+/// [`Key`] and its [`Modifiers`]. The spec is `+`-separated: every segment but
+/// the last is a modifier, and the last is the key itself. Returns `None` if
+/// any segment is unrecognized, so the caller can fall back to plain text.
+///
+/// Input is already lowercased by the caller.
+fn parse_key_combo(spec: &str) -> Option<(Key, Modifiers)> {
+    // The key is the segment after the last `+` separator — but `+` is also a
+    // valid key, so a spec ending in `+` (e.g. `ctrl++`) means the key is
+    // literally `+` and everything before the final `+` is the modifier list.
+    let (mod_part, key_str) = if let Some(stripped) = spec.strip_suffix('+')
+        && !stripped.is_empty()
+    {
+        (stripped.trim_end_matches('+'), "+")
+    } else {
+        match spec.rsplit_once('+') {
+            Some((mods, key)) => (mods, key),
+            None => ("", spec),
+        }
+    };
+
+    if key_str.is_empty() {
+        return None;
+    }
+
+    let mut mods = Modifiers::none();
+    if !mod_part.is_empty() {
+        for seg in mod_part.split('+') {
+            match seg {
+                "ctrl" | "control" | "c" => mods.ctrl = true,
+                "alt" | "meta" | "opt" | "option" | "a" | "m" => mods.alt = true,
+                "shift" | "s" => mods.shift = true,
+                _ => return None,
+            }
+        }
+    }
+
+    let key = parse_key_name(key_str)?;
+    Some((key, mods))
+}
+
+/// Map a key name to a [`Key`]. Single characters become `Key::Char`; longer
+/// tokens are matched against the named-key table. Input is lowercased.
+fn parse_key_name(name: &str) -> Option<Key> {
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if chars.next().is_none() {
+        // Single character: a literal key press.
+        return Some(Key::Char(first));
+    }
+
+    // Function keys: f1..=f12.
+    if let Some(num) = name.strip_prefix('f')
+        && let Ok(n) = num.parse::<u8>()
+        && (1..=12).contains(&n)
+    {
+        return Some(Key::F(n));
+    }
+
+    let key = match name {
+        "up" => Key::Up,
+        "down" => Key::Down,
+        "left" => Key::Left,
+        "right" => Key::Right,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" | "pgup" => Key::PageUp,
+        "pagedown" | "pgdn" | "pgdown" => Key::PageDown,
+        "insert" | "ins" => Key::Insert,
+        "delete" | "del" => Key::Delete,
+        "tab" => Key::Tab,
+        "esc" | "escape" => Key::Escape,
+        "enter" | "return" | "cr" => Key::Enter,
+        "space" | "spc" => Key::Space,
+        "backspace" | "bksp" | "bs" => Key::Backspace,
+        _ => return None,
+    };
+    Some(key)
 }
 
 fn parse_size(s: &str) -> Option<TerminalSize> {
@@ -407,17 +469,9 @@ fn parse_size(s: &str) -> Option<TerminalSize> {
 
 /// Convert a special command to the bytes that should be sent to the terminal.
 pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
-    let ctrl = |c: char| encode_key(&Key::Char(c), Modifiers { ctrl: true, ..Modifiers::none() });
     match cmd {
-        SpecialCommand::CtrlC => ctrl('c'),
-        SpecialCommand::CtrlD => ctrl('d'),
-        SpecialCommand::CtrlZ => ctrl('z'),
-        SpecialCommand::CtrlL => ctrl('l'),
-        SpecialCommand::CtrlBackslash => ctrl('\\'),
-        SpecialCommand::Tab => encode_key(&Key::Tab, Modifiers::none()),
-        SpecialCommand::Escape => encode_key(&Key::Escape, Modifiers::none()),
+        SpecialCommand::Key { key, mods } => encode_key(key, *mods),
         SpecialCommand::Enter => Some(vec![b'\r']),
-        SpecialCommand::Arrow(dir) => encode_key(&Key::from(dir), Modifiers::none()),
         SpecialCommand::Raw(hex) => hex::decode(hex).ok(),
         SpecialCommand::Slash(name) => {
             // Build "/<name>\r". CR submits the line in ConPTY (cmd / PowerShell
@@ -450,19 +504,14 @@ pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
 /// Generate help text listing all available commands.
 pub fn help_text() -> String {
     r#"*CliBridge Commands:*
-• `--ctrl+c` — Send interrupt (SIGINT)
-• `--ctrl+d` — Send EOF
-• `--ctrl+z` — Suspend (SIGTSTP)
-• `--ctrl+l` — Clear screen
-• `--ctrl+\` — Send SIGQUIT
+• `--ctrl+<key>` — Send a key with Ctrl (e.g. `--ctrl+c` interrupt, `--ctrl+d` EOF, `--ctrl+z` suspend, `--ctrl+l` clear, `--ctrl+\` SIGQUIT). Shortcuts: `--cc` `--cd` `--cz` `--cl`.
+• `--alt+<key>` / `--shift+<key>` — Send a key with Alt or Shift. Combine them: `--ctrl+alt+del`, `--alt+shift+left`.
+• `--<key>` — Send a named key on its own: `--up` `--down` `--left` `--right`, `--home` `--end`, `--pageup` `--pagedown`, `--insert` `--delete`, `--tab`, `--esc`, `--space`, `--backspace`, `--f1`…`--f12`.
 • `--kill` — Kill the shell process
 • `--restart` / `--new` — (Re)spawn the shell. While a shell is alive, asks for confirmation; reply `--new force` to terminate the current one and start fresh. After the shell has exited, plain `--new` works.
 • `--resize 120x40` — Resize terminal (cols x rows)
 • `--clear` — Re-anchor: end the current edited message, start a fresh one on next output
-• `--tab` — Send Tab key
-• `--esc` — Send Escape key
 • `--enter` — Send a bare Enter (CR), no text. Aliases: `--return`, `--cr`
-• `--up` `--down` `--left` `--right` — Arrow keys
 • `--tmux <key>` — Send tmux prefix + key
 • `--raw <hex>` — Send raw bytes (hex-encoded)
 • `--slash <name>` — Send a literal `/name` to the shell (e.g. `--slash init` for Claude Code)
@@ -496,13 +545,90 @@ mod tests {
 
     #[test]
     fn test_parse_ctrl_c() {
+        let ctrl_c = SpecialCommand::Key {
+            key: Key::Char('c'),
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::none()
+            },
+        };
+        assert_eq!(parse_input("--ctrl+c"), ParsedInput::Command(ctrl_c.clone()));
+        // Legacy short alias still works.
+        assert_eq!(parse_input("--cc"), ParsedInput::Command(ctrl_c.clone()));
+        // Case-insensitive on the modifier and key.
+        assert_eq!(parse_input("--CTRL+C"), ParsedInput::Command(ctrl_c));
+    }
+
+    #[test]
+    fn test_parse_modifier_combos() {
+        // alt+shift+left → CSI param 1 + shift(1) + alt(2) = 4
         assert_eq!(
-            parse_input("--ctrl+c"),
-            ParsedInput::Command(SpecialCommand::CtrlC)
+            parse_input("--alt+shift+left"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::Left,
+                mods: Modifiers {
+                    alt: true,
+                    shift: true,
+                    ..Modifiers::none()
+                }
+            })
         );
+        // Bare named key, no modifiers.
         assert_eq!(
-            parse_input("--cc"),
-            ParsedInput::Command(SpecialCommand::CtrlC)
+            parse_input("--pageup"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::PageUp,
+                mods: Modifiers::none()
+            })
+        );
+        // Function key.
+        assert_eq!(
+            parse_input("--f5"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::F(5),
+                mods: Modifiers::none()
+            })
+        );
+        // Arrow keys still parse.
+        assert_eq!(
+            parse_input("--up"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::Up,
+                mods: Modifiers::none()
+            })
+        );
+        // tab/esc as named keys.
+        assert_eq!(
+            parse_input("--tab"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::Tab,
+                mods: Modifiers::none()
+            })
+        );
+        // ctrl++ → the literal '+' key with ctrl.
+        assert_eq!(
+            parse_input("--ctrl++"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::Char('+'),
+                mods: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_unknown_key_combo_is_text() {
+        // Unrecognized modifier → plain text, not a command.
+        assert_eq!(
+            parse_input("--hyper+x"),
+            ParsedInput::Text("--hyper+x".to_string())
+        );
+        // Unrecognized multi-char key name → plain text.
+        assert_eq!(
+            parse_input("--frobnicate"),
+            ParsedInput::Text("--frobnicate".to_string())
         );
     }
 
@@ -608,13 +734,25 @@ mod tests {
 
     #[test]
     fn test_command_to_bytes_ctrl_c() {
-        assert_eq!(command_to_bytes(&SpecialCommand::CtrlC), Some(vec![0x03]));
+        assert_eq!(
+            command_to_bytes(&SpecialCommand::Key {
+                key: Key::Char('c'),
+                mods: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            }),
+            Some(vec![0x03])
+        );
     }
 
     #[test]
     fn test_command_to_bytes_arrow() {
         assert_eq!(
-            command_to_bytes(&SpecialCommand::Arrow(ArrowDirection::Up)),
+            command_to_bytes(&SpecialCommand::Key {
+                key: Key::Up,
+                mods: Modifiers::none()
+            }),
             Some(b"\x1b[A".to_vec())
         );
     }
