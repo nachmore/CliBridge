@@ -56,9 +56,7 @@ impl TranscriptFormat for SlackTranscriptFormat {
             return vec![body.to_string()];
         }
         match split_fenced(body) {
-            Some((header, content)) => {
-                self.paginate_fenced(header, content)
-            }
+            Some((header, content)) => self.paginate_fenced(header, content),
             None => self.paginate_plain(body),
         }
     }
@@ -255,7 +253,10 @@ mod tests {
         let f = SlackTranscriptFormat;
         // Default impl measures scroll_body(""). Make sure it's the UTF-16
         // size of the header + empty fence (label has one 2-unit emoji).
-        assert_eq!(f.fresh_overhead(), f.measure("📜 *Scroll buffer*\n```\n```"));
+        assert_eq!(
+            f.fresh_overhead(),
+            f.measure("📜 *Scroll buffer*\n```\n```")
+        );
     }
 
     #[test]
@@ -276,7 +277,11 @@ mod tests {
         }
         let body = format!("🟢 *Live*\n```\n{content}```");
         let pages = f.paginate(&body);
-        assert!(pages.len() > 1, "expected multiple pages, got {}", pages.len());
+        assert!(
+            pages.len() > 1,
+            "expected multiple pages, got {}",
+            pages.len()
+        );
         for (i, page) in pages.iter().enumerate() {
             // Every page is within the limit.
             assert!(
@@ -311,7 +316,11 @@ mod tests {
         let huge: String = "x".repeat(SLACK_MESSAGE_SIZE_LIMIT * 3);
         let body = format!("🟢 *Live*\n```\n{huge}```");
         let pages = f.paginate(&body);
-        assert!(pages.len() >= 3, "expected hard-split across pages: {}", pages.len());
+        assert!(
+            pages.len() >= 3,
+            "expected hard-split across pages: {}",
+            pages.len()
+        );
         for page in &pages {
             assert!(f.measure(page) <= SLACK_MESSAGE_SIZE_LIMIT);
             assert!(page.ends_with("```"));

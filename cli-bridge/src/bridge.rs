@@ -731,10 +731,7 @@ async fn handle_slack_message(
                     error!("Failed to resize PTY: {e}");
                 }
                 renderer.resize(new_size.cols, new_size.rows);
-                dispatch.say(format!(
-                    "📐 Resized to {}x{}",
-                    new_size.cols, new_size.rows
-                ));
+                dispatch.say(format!("📐 Resized to {}x{}", new_size.cols, new_size.rows));
                 SlackOutcome::Continue
             }
             SpecialCommand::Clear => {
@@ -778,7 +775,8 @@ async fn handle_slack_message(
             SpecialCommand::Config { key, value } => {
                 let reply = match (key, value) {
                     (None, _) => settings::list_settings(renderer, runtime_settings),
-                    (Some(k), None) => match settings::read_setting(&k, renderer, runtime_settings) {
+                    (Some(k), None) => match settings::read_setting(&k, renderer, runtime_settings)
+                    {
                         Some(v) => match settings::lookup(&k) {
                             Some(meta) => format!(
                                 "`{}` = `{v}` _({})_\n_{}_",
@@ -786,30 +784,27 @@ async fn handle_slack_message(
                             ),
                             None => format!("`{k}` = `{v}`"),
                         },
-                        None => format!(
-                            "⚠️ unknown setting `{k}`. Try `--help config` for the list."
-                        ),
-                    },
-                    (Some(k), Some(v)) => match settings::apply_setting(
-                        &k,
-                        &v,
-                        renderer,
-                        runtime_settings,
-                    ) {
-                        Ok(msg) => {
-                            // Special-case name: keep the attach title in sync.
-                            if k == "name"
-                                && let Some(s) = attach
-                            {
-                                let display =
-                                    settings::read_setting("name", renderer, runtime_settings)
-                                        .unwrap_or_default();
-                                s.set_title(build_title_frame(&display));
-                            }
-                            format!("✅ {msg}")
+                        None => {
+                            format!("⚠️ unknown setting `{k}`. Try `--help config` for the list.")
                         }
-                        Err(e) => format!("⚠️ {e}"),
                     },
+                    (Some(k), Some(v)) => {
+                        match settings::apply_setting(&k, &v, renderer, runtime_settings) {
+                            Ok(msg) => {
+                                // Special-case name: keep the attach title in sync.
+                                if k == "name"
+                                    && let Some(s) = attach
+                                {
+                                    let display =
+                                        settings::read_setting("name", renderer, runtime_settings)
+                                            .unwrap_or_default();
+                                    s.set_title(build_title_frame(&display));
+                                }
+                                format!("✅ {msg}")
+                            }
+                            Err(e) => format!("⚠️ {e}"),
+                        }
+                    }
                 };
                 dispatch.say(reply);
                 SlackOutcome::Continue

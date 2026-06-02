@@ -150,9 +150,7 @@ impl TuiRenderer {
             pending_handoff: None,
             inverse_active: false,
             input_carry: Vec::new(),
-            scroll_buffer: std::collections::VecDeque::with_capacity(
-                scroll_buffer_max.min(1024),
-            ),
+            scroll_buffer: std::collections::VecDeque::with_capacity(scroll_buffer_max.min(1024)),
             scroll_buffer_max,
             dirty: false,
             replace_block_chars: false,
@@ -912,14 +910,12 @@ impl TuiRenderer {
         let mut output = String::new();
         output.push_str("🟢 *Live*\n```\n");
         for (row_idx, row) in self.screen[..render_until].iter().enumerate() {
-            let cursor_col = if render_cursor
-                && row_idx == self.cursor_row
-                && self.cursor_col < self.cols
-            {
-                Some(self.cursor_col)
-            } else {
-                None
-            };
+            let cursor_col =
+                if render_cursor && row_idx == self.cursor_row && self.cursor_col < self.cols {
+                    Some(self.cursor_col)
+                } else {
+                    None
+                };
 
             // Build the row in *cell space* (one char per cell), then
             // trim trailing blanks. Doing the trim in char space avoids
@@ -2142,8 +2138,16 @@ mod tests {
         renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1H\x1b[7mAccessing workspace:\x1b[27m");
         let out = renderer.take_pending().unwrap();
-        assert!(out.text.contains("Accessing workspace:"), "got: {:?}", out.text);
-        assert!(!out.text.contains("\u{2588}\u{2588}"), "got: {:?}", out.text);
+        assert!(
+            out.text.contains("Accessing workspace:"),
+            "got: {:?}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("\u{2588}\u{2588}"),
+            "got: {:?}",
+            out.text
+        );
     }
 
     #[test]
@@ -2191,7 +2195,11 @@ mod tests {
         renderer.tui_mode = true;
         renderer.process(b"\x1b[3;6H"); // row 2, col 5 (1-indexed input)
         let out = renderer.take_pending().unwrap();
-        assert!(out.text.contains('\u{2588}'), "cursor missing: {:?}", out.text);
+        assert!(
+            out.text.contains('\u{2588}'),
+            "cursor missing: {:?}",
+            out.text
+        );
     }
 
     #[test]

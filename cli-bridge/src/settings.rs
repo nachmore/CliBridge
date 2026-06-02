@@ -111,16 +111,16 @@ pub fn apply_setting(
             Ok(format!("show_cursor = {v}"))
         }
         "anchor_refresh" => {
-            let v: u32 = value
-                .parse()
-                .map_err(|_| format!("anchor_refresh expects a non-negative integer, got {value:?}"))?;
+            let v: u32 = value.parse().map_err(|_| {
+                format!("anchor_refresh expects a non-negative integer, got {value:?}")
+            })?;
             settings.anchor_refresh = v;
             Ok(format!("anchor_refresh = {v}"))
         }
         "scroll_buffer" => {
-            let v: usize = value
-                .parse()
-                .map_err(|_| format!("scroll_buffer expects a non-negative integer, got {value:?}"))?;
+            let v: usize = value.parse().map_err(|_| {
+                format!("scroll_buffer expects a non-negative integer, got {value:?}")
+            })?;
             renderer.set_scroll_buffer_max(v);
             Ok(format!("scroll_buffer = {v}"))
         }
@@ -158,9 +158,7 @@ pub fn list_settings(renderer: &TuiRenderer, settings: &RuntimeSettings) -> Stri
 /// Render the help text for `--help config`: each setting's name, type,
 /// and description.
 pub fn help_text() -> String {
-    let mut out = String::from(
-        "*Configurable settings* (set with `--config <key> <value>`):\n",
-    );
+    let mut out = String::from("*Configurable settings* (set with `--config <key> <value>`):\n");
     for s in SETTINGS {
         out.push_str(&format!(
             "• `{}` _({})_ — {}\n",
@@ -218,7 +216,10 @@ mod tests {
         apply_setting("replace_block_chars", "true", &mut r, &mut s).unwrap();
         assert_eq!(read_setting("replace_block_chars", &r, &s).unwrap(), "true");
         apply_setting("replace_block_chars", "off", &mut r, &mut s).unwrap();
-        assert_eq!(read_setting("replace_block_chars", &r, &s).unwrap(), "false");
+        assert_eq!(
+            read_setting("replace_block_chars", &r, &s).unwrap(),
+            "false"
+        );
     }
 
     #[test]

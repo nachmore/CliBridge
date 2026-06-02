@@ -199,7 +199,8 @@ async fn main() -> Result<()> {
         .scroll_buffer
         .or(config.scroll_buffer)
         .unwrap_or(bridge_slack::DEFAULT_SCROLL_BUFFER_LINES);
-    let replace_block_chars = cli.replace_block_chars || config.replace_block_chars.unwrap_or(false);
+    let replace_block_chars =
+        cli.replace_block_chars || config.replace_block_chars.unwrap_or(false);
     // CLI is opt-out; config key is opt-in (show_cursor: false). Either
     // route to "off" wins.
     let show_cursor = !cli.hide_cursor && config.show_cursor.unwrap_or(true);
@@ -301,9 +302,7 @@ mod commands {
             None => {
                 let names = store.list_workspaces()?;
                 match names.len() {
-                    0 => anyhow::bail!(
-                        "No saved workspaces to export. Run --login first."
-                    ),
+                    0 => anyhow::bail!("No saved workspaces to export. Run --login first."),
                     1 => names.into_iter().next().unwrap(),
                     _ => anyhow::bail!(
                         "Multiple saved workspaces ({}). Pass --workspace <name> \
@@ -314,9 +313,9 @@ mod commands {
             }
         };
 
-        let export = store.export(&target)?.with_context(|| {
-            format!("No saved credentials for workspace '{target}'")
-        })?;
+        let export = store
+            .export(&target)?
+            .with_context(|| format!("No saved credentials for workspace '{target}'"))?;
         let json = serde_json::to_string_pretty(&export)?;
 
         if path == "-" {
@@ -355,8 +354,7 @@ mod commands {
             std::io::stdin().read_to_string(&mut buf)?;
             buf
         } else {
-            std::fs::read_to_string(path)
-                .with_context(|| format!("reading import file {path}"))?
+            std::fs::read_to_string(path).with_context(|| format!("reading import file {path}"))?
         };
 
         let export: LoginExport = serde_json::from_str(&json)
@@ -365,9 +363,7 @@ mod commands {
         let store = CredentialStore::new()?;
         let name = store.import(&export)?;
         eprintln!("✓ Imported credentials for workspace '{name}'.");
-        eprintln!(
-            "Run: cli-bridge --workspace \"{name}\" --channel <channel-id-or-name>"
-        );
+        eprintln!("Run: cli-bridge --workspace \"{name}\" --channel <channel-id-or-name>");
         info!("Imported login for workspace '{name}'");
         Ok(())
     }

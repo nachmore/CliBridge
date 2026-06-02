@@ -780,7 +780,10 @@ impl MessagingClient for SlackClient {
                         continue;
                     }
                     if let Some(text) = &msg.text
-                        && posted_texts.lock().map(|s| s.contains(text)).unwrap_or(false)
+                        && posted_texts
+                            .lock()
+                            .map(|s| s.contains(text))
+                            .unwrap_or(false)
                     {
                         continue;
                     }

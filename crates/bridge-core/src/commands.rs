@@ -214,12 +214,9 @@ fn encode_named(key: &Key, mods: Modifiers) -> Option<Vec<u8>> {
             _ => return None,
         },
         // Char and the single-byte keys above are handled elsewhere.
-        Key::Char(_)
-        | Key::Tab
-        | Key::Enter
-        | Key::Escape
-        | Key::Backspace
-        | Key::Space => return None,
+        Key::Char(_) | Key::Tab | Key::Enter | Key::Escape | Key::Backspace | Key::Space => {
+            return None;
+        }
     };
     Some(csi.encode(mods))
 }
@@ -251,9 +248,7 @@ impl Csi {
                 Csi::Ss3(_) => vec![0x1b, b'O', *fin],
                 _ => vec![0x1b, b'[', *fin],
             },
-            Csi::Letter(fin) | Csi::Ss3(fin) => {
-                format!("\x1b[1;{m}{}", *fin as char).into_bytes()
-            }
+            Csi::Letter(fin) | Csi::Ss3(fin) => format!("\x1b[1;{m}{}", *fin as char).into_bytes(),
             Csi::Tilde(n) if mods.is_none() => format!("\x1b[{n}~").into_bytes(),
             Csi::Tilde(n) => format!("\x1b[{n};{m}~").into_bytes(),
         }
@@ -442,7 +437,11 @@ fn parse_key_with_count(token: &str) -> Option<(Key, u32)> {
 
     // Trailing ASCII digits are the count; digits are single-byte so the
     // char count is a valid byte split point.
-    let trailing_digits = token.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    let trailing_digits = token
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
     if trailing_digits == 0 {
         return None;
     }
@@ -599,7 +598,10 @@ mod tests {
             },
             count: 1,
         };
-        assert_eq!(parse_input("--ctrl+c"), ParsedInput::Command(ctrl_c.clone()));
+        assert_eq!(
+            parse_input("--ctrl+c"),
+            ParsedInput::Command(ctrl_c.clone())
+        );
         // Legacy short alias still works.
         assert_eq!(parse_input("--cc"), ParsedInput::Command(ctrl_c.clone()));
         // Case-insensitive on the modifier and key.
@@ -978,28 +980,64 @@ mod tests {
     fn test_encode_key_ctrl_letters() {
         // Ctrl+C/D/Z/L/\ match the legacy hardcoded control bytes.
         assert_eq!(
-            encode_key(&Key::Char('c'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Char('c'),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(vec![0x03])
         );
         assert_eq!(
-            encode_key(&Key::Char('d'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Char('d'),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(vec![0x04])
         );
         assert_eq!(
-            encode_key(&Key::Char('z'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Char('z'),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(vec![0x1a])
         );
         assert_eq!(
-            encode_key(&Key::Char('l'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Char('l'),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(vec![0x0c])
         );
         assert_eq!(
-            encode_key(&Key::Char('\\'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Char('\\'),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(vec![0x1c])
         );
         // Ctrl is case-insensitive on letters.
         assert_eq!(
-            encode_key(&Key::Char('C'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Char('C'),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(vec![0x03])
         );
     }
@@ -1007,62 +1045,129 @@ mod tests {
     #[test]
     fn test_encode_key_alt_char_is_esc_prefixed() {
         assert_eq!(
-            encode_key(&Key::Char('a'), Modifiers { alt: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Char('a'),
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(vec![0x1b, b'a'])
         );
     }
 
     #[test]
     fn test_encode_key_arrows_plain() {
-        assert_eq!(encode_key(&Key::Up, Modifiers::none()), Some(b"\x1b[A".to_vec()));
-        assert_eq!(encode_key(&Key::Down, Modifiers::none()), Some(b"\x1b[B".to_vec()));
-        assert_eq!(encode_key(&Key::Right, Modifiers::none()), Some(b"\x1b[C".to_vec()));
-        assert_eq!(encode_key(&Key::Left, Modifiers::none()), Some(b"\x1b[D".to_vec()));
+        assert_eq!(
+            encode_key(&Key::Up, Modifiers::none()),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Down, Modifiers::none()),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Right, Modifiers::none()),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Left, Modifiers::none()),
+            Some(b"\x1b[D".to_vec())
+        );
     }
 
     #[test]
     fn test_encode_key_arrows_with_modifiers() {
         // Ctrl+Up → CSI 1;5 A
         assert_eq!(
-            encode_key(&Key::Up, Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Up,
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(b"\x1b[1;5A".to_vec())
         );
         // Shift+Right → CSI 1;2 C
         assert_eq!(
-            encode_key(&Key::Right, Modifiers { shift: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Right,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(b"\x1b[1;2C".to_vec())
         );
         // Ctrl+Alt+Left → 1 + alt(2) + ctrl(4) = 7
         assert_eq!(
-            encode_key(&Key::Left, Modifiers { ctrl: true, alt: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Left,
+                Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(b"\x1b[1;7D".to_vec())
         );
     }
 
     #[test]
     fn test_encode_key_tilde_keys() {
-        assert_eq!(encode_key(&Key::PageUp, Modifiers::none()), Some(b"\x1b[5~".to_vec()));
-        assert_eq!(encode_key(&Key::PageDown, Modifiers::none()), Some(b"\x1b[6~".to_vec()));
-        assert_eq!(encode_key(&Key::Delete, Modifiers::none()), Some(b"\x1b[3~".to_vec()));
+        assert_eq!(
+            encode_key(&Key::PageUp, Modifiers::none()),
+            Some(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::PageDown, Modifiers::none()),
+            Some(b"\x1b[6~".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::Delete, Modifiers::none()),
+            Some(b"\x1b[3~".to_vec())
+        );
         // Ctrl+PageUp → CSI 5;5 ~
         assert_eq!(
-            encode_key(&Key::PageUp, Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::PageUp,
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(b"\x1b[5;5~".to_vec())
         );
     }
 
     #[test]
     fn test_encode_key_function_keys() {
-        assert_eq!(encode_key(&Key::F(1), Modifiers::none()), Some(b"\x1bOP".to_vec()));
-        assert_eq!(encode_key(&Key::F(5), Modifiers::none()), Some(b"\x1b[15~".to_vec()));
-        assert_eq!(encode_key(&Key::F(12), Modifiers::none()), Some(b"\x1b[24~".to_vec()));
+        assert_eq!(
+            encode_key(&Key::F(1), Modifiers::none()),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::F(5), Modifiers::none()),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            encode_key(&Key::F(12), Modifiers::none()),
+            Some(b"\x1b[24~".to_vec())
+        );
         assert_eq!(encode_key(&Key::F(13), Modifiers::none()), None);
     }
 
     #[test]
     fn test_encode_key_shift_tab_is_backtab() {
         assert_eq!(
-            encode_key(&Key::Tab, Modifiers { shift: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Tab,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::none()
+                }
+            ),
             Some(b"\x1b[Z".to_vec())
         );
         assert_eq!(encode_key(&Key::Tab, Modifiers::none()), Some(vec![0x09]));
@@ -1072,7 +1177,13 @@ mod tests {
     fn test_encode_key_ctrl_on_plain_digit_is_none() {
         // Ctrl+1 has no control code.
         assert_eq!(
-            encode_key(&Key::Char('1'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            encode_key(
+                &Key::Char('1'),
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                }
+            ),
             None
         );
     }

@@ -249,7 +249,11 @@ struct Dispatcher {
 
 /// Spawn the dispatcher task and return a handle. The session loop feeds the
 /// handle; the task posts to `sink` formatted via `fmt`.
-pub fn spawn<S>(channel: String, sink: std::sync::Arc<S>, fmt: Box<dyn TranscriptFormat>) -> DispatchHandle
+pub fn spawn<S>(
+    channel: String,
+    sink: std::sync::Arc<S>,
+    fmt: Box<dyn TranscriptFormat>,
+) -> DispatchHandle
 where
     S: TranscriptSink,
 {
@@ -417,7 +421,11 @@ impl Dispatcher {
     async fn lock_active(&mut self, active: ActiveScrollBuffer) {
         let locked = self.fmt.lock_body(&active.body);
         debug!("locking scroll buffer id={} as history", active.message_id);
-        if let Err(e) = self.sink.edit(&self.channel, &active.message_id, &locked).await {
+        if let Err(e) = self
+            .sink
+            .edit(&self.channel, &active.message_id, &locked)
+            .await
+        {
             error!("failed to lock scroll buffer as history: {e}");
         }
     }
@@ -519,18 +527,26 @@ impl Dispatcher {
                         // The demoted live message is gone; force a fresh post
                         // next live frame.
                         self.last_live_body = None;
-                        self.active = Some(ActiveScrollBuffer { message_id: id, body });
+                        self.active = Some(ActiveScrollBuffer {
+                            message_id: id,
+                            body,
+                        });
                         return;
                     }
                     Err(e) => {
-                        error!("failed to demote live message to scroll buffer, posting fresh: {e}");
+                        error!(
+                            "failed to demote live message to scroll buffer, posting fresh: {e}"
+                        );
                     }
                 }
             }
             match self.sink.post(&self.channel, &body).await {
                 Ok(ts) => {
                     debug!("opened new active scroll buffer id={ts}");
-                    self.active = Some(ActiveScrollBuffer { message_id: ts, body });
+                    self.active = Some(ActiveScrollBuffer {
+                        message_id: ts,
+                        body,
+                    });
                 }
                 Err(e) => error!("failed to post new active scroll buffer: {e}"),
             }
@@ -576,7 +592,10 @@ impl Dispatcher {
         match self.sink.post(&self.channel, &body).await {
             Ok(ts) => {
                 debug!("opened new active scroll buffer id={ts} after rollover");
-                self.active = Some(ActiveScrollBuffer { message_id: ts, body });
+                self.active = Some(ActiveScrollBuffer {
+                    message_id: ts,
+                    body,
+                });
             }
             Err(e) => error!("failed to post fresh active scroll buffer after rollover: {e}"),
         }
@@ -824,7 +843,10 @@ mod tests {
         })
         .await;
         let joined = ops.join(" | ");
-        assert!(joined.contains("HIST["), "anchor should seal active: {joined}");
+        assert!(
+            joined.contains("HIST["),
+            "anchor should seal active: {joined}"
+        );
         assert!(joined.contains("live after anchor"));
     }
 
@@ -853,8 +875,16 @@ mod tests {
         h.shutdown().await;
 
         let ops = sink.ops();
-        assert!(ops.iter().any(|o| o.starts_with("POST") && o.contains("first")), "got {ops:?}");
-        assert!(ops.iter().any(|o| o.starts_with("EDIT") && o.contains("second")), "got {ops:?}");
+        assert!(
+            ops.iter()
+                .any(|o| o.starts_with("POST") && o.contains("first")),
+            "got {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|o| o.starts_with("EDIT") && o.contains("second")),
+            "got {ops:?}"
+        );
     }
 
     #[tokio::test]
@@ -864,7 +894,10 @@ mod tests {
             assert!(h.try_send_frame(vec![], None));
         })
         .await;
-        assert!(ops.is_empty(), "empty snapshot should post nothing: {ops:?}");
+        assert!(
+            ops.is_empty(),
+            "empty snapshot should post nothing: {ops:?}"
+        );
     }
 
     #[tokio::test]
@@ -891,7 +924,10 @@ mod tests {
         let body = posted.strip_prefix("POST#0: ").unwrap();
         assert!(body.chars().count() <= limit, "over limit: {body:?}");
         assert!(body.contains("line9"), "should show the tail: {body:?}");
-        assert!(!body.contains("line0"), "tail page shouldn't include the head: {body:?}");
+        assert!(
+            !body.contains("line0"),
+            "tail page shouldn't include the head: {body:?}"
+        );
     }
 
     #[tokio::test]
