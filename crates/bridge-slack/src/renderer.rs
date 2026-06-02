@@ -135,6 +135,11 @@ pub struct TuiRenderer {
     /// stray marker bytes as keystrokes (e.g. zsh ZLE turning `\x1b[201~`
     /// into a literal `1~` and ESC-prefixed Meta bindings). Default: false.
     bracketed_paste: bool,
+    /// Streaming-mode deferred carriage return: a `\r` was seen and we're
+    /// waiting to find out whether the next byte is text (→ in-place redraw,
+    /// overwrite the current line) or a `\n` (→ plain line ending, keep it).
+    /// See `push_streaming`. Only used in streaming mode.
+    pending_cr: bool,
 }
 
 impl TuiRenderer {
@@ -167,6 +172,7 @@ impl TuiRenderer {
             show_cursor: true,
             cursor_visible: true,
             bracketed_paste: false,
+            pending_cr: false,
         }
     }
 
@@ -479,10 +485,57 @@ impl TuiRenderer {
             (None, Some(_)) => self.bracketed_paste = false,
             (None, None) => {}
         }
-        // Strip ANSI escape sequences for streaming mode
+        // Strip ANSI escape sequences for streaming mode, then apply carriage-
+        // return overwrite semantics. Plain shells draw in-place progress bars
+        // ("Downloading: 42% [===>]") by printing a frame, emitting a bare \r
+        // to return to column 0, and overprinting the next frame — never
+        // entering TUI mode (no alt-screen / absolute positioning). strip_ansi
+        // leaves \r intact, so a naive push_str stacks every frame as its own
+        // line. Honor \r the way a terminal does: it rewinds to the start of
+        // the current line so following bytes overwrite it.
         let clean = strip_ansi(text);
-        self.line_buffer.push_str(&clean);
+        self.push_streaming(&clean);
         self.dirty = true;
+    }
+
+    /// Append streaming text to `line_buffer`, applying terminal carriage-
+    /// return semantics so `\r`-redrawn progress bars collapse to their final
+    /// frame instead of stacking one line per update.
+    ///
+    /// `\r` is *deferred*, not applied immediately: it sets `pending_cr`, and
+    /// only the next printable character rewinds to the start of the current
+    /// line and overwrites it. This is the crucial distinction between an
+    /// in-place redraw (`frame1\rframe2…` — there's text after the `\r`, so we
+    /// rewind) and a plain CRLF line ending (`hello\r\n` — the `\n` arrives
+    /// first and just clears the flag, preserving "hello"). The flag is a
+    /// struct field so it survives across `process` calls, since the PTY can
+    /// split a chunk between the `\r` and the next frame.
+    fn push_streaming(&mut self, text: &str) {
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    // CRLF / lone LF: end the line. A pending \r with no
+                    // overwriting text was just a line ending — drop the flag,
+                    // keep the line.
+                    self.pending_cr = false;
+                    self.line_buffer.push('\n');
+                }
+                '\r' => self.pending_cr = true,
+                _ => {
+                    if self.pending_cr {
+                        // Text follows the \r → in-place redraw. Rewind to the
+                        // start of the current line and overwrite it.
+                        self.pending_cr = false;
+                        let line_start = match self.line_buffer.rfind('\n') {
+                            Some(i) => i + 1,
+                            None => 0,
+                        };
+                        self.line_buffer.truncate(line_start);
+                    }
+                    self.line_buffer.push(ch);
+                }
+            }
+        }
     }
 
     fn handle_csi(&mut self, params: &str, cmd: char) {
@@ -1331,6 +1384,54 @@ mod tests {
         let output = renderer.take_pending().unwrap();
         assert!(!output.is_edit);
         assert!(output.text.contains("hello world"));
+    }
+
+    #[test]
+    fn test_streaming_carriage_return_overwrites_line() {
+        // A \r-redrawn progress bar must collapse to its final frame, not
+        // stack one line per update. (Regression: zsh/apt-style download bars
+        // printed dozens of separate lines in Slack.)
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"Downloading: 10% [=>........]\r");
+        renderer.process(b"Downloading: 55% [=====>....]\r");
+        renderer.process(b"Downloading: 99% [=========>]\r");
+        let out = renderer.take_pending().unwrap();
+        // Only the last frame survives on that line.
+        assert!(out.text.contains("99%"), "got: {:?}", out.text);
+        assert!(
+            !out.text.contains("10%"),
+            "stale frame leaked: {:?}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("55%"),
+            "stale frame leaked: {:?}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn test_streaming_cr_then_newline_keeps_final_frame() {
+        // Progress bar that finishes with a newline: the completed line is
+        // retained, and a following line appends normally.
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"prog 1%\rprog 100%\ndone\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("prog 100%"));
+        assert!(!out.text.contains("prog 1%"));
+        assert!(out.text.contains("done"));
+    }
+
+    #[test]
+    fn test_streaming_cr_overwrite_across_process_calls() {
+        // The overwrite must work even when \r and the next frame arrive in
+        // separate process() calls (PTY chunks however it likes).
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"line A\r");
+        renderer.process(b"line B\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("line B"));
+        assert!(!out.text.contains("line A"));
     }
 
     #[test]
