@@ -658,6 +658,33 @@ async fn await_new_or_quit(
     }
 }
 
+/// Encode Slack text input into the bytes to write to the PTY.
+///
+/// Single-line input is sent raw, followed by a CR to submit. Multi-line
+/// input is wrapped in bracketed-paste markers (`\x1b[200~ … \x1b[201~`) —
+/// but only when the foreground app enabled paste mode (`bracketed_paste`) —
+/// so a TUI editor inserts it as one block instead of submitting at each
+/// embedded newline; the trailing CR (outside the markers) then submits.
+///
+/// Why single-line input is never wrapped: the markers buy nothing without an
+/// embedded newline, and they get re-chunked in transit (ConPTY → ssh →
+/// remote shell). A torn `\x1b[201~` makes the remote line editor leak its
+/// `1~` tail as literal text and desync the command (observed `tel` →
+/// `tel1~`, `ls -l` → `ls -L`).
+fn encode_text_input(text: &str, bracketed_paste: bool) -> Vec<u8> {
+    let multiline = text.contains('\n');
+    let mut bytes = Vec::with_capacity(text.len() + 13);
+    if multiline && bracketed_paste {
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+    } else {
+        bytes.extend_from_slice(text.as_bytes());
+    }
+    bytes.push(b'\r');
+    bytes
+}
+
 /// What to do after handling one inbound Slack message in the session loop.
 enum SlackOutcome {
     Continue,
@@ -679,32 +706,25 @@ async fn handle_slack_message(
     let parsed = parse_input(&msg.text);
     match parsed {
         ParsedInput::Text(text) => {
-            // Only wrap in bracketed-paste markers when the foreground app has
-            // actually enabled the mode (\x1b[?2004h). Why this is conditional:
-            // - Modern TUI editors (Claude Code, helix, kitty's repl, etc.)
-            //   enable bracketed paste and, in that mode, deliver pasted
-            //   content surrounded by \x1b[200~ ... \x1b[201~ and insert it
-            //   *without* interpreting an embedded \r as "submit". So we wrap
-            //   the text and send a bare CR *outside* the brackets — the
-            //   \x1b[201~ takes the editor out of paste mode first, then the
-            //   CR submits. Without this, Claude Code captures the line but
-            //   never submits it until the user hits Enter.
-            // - But a plain interactive shell that has NOT enabled ?2004h does
-            //   NOT silently ignore these markers (an earlier assumption that
-            //   caused a bug): its line editor parses the stray \x1b[200~ /
-            //   \x1b[201~ bytes as keystrokes — e.g. zsh ZLE leaves a literal
-            //   `1~` behind and ESC-prefixed bytes hit Meta bindings, mangling
-            //   the command (`ls -l` arriving as `ls -L`, `tel` as `tel1~`).
-            //   So when paste mode is off we send the raw text + CR.
-            let mut bytes = Vec::with_capacity(text.len() + 13);
-            if renderer.bracketed_paste() {
-                bytes.extend_from_slice(b"\x1b[200~");
-                bytes.extend_from_slice(text.as_bytes());
-                bytes.extend_from_slice(b"\x1b[201~");
-            } else {
-                bytes.extend_from_slice(text.as_bytes());
-            }
-            bytes.push(b'\r');
+            // Bracketed-paste wrapping is only for *multi-line* input, and
+            // only when the foreground app enabled paste mode (\x1b[?2004h).
+            //
+            // Why so narrow (learned from pty.bin captures):
+            // - A multi-line paste into a TUI editor (Claude Code, helix, …)
+            //   must arrive surrounded by \x1b[200~ ... \x1b[201~ so the
+            //   editor inserts it as one block; the embedded newlines don't
+            //   each submit. We send a bare CR *after* \x1b[201~ to submit.
+            // - But for SINGLE-line input the markers buy nothing (no embedded
+            //   newline to protect) and actively cause corruption: the
+            //   \x1b[200~/\x1b[201~ sequences get re-chunked in transit
+            //   (ConPTY → ssh → network → remote zsh), and a torn \x1b[201~
+            //   makes the remote line editor leak its `1~` tail as literal
+            //   text and desync the command — the observed `tel` → `tel1~`,
+            //   `ls -l` → `ls -L`. So single-line input always goes raw + CR.
+            //
+            // `bracketed_paste()` reflects the foreground app's most recent
+            // \x1b[?2004h/l, tracked by the renderer.
+            let bytes = encode_text_input(&text, renderer.bracketed_paste());
             if input_tx.send(bytes).await.is_err() {
                 error!("PTY input channel closed");
             }
@@ -843,5 +863,25 @@ mod tests {
         assert!(!looks_like_channel_id("XABCDEFGH"));
         // Too short.
         assert!(!looks_like_channel_id("CXY"));
+    }
+
+    #[test]
+    fn single_line_input_is_raw_even_with_paste_mode() {
+        // The SSH regression: a single-line command must never be wrapped in
+        // bracketed-paste markers, even when the app has paste mode on —
+        // a torn \x1b[201~ in transit corrupts it (`tel` → `tel1~`).
+        assert_eq!(encode_text_input("ls -l", true), b"ls -l\r");
+        assert_eq!(encode_text_input("tel", true), b"tel\r");
+        // Same when paste mode is off.
+        assert_eq!(encode_text_input("ls -l", false), b"ls -l\r");
+    }
+
+    #[test]
+    fn multiline_input_wrapped_only_when_paste_mode_on() {
+        // Multi-line + paste mode on → wrapped, with CR outside the markers.
+        assert_eq!(encode_text_input("a\nb", true), b"\x1b[200~a\nb\x1b[201~\r");
+        // Multi-line but paste mode off → raw (markers would just be noise /
+        // get mis-parsed by a shell that didn't ask for them).
+        assert_eq!(encode_text_input("a\nb", false), b"a\nb\r");
     }
 }
