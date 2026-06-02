@@ -11,24 +11,25 @@
 /// and gives us ~10x headroom over a typical "long answer" burst.
 pub const DEFAULT_SCROLL_BUFFER_LINES: usize = 10_000;
 
-/// Renders terminal output for display in Slack messages.
+/// A small terminal emulator that renders PTY output for display in Slack.
 ///
-/// Strategy (log-segment model):
-/// - Accumulates terminal output as it arrives. `process()` does not render.
-/// - Detects "TUI mode" only when an app enables the alternate screen buffer
-///   (vim, htop, less, tmux). Plain output stays in streaming mode.
-/// - Streaming mode: appends to a buffer that the bridge drains on a fixed
-///   tick via `take_pending()` and posts as a new message.
-/// - TUI mode: the live frame is *just the current screen*. The bridge edits
-///   one Slack message with this each tick. Bounded by cols × rows so the
-///   message stays well under Slack's 4000-char chat.update cap in practice.
-/// - Rows that scroll off the top become append-only history. They are NOT
-///   re-rendered into the live frame. Instead the bridge drains them via
-///   `drain_scroll_buffer_rows()` and writes them into one of two kinds of
-///   Slack message: an "active" 📜 Scroll buffer (still being extended each
-///   tick) or a "locked" 📚 History (sealed once active fills up). This
-///   structurally rules out duplication: each row lives in exactly one
-///   Slack message forever.
+/// Everything runs through one virtual screen — there's no separate "plain
+/// streaming" path. Plain shell output (ls, build logs, a zsh prompt) is just
+/// the degenerate case of terminal output: text, newlines, carriage returns,
+/// and scrolls, with no absolute cursor positioning. Full-screen apps (vim,
+/// htop, Claude Code) drive the same screen with positioning and the alternate
+/// screen buffer. One model handles both.
+///
+/// Model:
+/// - `process()` feeds bytes through the emulator, updating the virtual screen.
+/// - `take_pending()` returns the *current screen* as the live frame; the
+///   bridge edits one Slack message with it each tick (bounded by cols × rows,
+///   so it stays well under Slack's message cap).
+/// - Rows that scroll off the top are captured into `scroll_buffer`; the bridge
+///   drains them into an "active" 📜 Scroll buffer message and seals filled
+///   ones as 📚 *History*. Each row lives in exactly one Slack message.
+/// - The alternate screen buffer (vim/less/htop) is saved on enter and restored
+///   on exit, so a full-screen app's private screen doesn't pollute scrollback.
 pub struct TuiRenderer {
     /// Current screen buffer (rows x cols)
     screen: Vec<Vec<char>>,
@@ -66,15 +67,6 @@ pub struct TuiRenderer {
     /// wherever the cursor happened to be — frames stacked vertically
     /// instead of overwriting in place.
     saved_cursor: Option<(usize, usize)>,
-    /// Whether we've detected TUI-mode output
-    tui_mode: bool,
-    /// Accumulated streaming output, drained by `take_pending`.
-    line_buffer: String,
-    /// Streaming text left over when we transitioned into TUI mode mid-stream.
-    /// Returned (and cleared) by the next `take_pending` so we don't lose the
-    /// pre-TUI output. Held separately because once `tui_mode` is on, the next
-    /// `take_pending` would otherwise return a TUI frame.
-    pending_handoff: Option<String>,
     /// Currently-active inverse-video SGR (set by `\x1b[7m`, cleared by
     /// `\x1b[27m` or `\x1b[0m` / bare `\x1b[m`). Written cells inherit
     /// this into the parallel `inverse` grid.
@@ -98,8 +90,6 @@ pub struct TuiRenderer {
     /// Maximum scroll-buffer lines to retain. 0 disables the buffer
     /// entirely (rows that scroll off are dropped — original behavior).
     scroll_buffer_max: usize,
-    /// Whether the TUI screen has changed since the last `take_pending`.
-    dirty: bool,
     /// When true, replace Unicode Block Elements (U+2580–U+259F: █ ▌ ▐ ▛
     /// ▜ ▝ ▟ etc.) with ASCII spaces in text we send to Slack. Slack's
     /// code-block font lacks glyphs for these and falls back to a font
@@ -135,11 +125,21 @@ pub struct TuiRenderer {
     /// stray marker bytes as keystrokes (e.g. zsh ZLE turning `\x1b[201~`
     /// into a literal `1~` and ESC-prefixed Meta bindings). Default: false.
     bracketed_paste: bool,
-    /// Streaming-mode deferred carriage return: a `\r` was seen and we're
-    /// waiting to find out whether the next byte is text (→ in-place redraw,
-    /// overwrite the current line) or a `\n` (→ plain line ending, keep it).
-    /// See `push_streaming`. Only used in streaming mode.
-    pending_cr: bool,
+    /// Saved primary-screen state while a full-screen app is on the alternate
+    /// screen (`\x1b[?1049h` / legacy `?47h`). Full-screen apps (vim, less,
+    /// htop) draw on a private screen and expect it discarded on exit, leaving
+    /// the prior terminal contents intact. We snapshot the primary screen on
+    /// enter and restore it on exit (`?1049l` / `?47l`) so the app's repaints
+    /// never flow into Slack scrollback. `None` when on the primary screen.
+    alt_screen: Option<AltScreenSave>,
+}
+
+/// Primary-screen state stashed while the alternate screen is active.
+struct AltScreenSave {
+    screen: Vec<Vec<char>>,
+    inverse: Vec<Vec<bool>>,
+    cursor_row: usize,
+    cursor_col: usize,
 }
 
 impl TuiRenderer {
@@ -160,19 +160,15 @@ impl TuiRenderer {
             cursor_col: 0,
             pending_wrap: false,
             saved_cursor: None,
-            tui_mode: false,
-            line_buffer: String::new(),
-            pending_handoff: None,
             inverse_active: false,
             input_carry: Vec::new(),
             scroll_buffer: std::collections::VecDeque::with_capacity(scroll_buffer_max.min(1024)),
             scroll_buffer_max,
-            dirty: false,
             replace_block_chars: false,
             show_cursor: true,
             cursor_visible: true,
             bracketed_paste: false,
-            pending_cr: false,
+            alt_screen: None,
         }
     }
 
@@ -288,59 +284,30 @@ impl TuiRenderer {
 
         let text = String::from_utf8_lossy(to_process);
 
-        if !self.tui_mode && Self::is_tui_output(&text) {
-            self.tui_mode = true;
-            // Preserve whatever streaming text we'd already accumulated so
-            // it gets posted before the first TUI frame.
-            if !self.line_buffer.is_empty() {
-                self.pending_handoff = Some(std::mem::take(&mut self.line_buffer));
-            }
-        }
-
-        if self.tui_mode {
-            self.process_tui(&text);
-        } else {
-            self.process_streaming(&text);
-        }
+        // Everything runs through the terminal emulator. Plain shell output
+        // (ls, build logs, a zsh prompt) is just the degenerate case: text,
+        // newlines, carriage returns, and scrolls — no absolute positioning.
+        // The live frame is always "the current screen", and rows that scroll
+        // off the top feed the scroll buffer. This gives one consistent
+        // presentation (live window + scrollback → history) regardless of
+        // whether a full-screen TUI or a plain command is running.
+        self.process_tui(&text);
     }
 
-    /// Drain whatever output has accumulated since the last call.
-    /// In streaming mode this empties the buffer; in TUI mode it
-    /// **always** returns the current screen — the bridge dedupes
-    /// identical content at the Slack-call layer.
+    /// Produce the current live frame: a render of the virtual screen, posted
+    /// as an editable message (`is_edit: true`) that the bridge keeps in sync.
     ///
-    /// We deliberately don't gate on a `dirty` flag in TUI mode: rows
-    /// that scrolled off the screen during a long burst aren't reflected
-    /// by `dirty` (which only fires when the renderer's `process` is
-    /// called), so a quiet renderer can still have a stale live frame
-    /// in Slack relative to the actual screen. Returning the current
-    /// frame every tick lets the bridge keep the live message in sync.
+    /// Always returns the current screen — we deliberately don't gate on a
+    /// "dirty" flag. Rows that scrolled off during a long burst aren't a
+    /// screen *change* per se, and a quiet renderer can still have a live frame
+    /// that's stale relative to Slack; returning the frame every tick lets the
+    /// bridge keep the live message current and dedupe identical bodies at the
+    /// Slack-call layer.
     pub fn take_pending(&mut self) -> Option<RenderedOutput> {
-        // Drain any leftover streaming text that was buffered before we
-        // transitioned into TUI mode. Always return it as a fresh post.
-        if let Some(chunk) = self.pending_handoff.take() {
-            return Some(RenderedOutput {
-                text: format!("```\n{chunk}```"),
-                is_edit: false,
-            });
-        }
-
-        if self.tui_mode {
-            self.dirty = false;
-            Some(RenderedOutput {
-                text: self.render_screen(),
-                is_edit: true,
-            })
-        } else {
-            if self.line_buffer.is_empty() {
-                return None;
-            }
-            let chunk = std::mem::take(&mut self.line_buffer);
-            Some(RenderedOutput {
-                text: format!("```\n{chunk}```"),
-                is_edit: false,
-            })
-        }
+        Some(RenderedOutput {
+            text: self.render_screen(),
+            is_edit: true,
+        })
     }
 
     /// Resize the virtual screen.
@@ -355,15 +322,25 @@ impl TuiRenderer {
         for row in &mut self.inverse {
             row.resize(new_cols, false);
         }
+        // Keep the stashed primary screen the same shape, so restoring after a
+        // resize-while-on-alt-screen doesn't produce a ragged grid (which the
+        // renderer and scroll math index into assuming rows are `cols` wide).
+        if let Some(saved) = self.alt_screen.as_mut() {
+            saved.screen.resize(new_rows, vec![' '; new_cols]);
+            saved.inverse.resize(new_rows, vec![false; new_cols]);
+            for row in &mut saved.screen {
+                row.resize(new_cols, ' ');
+            }
+            for row in &mut saved.inverse {
+                row.resize(new_cols, false);
+            }
+            saved.cursor_row = saved.cursor_row.min(new_rows.saturating_sub(1));
+            saved.cursor_col = saved.cursor_col.min(new_cols.saturating_sub(1));
+        }
         self.cols = new_cols;
         self.rows = new_rows;
         self.cursor_row = self.cursor_row.min(new_rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(new_cols.saturating_sub(1));
-    }
-
-    /// Check if we're in TUI mode.
-    pub fn is_tui_mode(&self) -> bool {
-        self.tui_mode
     }
 
     /// Whether the foreground app has enabled bracketed-paste mode
@@ -372,21 +349,6 @@ impl TuiRenderer {
     /// that hasn't enabled it would mis-parse the marker bytes as keystrokes.
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
-    }
-
-    fn is_tui_output(text: &str) -> bool {
-        // Indicators a full-screen app is taking over the terminal:
-        //  - \x1b[?1049h / ?47h: alternate screen buffer (vim, htop, less, tmux)
-        //  - \x1b[2J:           full-screen clear (Claude Code, many TUIs)
-        //  - \x1b[<r>;<c>H:     two-arg cursor positioning, used to lay out boxes
-        //
-        // We deliberately do NOT trigger on bare \x1b[H or \x1b[?25l: cmd.exe
-        // and PowerShell emit those during normal prompt redraws on Windows
-        // ConPTY, so those alone would mis-classify regular output as a TUI.
-        if text.contains("\x1b[?1049h") || text.contains("\x1b[?47h") || text.contains("\x1b[2J") {
-            return true;
-        }
-        contains_two_arg_cursor_position(text)
     }
 
     fn process_tui(&mut self, text: &str) {
@@ -466,74 +428,6 @@ impl TuiRenderer {
                 }
             } else {
                 self.put_char(ch);
-            }
-        }
-        self.dirty = true;
-    }
-
-    fn process_streaming(&mut self, text: &str) {
-        // Track bracketed-paste toggles even in streaming mode: a plain shell
-        // (zsh ZLE, fish, …) can enable ?2004 at its prompt without ever
-        // entering TUI mode, and the bridge needs to know so it wraps Slack
-        // input correctly. strip_ansi drops the sequence, so detect it first.
-        // If both appear in one chunk, the later one wins.
-        let enable = text.rfind("\x1b[?2004h");
-        let disable = text.rfind("\x1b[?2004l");
-        match (enable, disable) {
-            (Some(e), Some(d)) => self.bracketed_paste = e > d,
-            (Some(_), None) => self.bracketed_paste = true,
-            (None, Some(_)) => self.bracketed_paste = false,
-            (None, None) => {}
-        }
-        // Strip ANSI escape sequences for streaming mode, then apply carriage-
-        // return overwrite semantics. Plain shells draw in-place progress bars
-        // ("Downloading: 42% [===>]") by printing a frame, emitting a bare \r
-        // to return to column 0, and overprinting the next frame — never
-        // entering TUI mode (no alt-screen / absolute positioning). strip_ansi
-        // leaves \r intact, so a naive push_str stacks every frame as its own
-        // line. Honor \r the way a terminal does: it rewinds to the start of
-        // the current line so following bytes overwrite it.
-        let clean = strip_ansi(text);
-        self.push_streaming(&clean);
-        self.dirty = true;
-    }
-
-    /// Append streaming text to `line_buffer`, applying terminal carriage-
-    /// return semantics so `\r`-redrawn progress bars collapse to their final
-    /// frame instead of stacking one line per update.
-    ///
-    /// `\r` is *deferred*, not applied immediately: it sets `pending_cr`, and
-    /// only the next printable character rewinds to the start of the current
-    /// line and overwrites it. This is the crucial distinction between an
-    /// in-place redraw (`frame1\rframe2…` — there's text after the `\r`, so we
-    /// rewind) and a plain CRLF line ending (`hello\r\n` — the `\n` arrives
-    /// first and just clears the flag, preserving "hello"). The flag is a
-    /// struct field so it survives across `process` calls, since the PTY can
-    /// split a chunk between the `\r` and the next frame.
-    fn push_streaming(&mut self, text: &str) {
-        for ch in text.chars() {
-            match ch {
-                '\n' => {
-                    // CRLF / lone LF: end the line. A pending \r with no
-                    // overwriting text was just a line ending — drop the flag,
-                    // keep the line.
-                    self.pending_cr = false;
-                    self.line_buffer.push('\n');
-                }
-                '\r' => self.pending_cr = true,
-                _ => {
-                    if self.pending_cr {
-                        // Text follows the \r → in-place redraw. Rewind to the
-                        // start of the current line and overwrite it.
-                        self.pending_cr = false;
-                        let line_start = match self.line_buffer.rfind('\n') {
-                            Some(i) => i + 1,
-                            None => 0,
-                        };
-                        self.line_buffer.truncate(line_start);
-                    }
-                    self.line_buffer.push(ch);
-                }
             }
         }
     }
@@ -795,6 +689,18 @@ impl TuiRenderer {
                             // Slack input in paste markers when the app asked
                             // for the mode.
                             2004 => self.bracketed_paste = show,
+                            // Alternate screen buffer (1049 = modern combined
+                            // save+clear; 47 = legacy switch). Enter snapshots
+                            // and clears the primary screen; exit restores it,
+                            // so a full-screen app's private screen is
+                            // discarded rather than flowing into scrollback.
+                            1049 | 47 => {
+                                if show {
+                                    self.enter_alt_screen();
+                                } else {
+                                    self.exit_alt_screen();
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -868,6 +774,47 @@ impl TuiRenderer {
         }
     }
 
+    /// Enter the alternate screen buffer (`\x1b[?1049h` / `?47h`). Snapshot the
+    /// current primary screen + cursor, then present a cleared screen for the
+    /// full-screen app to draw on. Re-entering while already on the alt screen
+    /// is a no-op (don't clobber the saved primary state). The app's drawing
+    /// never reaches the scroll buffer because exit restores the primary screen
+    /// wholesale.
+    fn enter_alt_screen(&mut self) {
+        if self.alt_screen.is_some() {
+            return;
+        }
+        self.alt_screen = Some(AltScreenSave {
+            screen: self.screen.clone(),
+            inverse: self.inverse.clone(),
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+        });
+        for row in &mut self.screen {
+            row.fill(' ');
+        }
+        for row in &mut self.inverse {
+            row.fill(false);
+        }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.pending_wrap = false;
+    }
+
+    /// Exit the alternate screen (`\x1b[?1049l` / `?47l`): discard the app's
+    /// private screen and restore the saved primary screen + cursor. No rows
+    /// flow into the scroll buffer — the full-screen session is gone, just as
+    /// on a real terminal. A no-op if we weren't on the alt screen.
+    fn exit_alt_screen(&mut self) {
+        if let Some(saved) = self.alt_screen.take() {
+            self.screen = saved.screen;
+            self.inverse = saved.inverse;
+            self.cursor_row = saved.cursor_row.min(self.rows.saturating_sub(1));
+            self.cursor_col = saved.cursor_col.min(self.cols.saturating_sub(1));
+            self.pending_wrap = false;
+        }
+    }
+
     /// Drop the top row off the screen, capturing it into the scroll buffer, and
     /// append a fresh blank row at the bottom. Called by the three real-scroll
     /// paths (LF past bottom, auto-wrap past bottom, CSI S "scroll up").
@@ -880,7 +827,11 @@ impl TuiRenderer {
         // there's no way to express inverse video in Slack mrkdwn).
         self.inverse.remove(0);
         self.inverse.push(vec![false; self.cols]);
-        if self.scroll_buffer_max > 0 {
+        // On the alternate screen, scrolling is a full-screen app redrawing its
+        // private view (a pager paging, an editor scrolling) — that content is
+        // discarded on exit and must never enter Slack history. Only primary-
+        // screen scrolls are real scrollback.
+        if self.scroll_buffer_max > 0 && self.alt_screen.is_none() {
             // Skip rows that are all blanks — they're padding, not content.
             // Also skip the trailing run of blanks on real rows so we don't
             // pad the scroll buffer with right-edge whitespace.
@@ -1276,53 +1227,6 @@ fn find_string_terminator(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-/// Strip ANSI escape sequences from text. Handles:
-///  - CSI: `\x1b[...<final>` where `<final>` is an ASCII letter
-///  - String escapes (OSC `\x1b]`, DCS `\x1bP`, SOS `\x1bX`, PM `\x1b^`,
-///    APC `\x1b_`): body terminated by BEL (`\x07`) or ST (`\x1b\\`)
-///  - Single-char escapes: `\x1b<X>` for any other introducer
-///  - Stray BEL (`\x07`), so it can't leak into rendered output
-fn strip_ansi(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\x1b' => match chars.peek() {
-                Some(&'[') => {
-                    chars.next();
-                    // CSI body: parameter bytes (0x30-0x3F), intermediate
-                    // bytes (0x20-0x2F), then a final byte (0x40-0x7E).
-                    while let Some(&c) = chars.peek() {
-                        chars.next();
-                        if (0x40..=0x7E).contains(&(c as u32)) {
-                            break;
-                        }
-                    }
-                }
-                Some(&']') | Some(&'P') | Some(&'X') | Some(&'^') | Some(&'_') => {
-                    // String escapes share the same body: scan to BEL or ST.
-                    // OSC (]), DCS (P), SOS (X), PM (^), APC (_).
-                    chars.next();
-                    skip_string_body(&mut chars);
-                }
-                Some(_) => {
-                    // Two-byte escape (\x1b=, \x1b>, \x1bM, etc.) — drop both.
-                    chars.next();
-                }
-                None => {}
-            },
-            '\x07' => {
-                // Stray BEL — drop. We already swallow it as the OSC terminator
-                // above, but ConPTY occasionally emits it on its own.
-            }
-            _ => result.push(ch),
-        }
-    }
-
-    result
-}
-
 /// Consume an OSC/DCS/SOS/PM/APC body up to and including its terminator.
 /// Body ends at BEL (0x07) or ST (`\x1b\\`). A nested ESC without a `\`
 /// after it acts as a hard terminator (xterm-style resync).
@@ -1340,49 +1244,17 @@ fn skip_string_body<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>
     }
 }
 
-/// Heuristic: does `text` contain a CSI cursor-position escape with at least
-/// one explicit parameter (e.g. `\x1b[3;5H`)? Bare `\x1b[H` is excluded because
-/// cmd.exe uses it for prompt redraws. Apps that lay out boxes via absolute
-/// positioning (Claude Code, ncurses-style TUIs) emit the parameterized form.
-fn contains_two_arg_cursor_position(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
-            let mut j = i + 2;
-            let mut saw_digit = false;
-            while j < bytes.len() {
-                let b = bytes[j];
-                if b.is_ascii_digit() || b == b';' {
-                    if b.is_ascii_digit() {
-                        saw_digit = true;
-                    }
-                    j += 1;
-                } else {
-                    if saw_digit && (b == b'H' || b == b'f') {
-                        return true;
-                    }
-                    break;
-                }
-            }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_streaming_output() {
+    fn test_plain_output_renders() {
         let mut renderer = TuiRenderer::new(80, 24);
         renderer.process(b"hello world\n");
         let output = renderer.take_pending().unwrap();
-        assert!(!output.is_edit);
+        // The live frame is always an editable screen render.
+        assert!(output.is_edit);
         assert!(output.text.contains("hello world"));
     }
 
@@ -1435,49 +1307,37 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_drains_buffer() {
-        // Two `process` calls accumulate; one `take_pending` drains; the next
-        // `take_pending` returns None until more data arrives.
+    fn test_successive_output_accumulates_on_screen() {
+        // Output across multiple process() calls accumulates on the virtual
+        // screen; the live frame always reflects the current screen.
         let mut renderer = TuiRenderer::new(80, 24);
         renderer.process(b"first\n");
         renderer.process(b"second\n");
         let out = renderer.take_pending().unwrap();
         assert!(out.text.contains("first"));
         assert!(out.text.contains("second"));
-        assert!(renderer.take_pending().is_none());
         renderer.process(b"third\n");
-        assert!(renderer.take_pending().unwrap().text.contains("third"));
-    }
-
-    #[test]
-    fn test_tui_detection() {
-        // Triggers TUI mode:
-        assert!(TuiRenderer::is_tui_output("\x1b[?1049h"));
-        assert!(TuiRenderer::is_tui_output("\x1b[?47h"));
-        assert!(TuiRenderer::is_tui_output("\x1b[2J"));
-        assert!(TuiRenderer::is_tui_output("\x1b[3;5Hx"));
-        // Does NOT trigger (cmd.exe / PowerShell prompt echo):
-        assert!(!TuiRenderer::is_tui_output("\x1b[H"));
-        assert!(!TuiRenderer::is_tui_output("\x1b[?25l"));
-        assert!(!TuiRenderer::is_tui_output("\x1b[?25l\x1b[H"));
-        assert!(!TuiRenderer::is_tui_output("plain text"));
-    }
-
-    #[test]
-    fn test_cmd_echo_stays_streaming() {
-        let mut renderer = TuiRenderer::new(80, 24);
-        // Typical ConPTY prompt redraw: hide cursor, home, then text.
-        renderer.process(b"\x1b[?25l\x1b[Hhello\r\n");
-        assert!(!renderer.is_tui_mode());
         let out = renderer.take_pending().unwrap();
-        assert!(!out.is_edit);
+        // Screen still holds the earlier lines (within screen height) plus new.
+        assert!(out.text.contains("first"));
+        assert!(out.text.contains("third"));
+    }
+
+    #[test]
+    fn test_cmd_prompt_redraw_renders() {
+        // Typical ConPTY prompt redraw: hide cursor, home, then text. This
+        // used to be classified as "streaming"; now it just renders on screen.
+        let mut renderer = TuiRenderer::new(80, 24);
+        renderer.process(b"\x1b[?25l\x1b[Hhello\r\n");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.is_edit);
         assert!(out.text.contains("hello"));
     }
 
     #[test]
-    fn test_tui_mode_renders_screen() {
+    fn test_alt_screen_app_renders_screen() {
         let mut renderer = TuiRenderer::new(10, 3);
-        // Enable alt screen + write something.
+        // Enter alt screen + write something.
         renderer.process(b"\x1b[?1049h\x1b[2J\x1b[1;1Hhello");
         let output = renderer.take_pending().unwrap();
         assert!(output.is_edit);
@@ -1485,40 +1345,12 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_ansi() {
-        assert_eq!(strip_ansi("\x1b[32mgreen\x1b[0m"), "green");
-        assert_eq!(strip_ansi("plain"), "plain");
-    }
-
-    #[test]
-    fn test_strip_ansi_osc_window_title() {
-        // cmd.exe sets the window title via OSC 0: \x1b]0;TITLE\x07
-        assert_eq!(
-            strip_ansi("before\x1b]0;C:\\Windows\\system32\\cmd.exe\x07after"),
-            "beforeafter"
-        );
-        // ST-terminated form
-        assert_eq!(strip_ansi("a\x1b]0;title\x1b\\b"), "ab");
-    }
-
-    #[test]
-    fn test_strip_ansi_stray_bel() {
-        assert_eq!(strip_ansi("hi\x07there"), "hithere");
-    }
-
-    #[test]
-    fn test_strip_ansi_two_byte_escape() {
-        // \x1b= and \x1b> are application-keypad escapes; both bytes drop.
-        assert_eq!(strip_ansi("a\x1b=b\x1b>c"), "abc");
-    }
-
-    #[test]
-    fn test_streaming_drops_window_title() {
-        // Regression: dir output used to leak the OSC body and BEL into Slack.
+    fn test_drops_window_title_osc() {
+        // OSC 0 window-title sequences (cmd.exe / many shells emit these) must
+        // not leak their body or terminator into the rendered screen.
         let mut renderer = TuiRenderer::new(80, 24);
         renderer.process(b"line1\n\x1b]0;C:\\WINDOWS\\system32\\cmd.exe\x07line2\n");
         let out = renderer.take_pending().unwrap();
-        assert!(!out.is_edit);
         assert!(out.text.contains("line1"));
         assert!(out.text.contains("line2"));
         assert!(!out.text.contains(']'));
@@ -1527,54 +1359,14 @@ mod tests {
     }
 
     #[test]
-    fn test_two_arg_cursor_position_detected() {
-        // Apps that lay out boxes use parameterized H, e.g. claude-code.
-        assert!(contains_two_arg_cursor_position("\x1b[3;5Hhi"));
-        assert!(contains_two_arg_cursor_position("\x1b[10Hbar"));
-        assert!(contains_two_arg_cursor_position("\x1b[2;1f"));
-        // Bare \x1b[H is cmd.exe's prompt redraw — must NOT trigger TUI mode.
-        assert!(!contains_two_arg_cursor_position("\x1b[H"));
-        assert!(!contains_two_arg_cursor_position("\x1b[?25l\x1b[H"));
-        assert!(!contains_two_arg_cursor_position("plain"));
-    }
-
-    #[test]
-    fn test_tui_mode_triggers_on_screen_clear() {
-        // \x1b[2J alone is enough — Claude Code uses it to (re)paint.
-        let mut renderer = TuiRenderer::new(20, 5);
-        renderer.process(b"\x1b[2J\x1b[1;1Hhi");
-        assert!(renderer.is_tui_mode());
-    }
-
-    #[test]
-    fn test_strip_ansi_dcs() {
-        // DCS body — apps use this for capability negotiation. Used to leak
-        // through as literal "u1u4;2m" garbage in the rendered output.
-        assert_eq!(strip_ansi("a\x1bP1u\x1b\\b"), "ab");
-        assert_eq!(strip_ansi("a\x1bP$qm\x1b\\b"), "ab"); // DECRQSS query
-        // BEL-terminated form
-        assert_eq!(strip_ansi("a\x1bP1u\x07b"), "ab");
-    }
-
-    #[test]
-    fn test_strip_ansi_apc_pm_sos() {
-        // All string escapes share the same body shape.
-        assert_eq!(strip_ansi("a\x1b_kitty stuff\x1b\\b"), "ab"); // APC
-        assert_eq!(strip_ansi("a\x1b^private msg\x1b\\b"), "ab"); // PM
-        assert_eq!(strip_ansi("a\x1bXstart of string\x1b\\b"), "ab"); // SOS
-    }
-
-    #[test]
     fn test_tui_consumes_kitty_keyboard_escape() {
         // Regression: Claude Code uses Kitty's keyboard protocol, which emits
         // \x1b[>1u and \x1b[<u. The TUI parser used to stop at the '>' and
         // render "1u" as literal text in the screen buffer.
         let mut renderer = TuiRenderer::new(20, 3);
-        // Force TUI mode without otherwise touching the screen.
         renderer.process(b"\x1b[2J\x1b[1;1H");
         renderer.process(b"\x1b[>1u\x1b[<uhello");
         let out = renderer.take_pending().unwrap();
-        assert!(out.is_edit);
         assert!(out.text.contains("hello"));
         assert!(!out.text.contains("1u"));
         assert!(!out.text.contains(">1"));
@@ -1582,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_drops_dcs() {
+    fn test_drops_dcs() {
         // Regression for `u1u4;2m` leaking into Claude Code output.
         let mut renderer = TuiRenderer::new(80, 24);
         renderer.process(b"hello \x1bP1u\x1b\\world\n");
@@ -1591,6 +1383,81 @@ mod tests {
         assert!(out.text.contains("world"));
         assert!(!out.text.contains("u1u"));
         assert!(!out.text.contains('P'));
+    }
+
+    #[test]
+    fn test_alt_screen_restores_primary_on_exit() {
+        // A full-screen app (vim-like): primary shell content, enter alt
+        // screen, draw, exit. The primary content must come back and the app's
+        // private screen must be gone.
+        let mut renderer = TuiRenderer::new(20, 4);
+        renderer.process(b"shell line one\r\n");
+        renderer.process(b"shell line two\r\n");
+        // Enter alt screen, clear, draw a full-screen UI.
+        renderer.process(b"\x1b[?1049h\x1b[2J\x1b[1;1H~ EDITOR ~");
+        let during = renderer.take_pending().unwrap();
+        assert!(during.text.contains("EDITOR"));
+        assert!(
+            !during.text.contains("shell line"),
+            "primary content should be hidden while on alt screen: {:?}",
+            during.text
+        );
+        // Exit: primary screen restored, editor gone.
+        renderer.process(b"\x1b[?1049l");
+        let after = renderer.take_pending().unwrap();
+        assert!(
+            after.text.contains("shell line one"),
+            "got: {:?}",
+            after.text
+        );
+        assert!(after.text.contains("shell line two"));
+        assert!(!after.text.contains("EDITOR"));
+    }
+
+    #[test]
+    fn test_alt_screen_does_not_pollute_scrollback() {
+        // A full-screen app that scrolls internally must not push its lines
+        // into the scroll buffer (history). Only primary-screen scrolls do.
+        let mut renderer = TuiRenderer::with_scroll_buffer(20, 3, 100);
+        renderer.process(b"\x1b[?1049h\x1b[2J");
+        // Scroll a bunch inside the alt screen.
+        for i in 0..20 {
+            renderer.process(format!("editor row {i}\r\n").as_bytes());
+        }
+        renderer.process(b"\x1b[?1049l");
+        // Nothing from the editor should have entered scrollback.
+        let rows = renderer.drain_scroll_buffer_rows();
+        let joined: String = rows.iter().flat_map(|r| r.iter()).collect();
+        assert!(
+            !joined.contains("editor row"),
+            "alt-screen scrolls leaked into history: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn test_alt_screen_legacy_47_also_works() {
+        // The older ?47 enter/exit pair behaves the same as ?1049.
+        let mut renderer = TuiRenderer::new(20, 3);
+        renderer.process(b"primary\n");
+        renderer.process(b"\x1b[?47h\x1b[2J\x1b[1;1Halt");
+        renderer.process(b"\x1b[?47l");
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("primary"));
+        assert!(!out.text.contains("alt"));
+    }
+
+    #[test]
+    fn test_alt_screen_resize_then_exit_no_panic() {
+        // Resizing while on the alt screen must keep the saved primary screen
+        // shape consistent, so restoring it can't index a ragged grid.
+        let mut renderer = TuiRenderer::new(20, 4);
+        renderer.process(b"keep me\n");
+        renderer.process(b"\x1b[?1049h\x1b[2J\x1b[1;1Hbig editor");
+        renderer.resize(40, 8);
+        renderer.process(b"\x1b[?1049l");
+        // Render must not panic and primary content survives.
+        let out = renderer.take_pending().unwrap();
+        assert!(out.text.contains("keep me"), "got: {:?}", out.text);
     }
 
     #[test]
@@ -1670,21 +1537,6 @@ mod tests {
     }
 
     #[test]
-    fn test_handoff_streaming_then_tui() {
-        // Pre-TUI streaming output should be posted as its own streaming
-        // message before the first TUI frame is emitted.
-        let mut renderer = TuiRenderer::new(20, 5);
-        renderer.process(b"about to launch tui\n");
-        renderer.process(b"\x1b[?1049h\x1b[2J\x1b[1;1Hframe");
-        let first = renderer.take_pending().unwrap();
-        assert!(!first.is_edit, "handoff should post, not edit");
-        assert!(first.text.contains("about to launch tui"));
-        let second = renderer.take_pending().unwrap();
-        assert!(second.is_edit, "subsequent TUI frame should edit");
-        assert!(second.text.contains("frame"));
-    }
-
-    #[test]
     fn test_resize() {
         let mut renderer = TuiRenderer::new(80, 24);
         renderer.resize(120, 40);
@@ -1695,7 +1547,6 @@ mod tests {
     #[test]
     fn test_cursor_movement() {
         let mut renderer = TuiRenderer::new(10, 5);
-        renderer.tui_mode = true;
         // Move to row 3, col 5 and write 'X'
         renderer.process(b"\x1b[3;5HX");
         assert_eq!(renderer.screen[2][4], 'X');
@@ -1704,7 +1555,6 @@ mod tests {
     #[test]
     fn test_line_wrap() {
         let mut renderer = TuiRenderer::new(5, 3);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1H12345X");
         // 'X' should wrap to next line
         assert_eq!(renderer.screen[1][0], 'X');
@@ -1720,7 +1570,6 @@ mod tests {
         // partial-redraw TUIs (Claude Code etc.) to scrub a region before
         // writing fresh content. Without this we'd carry "old" text forward.
         let mut renderer = TuiRenderer::new(20, 1);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hold text here");
         // Move to col 5 ("text"), erase 4 cells.
         renderer.process(b"\x1b[1;5H\x1b[4X");
@@ -1733,7 +1582,6 @@ mod tests {
         // Wider than the content so put_char's auto-wrap doesn't trip the
         // single row into scrolling.
         let mut renderer = TuiRenderer::new(20, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Habcdefghij");
         renderer.process(b"\x1b[1;3H\x1b[2P"); // at col 3, delete 2
         assert_eq!(row_str(&renderer.screen[0]), "abefghij");
@@ -1743,7 +1591,6 @@ mod tests {
     fn test_csi_ich_inserts_chars() {
         // Width 10 row of content lives on a 12-wide / 2-row screen.
         let mut renderer = TuiRenderer::new(12, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Habcdefghij");
         renderer.process(b"\x1b[1;3H\x1b[2@"); // at col 3, insert 2 spaces
         // "ab" + "  " + "cdefghij" (no fall-off since width is 12, but the
@@ -1757,7 +1604,6 @@ mod tests {
     fn test_csi_il_inserts_lines() {
         // Wider than content so 5-char writes don't auto-wrap.
         let mut renderer = TuiRenderer::new(10, 4);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Haaaaa");
         renderer.process(b"\x1b[2;1Hbbbbb");
         renderer.process(b"\x1b[3;1Hccccc");
@@ -1772,7 +1618,6 @@ mod tests {
     #[test]
     fn test_csi_dl_deletes_lines() {
         let mut renderer = TuiRenderer::new(10, 4);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Haaaaa");
         renderer.process(b"\x1b[2;1Hbbbbb");
         renderer.process(b"\x1b[3;1Hccccc");
@@ -1788,7 +1633,6 @@ mod tests {
     #[test]
     fn test_csi_cha_horizontal_absolute() {
         let mut renderer = TuiRenderer::new(20, 1);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1HABC");
         renderer.process(b"\x1b[10GZ"); // jump to col 10, write Z
         assert_eq!(renderer.screen[0][9], 'Z');
@@ -1799,7 +1643,6 @@ mod tests {
     #[test]
     fn test_csi_vpa_vertical_absolute() {
         let mut renderer = TuiRenderer::new(5, 4);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1HA");
         renderer.process(b"\x1b[3dB"); // jump to row 3 (preserving col... col is now 1 after the 'A')
         // Cursor advanced past A so col=1; row jumps to 2 (0-indexed)
@@ -1813,7 +1656,6 @@ mod tests {
         // this, frames stack vertically (the original "Flambéing… /
         // Cogitated…" double-line bug).
         let mut renderer = TuiRenderer::new(20, 3);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[2;5H"); // row 2, col 5
         renderer.process(b"\x1b[s"); // save
         renderer.process(b"\x1b[1;1Helsewhere"); // move + write
@@ -1827,7 +1669,6 @@ mod tests {
     fn test_save_restore_cursor_decsc_decrc() {
         // \x1b 7 / \x1b 8 — same effect as SCP/RCP, more common in modern apps.
         let mut renderer = TuiRenderer::new(20, 3);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[3;10H"); // row 3, col 10
         renderer.process(b"\x1b7"); // DECSC
         renderer.process(b"\x1b[1;1Hsomewhere else");
@@ -1841,7 +1682,6 @@ mod tests {
         // RCP before SCP: should leave cursor where it was rather than panic
         // or jump somewhere weird.
         let mut renderer = TuiRenderer::new(20, 3);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[2;5H"); // row 2 col 5
         renderer.process(b"\x1b[u"); // restore with no save
         renderer.process(b"Z");
@@ -1854,7 +1694,6 @@ mod tests {
         // Wider than content + room for the trailing write so we don't
         // accidentally trigger an extra auto-wrap scroll.
         let mut renderer = TuiRenderer::with_scroll_buffer(20, 2, 50);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hfirst");
         renderer.process(b"\x1b[2;1Hsecond");
         // Position to end of "second" then LF past bottom — row 0 ("first")
@@ -1872,7 +1711,6 @@ mod tests {
         // the live frame. They live only in `self.scroll_buffer`, which the
         // bridge drains separately and posts as sealed messages.
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hold");
         renderer.process(b"\x1b[2;1Hkeep");
         renderer.process(b"\n"); // 'old' scrolls off
@@ -1895,7 +1733,6 @@ mod tests {
         // Once drained, scroll buffer is gone — the live frame stays bounded
         // and the same history isn't re-rendered into the next message.
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hold");
         renderer.process(b"\x1b[2;1Hkeep");
         renderer.process(b"\n"); // 'old' scrolls off
@@ -1923,7 +1760,6 @@ mod tests {
     #[test]
     fn test_drain_scroll_buffer_rows_returns_oldest_first() {
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
-        renderer.tui_mode = true;
         for i in 0..5 {
             renderer.process(format!("line{i}\r\n").as_bytes());
         }
@@ -1940,7 +1776,6 @@ mod tests {
     #[test]
     fn test_drain_scroll_buffer_rows_empty_when_no_history() {
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
-        renderer.tui_mode = true;
         renderer.process(b"hello");
         assert!(renderer.drain_scroll_buffer_rows().is_empty());
     }
@@ -1948,7 +1783,6 @@ mod tests {
     #[test]
     fn test_scroll_buffer_capped_at_max() {
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 3);
-        renderer.tui_mode = true;
         // Push 10 rows through (CRLF line-discipline-style so col resets).
         for i in 0..10 {
             renderer.process(format!("row{i}\r\n").as_bytes());
@@ -1962,7 +1796,6 @@ mod tests {
     #[test]
     fn test_scroll_buffer_disabled_when_max_zero() {
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 0);
-        renderer.tui_mode = true;
         for i in 0..5 {
             renderer.process(format!("row{i}\r\n").as_bytes());
         }
@@ -1972,7 +1805,6 @@ mod tests {
     #[test]
     fn test_scroll_buffer_clear() {
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
-        renderer.tui_mode = true;
         for i in 0..3 {
             renderer.process(format!("r{i}\r\n").as_bytes());
         }
@@ -1986,7 +1818,6 @@ mod tests {
         // Scrolling off a row that's all blanks shouldn't pollute scroll buffer
         // — those are padding, not user content.
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
-        renderer.tui_mode = true;
         // Start with two blank rows. \n past bottom scrolls a blank off.
         renderer.process(b"\n\n");
         assert!(renderer.scroll_buffer.is_empty());
@@ -1997,7 +1828,6 @@ mod tests {
         // \x1b[<r>;<c>H with values past the screen size must clamp,
         // not panic or render outside the buffer.
         let mut renderer = TuiRenderer::new(20, 5);
-        renderer.tui_mode = true;
         // Way past bottom-right.
         renderer.process(b"\x1b[999;999HX");
         // Char must land inside the screen.
@@ -2011,7 +1841,6 @@ mod tests {
         // \x1b[0;0H is technically out-of-spec (params are 1-indexed) but
         // some apps emit it. We must not underflow.
         let mut renderer = TuiRenderer::new(10, 3);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[0;0HZ");
         assert_eq!(renderer.screen[0][0], 'Z');
     }
@@ -2024,7 +1853,6 @@ mod tests {
         // *next* printable, so apps that fill the bottom row exactly
         // (Claude Code's separator lines) don't trigger spurious scrolls.
         let mut renderer = TuiRenderer::new(5, 3);
-        renderer.tui_mode = true;
         // Pin "anch" on row 0 so we can detect a scroll.
         renderer.process(b"\x1b[1;1Hanch");
         // Move to bottom row, write exactly 5 chars (one full row).
@@ -2056,7 +1884,6 @@ mod tests {
         // of the same row instead — visible as the prompt arrow trailing
         // the dashes line in Slack.
         let mut renderer = TuiRenderer::new(5, 3);
-        renderer.tui_mode = true;
         // Fill row 0 exactly to the right edge.
         renderer.process(b"\x1b[1;1Habcde");
         // SGR reset (an attribute-only escape — must not clear pending_wrap).
@@ -2075,7 +1902,6 @@ mod tests {
         // the pending flag — otherwise the next printable would jump to the
         // wrong row.
         let mut renderer = TuiRenderer::new(5, 3);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Habcde"); // row 0 full, pending wrap
         renderer.process(b"\x1b[2;1HX"); // jump to row 1 col 0, write X
         // X should land at row 1 col 0, NOT row 1 col 0 after a wrap.
@@ -2089,7 +1915,6 @@ mod tests {
     fn test_pending_wrap_cleared_by_cr() {
         // CR also clears pending wrap.
         let mut renderer = TuiRenderer::new(5, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Habcde"); // row 0 full
         renderer.process(b"\rX"); // CR + X — should overwrite col 0 of row 0
         assert_eq!(renderer.screen[0][0], 'X');
@@ -2101,7 +1926,6 @@ mod tests {
         // Every TUI render should mark the live region for the user, so the
         // 🟢 *Live* label appears even with no scroll buffer or spill.
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hhello");
         let out = renderer.take_pending().unwrap();
         assert!(out.text.contains("🟢 *Live*"), "got: {:?}", out.text);
@@ -2117,7 +1941,6 @@ mod tests {
         // header is added by the bridge when it posts sealed scroll buffer
         // messages — it must not appear in a render_screen output.
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hold");
         renderer.process(b"\x1b[2;1Hkeep");
         renderer.process(b"\n"); // 'old' scrolls off
@@ -2137,7 +1960,6 @@ mod tests {
         // sealed message), the live frame keeps showing the full current
         // screen — there's no per-row dirty bookkeeping anymore.
         let mut renderer = TuiRenderer::with_scroll_buffer(20, 4, 50);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hbanner line");
         renderer.process(b"\x1b[2;1Hsubtitle");
         renderer.process(b"\x1b[3;1Hresponse text");
@@ -2158,7 +1980,6 @@ mod tests {
         // user has explicitly asked to drop pending history rather than
         // posting it. After it, take_scroll buffer_chunks returns empty.
         let mut renderer = TuiRenderer::with_scroll_buffer(20, 2, 50);
-        renderer.tui_mode = true;
         for i in 0..5 {
             renderer.process(format!("row{i}\r\n").as_bytes());
         }
@@ -2171,7 +1992,6 @@ mod tests {
     fn test_replace_block_chars_off_by_default() {
         // Block characters pass through unchanged unless explicitly enabled.
         let mut renderer = TuiRenderer::new(20, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Hlogo:\xe2\x96\x90\xe2\x96\x9b"); // "logo:▐▛"
         let out = renderer.take_pending().unwrap();
         assert!(out.text.contains('▐'), "got: {:?}", out.text);
@@ -2186,7 +2006,6 @@ mod tests {
         // pass through.
         let mut renderer = TuiRenderer::new(20, 2);
         renderer.set_replace_block_chars(true);
-        renderer.tui_mode = true;
         // "│▐▛x│" — block chars between two box-drawing pipes.
         // ▐ (right half block) → ']'; ▛ (upper-left + lower-left → "[").
         renderer.process(b"\x1b[1;1H\xe2\x94\x82\xe2\x96\x90\xe2\x96\x9bx\xe2\x94\x82");
@@ -2200,7 +2019,6 @@ mod tests {
     fn test_cursor_overlay_default_on() {
         // Default: cursor cell is shown as █ in the rendered live frame.
         let mut renderer = TuiRenderer::new(10, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Habc"); // cursor at row 0, col 3 after writing
         let out = renderer.take_pending().unwrap();
         // Row 0 should be "abc█" (block at the post-write cursor position).
@@ -2211,7 +2029,6 @@ mod tests {
     fn test_cursor_overlay_can_be_hidden() {
         let mut renderer = TuiRenderer::new(10, 2);
         renderer.set_show_cursor(false);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Habc");
         let out = renderer.take_pending().unwrap();
         assert!(!out.text.contains('\u{2588}'), "got: {:?}", out.text);
@@ -2228,7 +2045,6 @@ mod tests {
         // only the cursor glyph itself is exempt.
         let mut renderer = TuiRenderer::new(10, 2);
         renderer.set_replace_block_chars(true);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1Habc");
         let out = renderer.take_pending().unwrap();
         assert!(out.text.contains("abc\u{2588}"), "got: {:?}", out.text);
@@ -2240,7 +2056,6 @@ mod tests {
         // hidden in this frame (matches inverse-video cursor behavior
         // in real terminals).
         let mut renderer = TuiRenderer::new(10, 2);
-        renderer.tui_mode = true;
         // Write "abcd", then move cursor back to col 1 ('b').
         renderer.process(b"\x1b[1;1Habcd\x1b[1;2H");
         let out = renderer.take_pending().unwrap();
@@ -2256,7 +2071,6 @@ mod tests {
         // rendered Slack frame even with DECTCEM hiding the regular
         // cursor overlay.
         let mut renderer = TuiRenderer::new(20, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[?25l\x1b[1;1H\xe2\x9d\xaf\x1b[7m \x1b[27m");
         let out = renderer.take_pending().unwrap();
         // The "❯" plus inverse-video space → "❯█" in the rendered output.
@@ -2273,7 +2087,6 @@ mod tests {
         // Inverse-video non-space cells therefore keep their actual
         // character.
         let mut renderer = TuiRenderer::new(30, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1H\x1b[7mAccessing workspace:\x1b[27m");
         let out = renderer.take_pending().unwrap();
         assert!(
@@ -2293,7 +2106,6 @@ mod tests {
         // \x1b[m (full reset) clears the inverse flag — subsequent
         // writes are normal characters, not block markers.
         let mut renderer = TuiRenderer::new(20, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1H\x1b[7m \x1b[mhello");
         let out = renderer.take_pending().unwrap();
         // First cell should be █ (inverse space); rest should be "hello".
@@ -2307,7 +2119,6 @@ mod tests {
         // if show_cursor is on — the PTY cursor at that point is
         // wherever the app last wrote, not where the user is "typing".
         let mut renderer = TuiRenderer::new(10, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[?25l\x1b[1;1Habc");
         let out = renderer.take_pending().unwrap();
         assert!(!out.text.contains('\u{2588}'), "got: {:?}", out.text);
@@ -2318,7 +2129,6 @@ mod tests {
     fn test_cursor_visibility_toggled_back() {
         // ?25l hides, ?25h re-shows. Cursor reappears.
         let mut renderer = TuiRenderer::new(10, 2);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[?25l\x1b[1;1Habc\x1b[?25h");
         let out = renderer.take_pending().unwrap();
         assert!(out.text.contains('\u{2588}'), "got: {:?}", out.text);
@@ -2338,31 +2148,14 @@ mod tests {
     }
 
     #[test]
-    fn test_bracketed_paste_tracked_in_tui_mode() {
-        // The same toggle must be honored once we're in TUI mode (the CSI
-        // goes through the TUI parser path, not just streaming).
+    fn test_bracketed_paste_toggle_in_one_chunk() {
+        // When both enable and disable appear in one chunk, the later one wins
+        // (the emulator applies them in order).
         let mut renderer = TuiRenderer::new(20, 3);
-        renderer.process(b"\x1b[2J"); // force TUI mode
-        assert!(renderer.is_tui_mode());
-        renderer.process(b"\x1b[?2004h");
-        assert!(renderer.bracketed_paste());
-    }
-
-    #[test]
-    fn test_bracketed_paste_tracked_in_streaming_mode() {
-        // A plain shell (the SSH case) stays in streaming mode but can still
-        // enable/disable ?2004 at its prompt. Streaming strips ANSI, so we
-        // detect the toggle before stripping.
-        let mut renderer = TuiRenderer::new(20, 3);
-        assert!(!renderer.is_tui_mode());
-        renderer.process(b"prompt$ \x1b[?2004h");
-        assert!(renderer.bracketed_paste());
-        assert!(!renderer.is_tui_mode(), "must not have entered TUI mode");
-        renderer.process(b"\x1b[?2004l");
-        assert!(!renderer.bracketed_paste());
-        // Both in one chunk: the later one wins.
         renderer.process(b"\x1b[?2004l\x1b[?2004h");
         assert!(renderer.bracketed_paste());
+        renderer.process(b"\x1b[?2004h\x1b[?2004l");
+        assert!(!renderer.bracketed_paste());
     }
 
     #[test]
@@ -2371,7 +2164,6 @@ mod tests {
         // includes row 2 with the cursor visible (rather than getting
         // trimmed away by the trailing-blank-rows trim).
         let mut renderer = TuiRenderer::new(10, 5);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[3;6H"); // row 2, col 5 (1-indexed input)
         let out = renderer.take_pending().unwrap();
         assert!(
@@ -2387,7 +2179,6 @@ mod tests {
         // filled silhouette rather than disappearing into whitespace.
         let mut renderer = TuiRenderer::new(10, 1);
         renderer.set_replace_block_chars(true);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1H\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88");
         let out = renderer.take_pending().unwrap();
         assert!(out.text.contains("###"), "got: {:?}", out.text);
@@ -2399,7 +2190,6 @@ mod tests {
         // the live frame — otherwise scroll-buffer messages still misalign.
         let mut renderer = TuiRenderer::with_scroll_buffer(10, 2, 50);
         renderer.set_replace_block_chars(true);
-        renderer.tui_mode = true;
         renderer.process(b"\xe2\x96\x90\xe2\x96\x9b\r\n"); // "▐▛\r\n"
         renderer.process(b"\xe2\x96\x9c\xe2\x96\x9d\r\n"); // "▜▝\r\n"
         renderer.process(b"\xe2\x96\x9e\r\n"); // "▞\r\n" (one more to push first into buffer)
@@ -2419,7 +2209,6 @@ mod tests {
         // Wider than the row content so put_char doesn't auto-wrap and
         // muddy the scroll math.
         let mut renderer = TuiRenderer::new(5, 3);
-        renderer.tui_mode = true;
         renderer.process(b"\x1b[1;1H111\x1b[2;1H222\x1b[3;1H333");
         renderer.process(b"\x1b[1S"); // scroll up 1
         assert_eq!(row_str(&renderer.screen[0]), "222");
