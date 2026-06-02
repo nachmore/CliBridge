@@ -185,6 +185,7 @@ intercepts slash commands client-side).
 | `--ctrl+<key>` | Send a key with Ctrl, e.g. `--ctrl+c` (SIGINT), `--ctrl+d` (EOF), `--ctrl+z` (suspend), `--ctrl+l` (clear), `--ctrl+\` (SIGQUIT). Shortcuts: `--cc` `--cd` `--cz` `--cl` |
 | `--alt+<key>` / `--shift+<key>` | Send a key with Alt or Shift; combine modifiers, e.g. `--ctrl+alt+del`, `--alt+shift+left` |
 | `--<key>` | Send a named key: `--up` `--down` `--left` `--right`, `--home` `--end`, `--pageup` `--pagedown`, `--insert` `--delete`, `--tab`, `--esc`, `--space`, `--backspace`, `--f1`…`--f12` |
+| `--<key><n>` | Repeat a key `n` times: `--up5` sends five Up presses, `--ctrl+left3` sends Ctrl+Left three times |
 | `--kill` | Kill the shell process |
 | `--restart` / `--new` | (Re)spawn the shell. While alive, asks for confirmation; reply `--new force` to proceed. After exit, plain `--new` works. |
 | `--resize 120x40` | Resize terminal (cols x rows) |

@@ -5,10 +5,17 @@ use crate::types::TerminalSize;
 /// Special commands that can be sent from the messaging platform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpecialCommand {
-    /// Send a key press, optionally with modifiers. Covers all of
-    /// `--ctrl+<key>`, `--alt+<key>`, `--shift+<key>` (and combinations) plus
-    /// bare named keys like `--up`, `--pageup`, `--f5`, `--tab`, `--esc`.
-    Key { key: Key, mods: Modifiers },
+    /// Send a key press, optionally with modifiers, repeated `count` times.
+    /// Covers all of `--ctrl+<key>`, `--alt+<key>`, `--shift+<key>` (and
+    /// combinations) plus bare named keys like `--up`, `--pageup`, `--f5`,
+    /// `--tab`, `--esc`. A trailing number repeats the key: `--up5` sends five
+    /// Up presses, `--ctrl+left3` sends Ctrl+Left three times. `count` is at
+    /// least 1.
+    Key {
+        key: Key,
+        mods: Modifiers,
+        count: u32,
+    },
     /// Kill the shell process
     Kill,
     /// Restart the shell process. The bool `force` distinguishes a plain
@@ -280,10 +287,10 @@ pub fn parse_input(input: &str) -> ParsedInput {
         // Legacy short aliases for the most common control keys. The general
         // --ctrl+<key> form below also handles these, but cc/cd/cz/cl are
         // muscle-memory shortcuts worth keeping.
-        "cc" => ParsedInput::Command(key_cmd(Key::Char('c'), ctrl_mods())),
-        "cd" => ParsedInput::Command(key_cmd(Key::Char('d'), ctrl_mods())),
-        "cz" => ParsedInput::Command(key_cmd(Key::Char('z'), ctrl_mods())),
-        "cl" => ParsedInput::Command(key_cmd(Key::Char('l'), ctrl_mods())),
+        "cc" => ParsedInput::Command(key_cmd(Key::Char('c'), ctrl_mods(), 1)),
+        "cd" => ParsedInput::Command(key_cmd(Key::Char('d'), ctrl_mods(), 1)),
+        "cz" => ParsedInput::Command(key_cmd(Key::Char('z'), ctrl_mods(), 1)),
+        "cl" => ParsedInput::Command(key_cmd(Key::Char('l'), ctrl_mods(), 1)),
         "kill" => ParsedInput::Command(SpecialCommand::Kill),
         "restart" | "new" => {
             let force = matches!(arg, Some(a) if a.eq_ignore_ascii_case("force"));
@@ -356,17 +363,22 @@ pub fn parse_input(input: &str) -> ParsedInput {
             }
         }
         // General key syntax: bare named keys (--up, --pageup, --f5, --tab,
-        // --esc) and modifier combos (--ctrl+c, --alt+shift+left, --ctrl+k).
-        // Tried last so explicit commands above always win.
+        // --esc), modifier combos (--ctrl+c, --alt+shift+left, --ctrl+k), and
+        // repeat counts (--up5, --ctrl+left3). Tried last so explicit commands
+        // above always win.
         other => match parse_key_combo(other) {
-            Some((key, mods)) => ParsedInput::Command(key_cmd(key, mods)),
+            Some((key, mods, count)) => ParsedInput::Command(key_cmd(key, mods, count)),
             None => ParsedInput::Text(input.to_string()),
         },
     }
 }
 
-fn key_cmd(key: Key, mods: Modifiers) -> SpecialCommand {
-    SpecialCommand::Key { key, mods }
+/// Upper bound on a key-repeat count, so a typo like `--up9999999` can't make
+/// us synthesize a huge byte buffer.
+const MAX_KEY_REPEAT: u32 = 1000;
+
+fn key_cmd(key: Key, mods: Modifiers, count: u32) -> SpecialCommand {
+    SpecialCommand::Key { key, mods, count }
 }
 
 fn ctrl_mods() -> Modifiers {
@@ -376,13 +388,14 @@ fn ctrl_mods() -> Modifiers {
     }
 }
 
-/// Parse a key spec like `ctrl+c`, `alt+shift+left`, `pageup`, or `f5` into a
-/// [`Key`] and its [`Modifiers`]. The spec is `+`-separated: every segment but
-/// the last is a modifier, and the last is the key itself. Returns `None` if
-/// any segment is unrecognized, so the caller can fall back to plain text.
+/// Parse a key spec like `ctrl+c`, `alt+shift+left`, `pageup`, `f5`, or
+/// `up5` into a [`Key`], its [`Modifiers`], and a repeat count. The spec is
+/// `+`-separated: every segment but the last is a modifier, and the last is
+/// the key (with an optional trailing repeat count). Returns `None` if any
+/// segment is unrecognized, so the caller can fall back to plain text.
 ///
 /// Input is already lowercased by the caller.
-fn parse_key_combo(spec: &str) -> Option<(Key, Modifiers)> {
+fn parse_key_combo(spec: &str) -> Option<(Key, Modifiers, u32)> {
     // The key is the segment after the last `+` separator — but `+` is also a
     // valid key, so a spec ending in `+` (e.g. `ctrl++`) means the key is
     // literally `+` and everything before the final `+` is the modifier list.
@@ -413,8 +426,37 @@ fn parse_key_combo(spec: &str) -> Option<(Key, Modifiers)> {
         }
     }
 
-    let key = parse_key_name(key_str)?;
-    Some((key, mods))
+    let (key, count) = parse_key_with_count(key_str)?;
+    Some((key, mods, count))
+}
+
+/// Resolve a key token that may carry a trailing repeat count, e.g. `up5`.
+/// The whole token is tried as a key name first, so `f5`/`f12` stay function
+/// keys rather than being read as `f` repeated. Only if that fails do we peel
+/// a trailing digit run as the count (`up5` → Up ×5, `ctrl+left3` → Left ×3).
+/// A count of 0 is rejected; anything above [`MAX_KEY_REPEAT`] is clamped.
+fn parse_key_with_count(token: &str) -> Option<(Key, u32)> {
+    if let Some(key) = parse_key_name(token) {
+        return Some((key, 1));
+    }
+
+    // Trailing ASCII digits are the count; digits are single-byte so the
+    // char count is a valid byte split point.
+    let trailing_digits = token.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    if trailing_digits == 0 {
+        return None;
+    }
+    let split = token.len() - trailing_digits;
+    let (base, num) = token.split_at(split);
+    if base.is_empty() {
+        return None;
+    }
+    let count: u32 = num.parse().ok()?;
+    if count == 0 {
+        return None;
+    }
+    let key = parse_key_name(base)?;
+    Some((key, count.min(MAX_KEY_REPEAT)))
 }
 
 /// Map a key name to a [`Key`]. Single characters become `Key::Char`; longer
@@ -470,7 +512,10 @@ fn parse_size(s: &str) -> Option<TerminalSize> {
 /// Convert a special command to the bytes that should be sent to the terminal.
 pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
     match cmd {
-        SpecialCommand::Key { key, mods } => encode_key(key, *mods),
+        SpecialCommand::Key { key, mods, count } => {
+            let one = encode_key(key, *mods)?;
+            Some(one.repeat((*count).max(1) as usize))
+        }
         SpecialCommand::Enter => Some(vec![b'\r']),
         SpecialCommand::Raw(hex) => hex::decode(hex).ok(),
         SpecialCommand::Slash(name) => {
@@ -507,6 +552,7 @@ pub fn help_text() -> String {
 • `--ctrl+<key>` — Send a key with Ctrl (e.g. `--ctrl+c` interrupt, `--ctrl+d` EOF, `--ctrl+z` suspend, `--ctrl+l` clear, `--ctrl+\` SIGQUIT). Shortcuts: `--cc` `--cd` `--cz` `--cl`.
 • `--alt+<key>` / `--shift+<key>` — Send a key with Alt or Shift. Combine them: `--ctrl+alt+del`, `--alt+shift+left`.
 • `--<key>` — Send a named key on its own: `--up` `--down` `--left` `--right`, `--home` `--end`, `--pageup` `--pagedown`, `--insert` `--delete`, `--tab`, `--esc`, `--space`, `--backspace`, `--f1`…`--f12`.
+• `--<key><n>` — Repeat a key `n` times: `--up5` sends five Up presses, `--ctrl+left3` sends Ctrl+Left three times.
 • `--kill` — Kill the shell process
 • `--restart` / `--new` — (Re)spawn the shell. While a shell is alive, asks for confirmation; reply `--new force` to terminate the current one and start fresh. After the shell has exited, plain `--new` works.
 • `--resize 120x40` — Resize terminal (cols x rows)
@@ -551,6 +597,7 @@ mod tests {
                 ctrl: true,
                 ..Modifiers::none()
             },
+            count: 1,
         };
         assert_eq!(parse_input("--ctrl+c"), ParsedInput::Command(ctrl_c.clone()));
         // Legacy short alias still works.
@@ -570,7 +617,8 @@ mod tests {
                     alt: true,
                     shift: true,
                     ..Modifiers::none()
-                }
+                },
+                count: 1,
             })
         );
         // Bare named key, no modifiers.
@@ -578,7 +626,8 @@ mod tests {
             parse_input("--pageup"),
             ParsedInput::Command(SpecialCommand::Key {
                 key: Key::PageUp,
-                mods: Modifiers::none()
+                mods: Modifiers::none(),
+                count: 1,
             })
         );
         // Function key.
@@ -586,7 +635,8 @@ mod tests {
             parse_input("--f5"),
             ParsedInput::Command(SpecialCommand::Key {
                 key: Key::F(5),
-                mods: Modifiers::none()
+                mods: Modifiers::none(),
+                count: 1,
             })
         );
         // Arrow keys still parse.
@@ -594,7 +644,8 @@ mod tests {
             parse_input("--up"),
             ParsedInput::Command(SpecialCommand::Key {
                 key: Key::Up,
-                mods: Modifiers::none()
+                mods: Modifiers::none(),
+                count: 1,
             })
         );
         // tab/esc as named keys.
@@ -602,7 +653,8 @@ mod tests {
             parse_input("--tab"),
             ParsedInput::Command(SpecialCommand::Key {
                 key: Key::Tab,
-                mods: Modifiers::none()
+                mods: Modifiers::none(),
+                count: 1,
             })
         );
         // ctrl++ → the literal '+' key with ctrl.
@@ -613,7 +665,8 @@ mod tests {
                 mods: Modifiers {
                     ctrl: true,
                     ..Modifiers::none()
-                }
+                },
+                count: 1,
             })
         );
     }
@@ -740,7 +793,8 @@ mod tests {
                 mods: Modifiers {
                     ctrl: true,
                     ..Modifiers::none()
-                }
+                },
+                count: 1,
             }),
             Some(vec![0x03])
         );
@@ -751,9 +805,66 @@ mod tests {
         assert_eq!(
             command_to_bytes(&SpecialCommand::Key {
                 key: Key::Up,
-                mods: Modifiers::none()
+                mods: Modifiers::none(),
+                count: 1,
             }),
             Some(b"\x1b[A".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_parse_repeat_counts() {
+        // --up5 → Up repeated 5 times.
+        assert_eq!(
+            parse_input("--up5"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::Up,
+                mods: Modifiers::none(),
+                count: 5,
+            })
+        );
+        // Modifier + repeat: --ctrl+left3.
+        assert_eq!(
+            parse_input("--ctrl+left3"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::Left,
+                mods: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::none()
+                },
+                count: 3,
+            })
+        );
+        // f5 stays a function key (not "f" times 5).
+        assert_eq!(
+            parse_input("--f5"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::F(5),
+                mods: Modifiers::none(),
+                count: 1,
+            })
+        );
+        // count is clamped to MAX_KEY_REPEAT.
+        assert_eq!(
+            parse_input("--down99999"),
+            ParsedInput::Command(SpecialCommand::Key {
+                key: Key::Down,
+                mods: Modifiers::none(),
+                count: MAX_KEY_REPEAT,
+            })
+        );
+    }
+
+    #[test]
+    fn test_command_to_bytes_repeated_arrow() {
+        // --up3 emits the Up sequence three times back-to-back.
+        assert_eq!(
+            command_to_bytes(&SpecialCommand::Key {
+                key: Key::Up,
+                mods: Modifiers::none(),
+                count: 3,
+            }),
+            Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
         );
     }
 
