@@ -215,7 +215,59 @@ struct RawModeGuard;
 impl RawModeGuard {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
+        // On Windows, raw mode alone doesn't make special keys (Esc, Ctrl,
+        // Alt, PgUp/PgDn, arrows) arrive on stdin — they're delivered as
+        // console KEY_EVENT records that a plain read() never sees. Enabling
+        // virtual-terminal input makes the console encode them as VT escape
+        // sequences, which then flow through our byte-oriented read loop
+        // unchanged, exactly like a Unix terminal. No-op on other platforms.
+        platform::enable_vt_input().context("enable virtual terminal input")?;
         Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use anyhow::{Result, bail};
+    use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+    use winapi::um::processenv::GetStdHandle;
+    use winapi::um::winbase::STD_INPUT_HANDLE;
+    use winapi::um::wincon::ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+    /// Add ENABLE_VIRTUAL_TERMINAL_INPUT to the console input mode so special
+    /// keys are translated to VT escape sequences on stdin. We deliberately
+    /// don't restore the previous mode: the attach client owns its terminal
+    /// window for the whole process lifetime, and the window is torn down when
+    /// the session ends, so there's nothing to restore into.
+    pub(super) fn enable_vt_input() -> Result<()> {
+        // SAFETY: standard Win32 console calls. GetStdHandle returns a handle
+        // owned by the process (not to be closed); we only read and re-set the
+        // console mode bits on it.
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            if handle.is_null() || handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                bail!("GetStdHandle(STD_INPUT_HANDLE) returned an invalid handle");
+            }
+            let mut mode: u32 = 0;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                bail!("GetConsoleMode failed: {}", std::io::Error::last_os_error());
+            }
+            if SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_INPUT) == 0 {
+                bail!("SetConsoleMode failed: {}", std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+mod platform {
+    use anyhow::Result;
+
+    /// On Unix terminals special keys already arrive as VT escape sequences,
+    /// so there's nothing to toggle.
+    pub(super) fn enable_vt_input() -> Result<()> {
+        Ok(())
     }
 }
 

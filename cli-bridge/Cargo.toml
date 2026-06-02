@@ -21,3 +21,6 @@ dirs.workspace = true
 crossterm.workspace = true
 rand.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi.workspace = true

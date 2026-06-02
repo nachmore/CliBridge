@@ -41,6 +41,10 @@ crossterm = "0.29"
 # Cryptographically-strong RNG for the per-session attach token
 rand = "0.9"
 
+# Win32 console API: toggling ENABLE_VIRTUAL_TERMINAL_INPUT so the attach
+# client's stdin reads receive special keys as VT escape sequences.
+winapi = { version = "0.3", features = ["consoleapi", "processenv", "winbase", "wincon"] }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
