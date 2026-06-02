@@ -679,32 +679,31 @@ async fn handle_slack_message(
     let parsed = parse_input(&msg.text);
     match parsed {
         ParsedInput::Text(text) => {
-            // Wrap pasted text in bracketed-paste markers, then send a
-            // bare CR *outside* the brackets. Why:
-            // - Modern TUI editors (Claude Code, helix, kitty's repl,
-            //   etc.) enable bracketed paste mode (CSI ?2004h) and
-            //   leave it on for the lifetime of the session. In that
-            //   mode, terminals deliver pasted content surrounded by
-            //   \x1b[200~ ... \x1b[201~ and the editor inserts that
-            //   content into its buffer *without* interpreting any
-            //   embedded \r as "submit".
-            // - So if we just append \r to the text, the editor sees
-            //   it as paste-content CR (visible as Ctrl-M in some
-            //   editors) — Claude Code captures the line into its
-            //   buffer but never submits it. Symptom: "I sent the
-            //   message but Claude didn't respond until I hit Enter."
-            // - Sending the CR *after* \x1b[201~ takes the editor out
-            //   of paste mode first, then the CR is interpreted as
-            //   Enter and the line submits.
-            //
-            // For shells that haven't enabled ?2004h (cmd, plain bash),
-            // these markers are silently ignored — they show up as
-            // unknown CSI escapes and get dropped. So this is safe to
-            // do unconditionally.
+            // Only wrap in bracketed-paste markers when the foreground app has
+            // actually enabled the mode (\x1b[?2004h). Why this is conditional:
+            // - Modern TUI editors (Claude Code, helix, kitty's repl, etc.)
+            //   enable bracketed paste and, in that mode, deliver pasted
+            //   content surrounded by \x1b[200~ ... \x1b[201~ and insert it
+            //   *without* interpreting an embedded \r as "submit". So we wrap
+            //   the text and send a bare CR *outside* the brackets — the
+            //   \x1b[201~ takes the editor out of paste mode first, then the
+            //   CR submits. Without this, Claude Code captures the line but
+            //   never submits it until the user hits Enter.
+            // - But a plain interactive shell that has NOT enabled ?2004h does
+            //   NOT silently ignore these markers (an earlier assumption that
+            //   caused a bug): its line editor parses the stray \x1b[200~ /
+            //   \x1b[201~ bytes as keystrokes — e.g. zsh ZLE leaves a literal
+            //   `1~` behind and ESC-prefixed bytes hit Meta bindings, mangling
+            //   the command (`ls -l` arriving as `ls -L`, `tel` as `tel1~`).
+            //   So when paste mode is off we send the raw text + CR.
             let mut bytes = Vec::with_capacity(text.len() + 13);
-            bytes.extend_from_slice(b"\x1b[200~");
-            bytes.extend_from_slice(text.as_bytes());
-            bytes.extend_from_slice(b"\x1b[201~");
+            if renderer.bracketed_paste() {
+                bytes.extend_from_slice(b"\x1b[200~");
+                bytes.extend_from_slice(text.as_bytes());
+                bytes.extend_from_slice(b"\x1b[201~");
+            } else {
+                bytes.extend_from_slice(text.as_bytes());
+            }
             bytes.push(b'\r');
             if input_tx.send(bytes).await.is_err() {
                 error!("PTY input channel closed");

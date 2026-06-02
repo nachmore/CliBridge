@@ -125,6 +125,16 @@ pub struct TuiRenderer {
     /// so when this is `false` we suppress the cursor regardless of
     /// `show_cursor`. Default: true.
     cursor_visible: bool,
+    /// Bracketed-paste mode (`\x1b[?2004h` enable / `\x1b[?2004l` disable).
+    /// Modern TUI line editors (Claude Code, helix, fish, zsh's ZLE under
+    /// some configs) turn this on so a multi-line paste is inserted as one
+    /// literal block instead of each newline submitting. The bridge uses this
+    /// to decide whether to wrap Slack input in `\x1b[200~…\x1b[201~` markers:
+    /// only when the foreground app actually requested the mode. A plain
+    /// interactive shell that hasn't enabled it would otherwise parse the
+    /// stray marker bytes as keystrokes (e.g. zsh ZLE turning `\x1b[201~`
+    /// into a literal `1~` and ESC-prefixed Meta bindings). Default: false.
+    bracketed_paste: bool,
 }
 
 impl TuiRenderer {
@@ -156,6 +166,7 @@ impl TuiRenderer {
             replace_block_chars: false,
             show_cursor: true,
             cursor_visible: true,
+            bracketed_paste: false,
         }
     }
 
@@ -349,6 +360,14 @@ impl TuiRenderer {
         self.tui_mode
     }
 
+    /// Whether the foreground app has enabled bracketed-paste mode
+    /// (`\x1b[?2004h`). The bridge wraps Slack text input in
+    /// `\x1b[200~…\x1b[201~` markers only when this is true; a plain shell
+    /// that hasn't enabled it would mis-parse the marker bytes as keystrokes.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
     fn is_tui_output(text: &str) -> bool {
         // Indicators a full-screen app is taking over the terminal:
         //  - \x1b[?1049h / ?47h: alternate screen buffer (vim, htop, less, tmux)
@@ -447,6 +466,19 @@ impl TuiRenderer {
     }
 
     fn process_streaming(&mut self, text: &str) {
+        // Track bracketed-paste toggles even in streaming mode: a plain shell
+        // (zsh ZLE, fish, …) can enable ?2004 at its prompt without ever
+        // entering TUI mode, and the bridge needs to know so it wraps Slack
+        // input correctly. strip_ansi drops the sequence, so detect it first.
+        // If both appear in one chunk, the later one wins.
+        let enable = text.rfind("\x1b[?2004h");
+        let disable = text.rfind("\x1b[?2004l");
+        match (enable, disable) {
+            (Some(e), Some(d)) => self.bracketed_paste = e > d,
+            (Some(_), None) => self.bracketed_paste = true,
+            (None, Some(_)) => self.bracketed_paste = false,
+            (None, None) => {}
+        }
         // Strip ANSI escape sequences for streaming mode
         let clean = strip_ansi(text);
         self.line_buffer.push_str(&clean);
@@ -704,8 +736,13 @@ impl TuiRenderer {
                 if params.starts_with('?') {
                     let show = cmd == 'h';
                     for &n in &nums {
-                        if n == 25 {
-                            self.cursor_visible = show;
+                        match n {
+                            25 => self.cursor_visible = show,
+                            // Bracketed paste: track so the bridge only wraps
+                            // Slack input in paste markers when the app asked
+                            // for the mode.
+                            2004 => self.bracketed_paste = show,
+                            _ => {}
                         }
                     }
                 }
@@ -2184,6 +2221,47 @@ mod tests {
         renderer.process(b"\x1b[?25l\x1b[1;1Habc\x1b[?25h");
         let out = renderer.take_pending().unwrap();
         assert!(out.text.contains('\u{2588}'), "got: {:?}", out.text);
+    }
+
+    #[test]
+    fn test_bracketed_paste_tracking() {
+        let mut renderer = TuiRenderer::new(20, 3);
+        // Off by default.
+        assert!(!renderer.bracketed_paste());
+        // App enables it (\x1b[?2004h).
+        renderer.process(b"\x1b[?2004h");
+        assert!(renderer.bracketed_paste());
+        // App disables it (\x1b[?2004l).
+        renderer.process(b"\x1b[?2004l");
+        assert!(!renderer.bracketed_paste());
+    }
+
+    #[test]
+    fn test_bracketed_paste_tracked_in_tui_mode() {
+        // The same toggle must be honored once we're in TUI mode (the CSI
+        // goes through the TUI parser path, not just streaming).
+        let mut renderer = TuiRenderer::new(20, 3);
+        renderer.process(b"\x1b[2J"); // force TUI mode
+        assert!(renderer.is_tui_mode());
+        renderer.process(b"\x1b[?2004h");
+        assert!(renderer.bracketed_paste());
+    }
+
+    #[test]
+    fn test_bracketed_paste_tracked_in_streaming_mode() {
+        // A plain shell (the SSH case) stays in streaming mode but can still
+        // enable/disable ?2004 at its prompt. Streaming strips ANSI, so we
+        // detect the toggle before stripping.
+        let mut renderer = TuiRenderer::new(20, 3);
+        assert!(!renderer.is_tui_mode());
+        renderer.process(b"prompt$ \x1b[?2004h");
+        assert!(renderer.bracketed_paste());
+        assert!(!renderer.is_tui_mode(), "must not have entered TUI mode");
+        renderer.process(b"\x1b[?2004l");
+        assert!(!renderer.bracketed_paste());
+        // Both in one chunk: the later one wins.
+        renderer.process(b"\x1b[?2004l\x1b[?2004h");
+        assert!(renderer.bracketed_paste());
     }
 
     #[test]
