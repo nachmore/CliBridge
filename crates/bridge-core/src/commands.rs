@@ -71,6 +71,219 @@ pub enum ArrowDirection {
     Right,
 }
 
+/// A single keyboard key, independent of modifiers. This is the unit that
+/// [`encode_key`] turns into the bytes a terminal would emit when the key is
+/// pressed. `Char` covers ordinary printable keys; the rest are the named
+/// keys that have dedicated escape sequences.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Key {
+    Char(char),
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    Tab,
+    Escape,
+    Enter,
+    Space,
+    Backspace,
+    /// Function key F1–F12.
+    F(u8),
+}
+
+impl From<&ArrowDirection> for Key {
+    fn from(dir: &ArrowDirection) -> Self {
+        match dir {
+            ArrowDirection::Up => Key::Up,
+            ArrowDirection::Down => Key::Down,
+            ArrowDirection::Left => Key::Left,
+            ArrowDirection::Right => Key::Right,
+        }
+    }
+}
+
+/// Keyboard modifiers that can accompany a [`Key`]. `none()` means an
+/// unmodified press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Modifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+impl Modifiers {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    fn is_none(self) -> bool {
+        !self.ctrl && !self.alt && !self.shift
+    }
+
+    /// The xterm modifier parameter used in CSI sequences like `\x1b[1;5A`
+    /// (Ctrl+Up). Encoded as 1 + shift(1) + alt(2) + ctrl(4).
+    fn csi_param(self) -> u8 {
+        1 + (self.shift as u8) + ((self.alt as u8) << 1) + ((self.ctrl as u8) << 2)
+    }
+}
+
+/// Encode a key press (with optional modifiers) into the byte sequence a
+/// terminal emits for it. Returns `None` when the combination has no
+/// meaningful encoding (e.g. Ctrl with a key that has no control code).
+///
+/// Named keys use standard xterm sequences; with modifiers they take the
+/// parametrized CSI form (`\x1b[1;<m>A` for cursor/F1–F4-style keys, and
+/// `\x1b[<n>;<m>~` for tilde keys like PageUp). `Char` keys map Ctrl to the
+/// usual C0 control byte and Alt to an ESC prefix.
+pub fn encode_key(key: &Key, mods: Modifiers) -> Option<Vec<u8>> {
+    match key {
+        Key::Char(c) => encode_char(*c, mods),
+        _ => encode_named(key, mods),
+    }
+}
+
+fn encode_char(c: char, mods: Modifiers) -> Option<Vec<u8>> {
+    // Shift on a letter just selects the uppercase form; for other glyphs the
+    // typed character already reflects shift, so this is a no-op there.
+    let c = if mods.shift { shift_char(c) } else { c };
+
+    let mut bytes = if mods.ctrl {
+        vec![ctrl_byte(c)?]
+    } else {
+        let mut buf = [0u8; 4];
+        c.encode_utf8(&mut buf).as_bytes().to_vec()
+    };
+
+    // Alt/Meta is the ESC prefix on the resulting byte(s).
+    if mods.alt {
+        bytes.insert(0, 0x1b);
+    }
+    Some(bytes)
+}
+
+/// Map a character to its C0 control byte (Ctrl+key). Covers `@A–Z[\]^_`
+/// (0x40–0x5f → 0x00–0x1f), plus Space (NUL) and `?` (DEL). Returns `None`
+/// for characters that have no control encoding.
+fn ctrl_byte(c: char) -> Option<u8> {
+    let up = c.to_ascii_uppercase();
+    match up {
+        '@'..='_' => Some((up as u8) & 0x1f),
+        ' ' => Some(0x00),
+        '?' => Some(0x7f),
+        _ => None,
+    }
+}
+
+fn shift_char(c: char) -> char {
+    if c.is_ascii_alphabetic() {
+        c.to_ascii_uppercase()
+    } else {
+        c
+    }
+}
+
+fn encode_named(key: &Key, mods: Modifiers) -> Option<Vec<u8>> {
+    // Single-byte keys whose modifier behavior is special-cased.
+    match key {
+        Key::Tab => {
+            // Shift+Tab is back-tab (CSI Z); otherwise HT, with optional ESC
+            // prefix for Alt.
+            if mods.shift {
+                return Some(b"\x1b[Z".to_vec());
+            }
+            return Some(alt_prefixed(vec![0x09], mods));
+        }
+        Key::Enter => return Some(alt_prefixed(vec![0x0d], mods)),
+        Key::Escape => return Some(alt_prefixed(vec![0x1b], mods)),
+        Key::Backspace => {
+            let b = if mods.ctrl { 0x08 } else { 0x7f };
+            return Some(alt_prefixed(vec![b], mods));
+        }
+        Key::Space => return encode_char(' ', mods),
+        _ => {}
+    }
+
+    // CSI keys: either a final-letter form (cursor + F1–F4) or a numeric
+    // tilde form (PageUp/Down, Insert, Delete, F5+).
+    let csi = match key {
+        Key::Up => Csi::Letter(b'A'),
+        Key::Down => Csi::Letter(b'B'),
+        Key::Right => Csi::Letter(b'C'),
+        Key::Left => Csi::Letter(b'D'),
+        Key::Home => Csi::Letter(b'H'),
+        Key::End => Csi::Letter(b'F'),
+        Key::PageUp => Csi::Tilde(5),
+        Key::PageDown => Csi::Tilde(6),
+        Key::Insert => Csi::Tilde(2),
+        Key::Delete => Csi::Tilde(3),
+        Key::F(n) => match n {
+            1 => Csi::Ss3(b'P'),
+            2 => Csi::Ss3(b'Q'),
+            3 => Csi::Ss3(b'R'),
+            4 => Csi::Ss3(b'S'),
+            5 => Csi::Tilde(15),
+            6 => Csi::Tilde(17),
+            7 => Csi::Tilde(18),
+            8 => Csi::Tilde(19),
+            9 => Csi::Tilde(20),
+            10 => Csi::Tilde(21),
+            11 => Csi::Tilde(23),
+            12 => Csi::Tilde(24),
+            _ => return None,
+        },
+        // Char and the single-byte keys above are handled elsewhere.
+        Key::Char(_)
+        | Key::Tab
+        | Key::Enter
+        | Key::Escape
+        | Key::Backspace
+        | Key::Space => return None,
+    };
+    Some(csi.encode(mods))
+}
+
+/// Prepend the ESC byte when Alt is held; otherwise return bytes unchanged.
+fn alt_prefixed(mut bytes: Vec<u8>, mods: Modifiers) -> Vec<u8> {
+    if mods.alt {
+        bytes.insert(0, 0x1b);
+    }
+    bytes
+}
+
+/// The CSI shape of a named key, used to build both the plain and
+/// modifier-parametrized escape sequences.
+enum Csi {
+    /// `\x1b[<final>` plain, `\x1b[1;<m><final>` with modifiers.
+    Letter(u8),
+    /// SS3 form `\x1bO<final>` plain (F1–F4), `\x1b[1;<m><final>` with mods.
+    Ss3(u8),
+    /// `\x1b[<n>~` plain, `\x1b[<n>;<m>~` with modifiers.
+    Tilde(u8),
+}
+
+impl Csi {
+    fn encode(&self, mods: Modifiers) -> Vec<u8> {
+        let m = mods.csi_param();
+        match self {
+            Csi::Letter(fin) | Csi::Ss3(fin) if mods.is_none() => match self {
+                Csi::Ss3(_) => vec![0x1b, b'O', *fin],
+                _ => vec![0x1b, b'[', *fin],
+            },
+            Csi::Letter(fin) | Csi::Ss3(fin) => {
+                format!("\x1b[1;{m}{}", *fin as char).into_bytes()
+            }
+            Csi::Tilde(n) if mods.is_none() => format!("\x1b[{n}~").into_bytes(),
+            Csi::Tilde(n) => format!("\x1b[{n};{m}~").into_bytes(),
+        }
+    }
+}
+
 /// Result of parsing user input from the messaging platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedInput {
@@ -194,24 +407,17 @@ fn parse_size(s: &str) -> Option<TerminalSize> {
 
 /// Convert a special command to the bytes that should be sent to the terminal.
 pub fn command_to_bytes(cmd: &SpecialCommand) -> Option<Vec<u8>> {
+    let ctrl = |c: char| encode_key(&Key::Char(c), Modifiers { ctrl: true, ..Modifiers::none() });
     match cmd {
-        SpecialCommand::CtrlC => Some(vec![0x03]),
-        SpecialCommand::CtrlD => Some(vec![0x04]),
-        SpecialCommand::CtrlZ => Some(vec![0x1A]),
-        SpecialCommand::CtrlL => Some(vec![0x0C]),
-        SpecialCommand::CtrlBackslash => Some(vec![0x1C]),
-        SpecialCommand::Tab => Some(vec![0x09]),
-        SpecialCommand::Escape => Some(vec![0x1B]),
+        SpecialCommand::CtrlC => ctrl('c'),
+        SpecialCommand::CtrlD => ctrl('d'),
+        SpecialCommand::CtrlZ => ctrl('z'),
+        SpecialCommand::CtrlL => ctrl('l'),
+        SpecialCommand::CtrlBackslash => ctrl('\\'),
+        SpecialCommand::Tab => encode_key(&Key::Tab, Modifiers::none()),
+        SpecialCommand::Escape => encode_key(&Key::Escape, Modifiers::none()),
         SpecialCommand::Enter => Some(vec![b'\r']),
-        SpecialCommand::Arrow(dir) => {
-            let seq = match dir {
-                ArrowDirection::Up => b"\x1b[A".to_vec(),
-                ArrowDirection::Down => b"\x1b[B".to_vec(),
-                ArrowDirection::Right => b"\x1b[C".to_vec(),
-                ArrowDirection::Left => b"\x1b[D".to_vec(),
-            };
-            Some(seq)
-        }
+        SpecialCommand::Arrow(dir) => encode_key(&Key::from(dir), Modifiers::none()),
         SpecialCommand::Raw(hex) => hex::decode(hex).ok(),
         SpecialCommand::Slash(name) => {
             // Build "/<name>\r". CR submits the line in ConPTY (cmd / PowerShell
@@ -508,6 +714,117 @@ mod tests {
         assert_eq!(
             parse_input("--new please"),
             ParsedInput::Command(SpecialCommand::Restart { force: false })
+        );
+    }
+
+    #[test]
+    fn test_encode_key_plain_char() {
+        assert_eq!(
+            encode_key(&Key::Char('a'), Modifiers::none()),
+            Some(b"a".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_encode_key_ctrl_letters() {
+        // Ctrl+C/D/Z/L/\ match the legacy hardcoded control bytes.
+        assert_eq!(
+            encode_key(&Key::Char('c'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            Some(vec![0x03])
+        );
+        assert_eq!(
+            encode_key(&Key::Char('d'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            Some(vec![0x04])
+        );
+        assert_eq!(
+            encode_key(&Key::Char('z'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            Some(vec![0x1a])
+        );
+        assert_eq!(
+            encode_key(&Key::Char('l'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            Some(vec![0x0c])
+        );
+        assert_eq!(
+            encode_key(&Key::Char('\\'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            Some(vec![0x1c])
+        );
+        // Ctrl is case-insensitive on letters.
+        assert_eq!(
+            encode_key(&Key::Char('C'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            Some(vec![0x03])
+        );
+    }
+
+    #[test]
+    fn test_encode_key_alt_char_is_esc_prefixed() {
+        assert_eq!(
+            encode_key(&Key::Char('a'), Modifiers { alt: true, ..Modifiers::none() }),
+            Some(vec![0x1b, b'a'])
+        );
+    }
+
+    #[test]
+    fn test_encode_key_arrows_plain() {
+        assert_eq!(encode_key(&Key::Up, Modifiers::none()), Some(b"\x1b[A".to_vec()));
+        assert_eq!(encode_key(&Key::Down, Modifiers::none()), Some(b"\x1b[B".to_vec()));
+        assert_eq!(encode_key(&Key::Right, Modifiers::none()), Some(b"\x1b[C".to_vec()));
+        assert_eq!(encode_key(&Key::Left, Modifiers::none()), Some(b"\x1b[D".to_vec()));
+    }
+
+    #[test]
+    fn test_encode_key_arrows_with_modifiers() {
+        // Ctrl+Up → CSI 1;5 A
+        assert_eq!(
+            encode_key(&Key::Up, Modifiers { ctrl: true, ..Modifiers::none() }),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+        // Shift+Right → CSI 1;2 C
+        assert_eq!(
+            encode_key(&Key::Right, Modifiers { shift: true, ..Modifiers::none() }),
+            Some(b"\x1b[1;2C".to_vec())
+        );
+        // Ctrl+Alt+Left → 1 + alt(2) + ctrl(4) = 7
+        assert_eq!(
+            encode_key(&Key::Left, Modifiers { ctrl: true, alt: true, ..Modifiers::none() }),
+            Some(b"\x1b[1;7D".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_encode_key_tilde_keys() {
+        assert_eq!(encode_key(&Key::PageUp, Modifiers::none()), Some(b"\x1b[5~".to_vec()));
+        assert_eq!(encode_key(&Key::PageDown, Modifiers::none()), Some(b"\x1b[6~".to_vec()));
+        assert_eq!(encode_key(&Key::Delete, Modifiers::none()), Some(b"\x1b[3~".to_vec()));
+        // Ctrl+PageUp → CSI 5;5 ~
+        assert_eq!(
+            encode_key(&Key::PageUp, Modifiers { ctrl: true, ..Modifiers::none() }),
+            Some(b"\x1b[5;5~".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_encode_key_function_keys() {
+        assert_eq!(encode_key(&Key::F(1), Modifiers::none()), Some(b"\x1bOP".to_vec()));
+        assert_eq!(encode_key(&Key::F(5), Modifiers::none()), Some(b"\x1b[15~".to_vec()));
+        assert_eq!(encode_key(&Key::F(12), Modifiers::none()), Some(b"\x1b[24~".to_vec()));
+        assert_eq!(encode_key(&Key::F(13), Modifiers::none()), None);
+    }
+
+    #[test]
+    fn test_encode_key_shift_tab_is_backtab() {
+        assert_eq!(
+            encode_key(&Key::Tab, Modifiers { shift: true, ..Modifiers::none() }),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(encode_key(&Key::Tab, Modifiers::none()), Some(vec![0x09]));
+    }
+
+    #[test]
+    fn test_encode_key_ctrl_on_plain_digit_is_none() {
+        // Ctrl+1 has no control code.
+        assert_eq!(
+            encode_key(&Key::Char('1'), Modifiers { ctrl: true, ..Modifiers::none() }),
+            None
         );
     }
 
