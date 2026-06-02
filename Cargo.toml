@@ -13,7 +13,18 @@ repository = "https://github.com/nachmore/CliBridge"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "cookies"] }
+# rustls (not the default native-tls) so the binary doesn't dynamically link
+# the build host's OpenSSL. Native-tls links libssl.so.3, which a Ubuntu CI
+# build then can't load on distros shipping a different OpenSSL (e.g. Amazon
+# Linux 2 has no libssl.so.3). rustls is pure-Rust and statically linked, so
+# one Linux binary runs everywhere.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "cookies",
+    "rustls-tls",
+    "charset",
+    "http2",
+] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
