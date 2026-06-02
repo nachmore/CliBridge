@@ -3,17 +3,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use bridge_auth::CredentialStore;
 use bridge_core::commands::{
     ParsedInput, SpecialCommand, command_to_bytes, help_text, parse_input,
 };
+use bridge_core::dispatch::{self, DispatchHandle, LiveFrame};
 use bridge_core::messaging::MessagingClient;
 use bridge_core::terminal::TerminalBackend;
 use bridge_core::types::{IncomingMessage, TerminalSize};
 use bridge_pty::PtyBackend;
-use bridge_slack::{RenderedOutput, SlackClient, TuiRenderer};
+use bridge_slack::{SlackClient, SlackTranscriptFormat, TuiRenderer};
 
 use crate::attach::{AttachEvent, AttachServer, open_attach_terminal, print_manual_attach_hint};
 use crate::settings;
@@ -32,37 +33,6 @@ const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(2);
 /// for a beat after the child is reaped). After this elapses, we break
 /// out and tear down.
 const SHELL_EXIT_GRACE: Duration = Duration::from_millis(500);
-
-/// Per-message size budget. Slack has *two* relevant ceilings:
-///
-/// 1. **API hard cap (`chat.update` `msg_too_long`):** ~4,000 UTF-16
-///    code units. Above this Slack rejects the call.
-/// 2. **Client rendering cap (~3,000 chars):** Slack's desktop/web
-///    client renders the tail of any `text` field above ~3,000 chars
-///    as a collapsed "Show more" attachment, which displays as a
-///    *separate* stacked bubble. The API succeeds, but the user sees
-///    one logical message rendered as two — breaking our fenced-code
-///    formatting because the closing ``` lands in the second bubble.
-///
-/// We target a ceiling well under (2) so each bridge message is
-/// guaranteed to render as a single bubble. Headroom for labels/
-/// headers (📜 *Scroll buffer* etc.) and a margin against UTF-16 width
-/// surprises.
-///
-/// Always measure with [`slack_text_size`] when comparing against this
-/// constant — emoji like 📜 / 🟢 / 🌉 are each one Rust `char` but
-/// two UTF-16 units, and an earlier `chars().count()` check let
-/// emoji-heavy bodies sneak past, after which the edit silently got
-/// truncated mid-content with no closing fence.
-const SLACK_MESSAGE_CHAR_LIMIT: usize = 2_800;
-
-/// Count UTF-16 code units in a string — the unit Slack actually uses
-/// for its `msg_too_long` check. For ASCII this is identical to byte
-/// count and to `chars().count()`; for emoji on the supplementary plane
-/// (📜, 🟢, 🌉, …) each `char` becomes two units.
-fn slack_text_size(s: &str) -> usize {
-    s.encode_utf16().count()
-}
 
 /// Reason a shell session ended. The outer run loop uses this to decide
 /// whether to spawn a new session, ask the user, or quit entirely.
@@ -159,6 +129,11 @@ pub async fn run(
     // Resubscribing is expensive (full channel re-poll); keeping it open means
     // `--new` from Slack always works even between sessions.
     let mut message_rx = slack.subscribe(channel).await?;
+
+    // Done mutating the client. Wrap it in an Arc so each session's async
+    // dispatch task can share it (the dispatcher posts to Slack off the hot
+    // path; see bridge_core::dispatch).
+    let slack = std::sync::Arc::new(slack);
 
     // If --pty-log was given, open it once for the whole bridge run. Each
     // session appends. Truncates on open so each cli-bridge invocation
@@ -293,7 +268,7 @@ fn build_title_frame(title: &str) -> Arc<Vec<u8>> {
 /// between PTY, Slack, and attach clients until the session ends.
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
-    slack: &SlackClient,
+    slack: &std::sync::Arc<SlackClient>,
     message_rx: &mut mpsc::Receiver<IncomingMessage>,
     channel: &str,
     shell: &str,
@@ -365,27 +340,28 @@ async fn run_session(
         anchor_refresh,
         name: name.clone(),
     };
-    let mut current_message_id: Option<String> = None;
-    // The last body we posted/edited as the live message. Used to skip
-    // wasteful identical edits — the renderer now always produces a
-    // frame each tick (so we don't miss frames where the live screen
-    // changed while no `process` call ran), but we only actually call
-    // chat.update when the rendered text differs from this.
-    let mut last_live_body: Option<String> = None;
-    // Two-level scroll buffer: an "active" 📜 Scroll buffer message we extend
-    // each tick by editing in place, plus an implicit collection of
-    // already-locked 📚 History messages above it (those we never touch
-    // again). When the active fills up we relabel it as History and start
-    // a fresh active. See `extend_or_lock_active` for the policy.
-    let mut active_scroll_buffer: Option<ActiveScrollBuffer> = None;
+    // Async Slack dispatch. All posting (live frame + the two-level scroll
+    // buffer / history machinery) runs on a dedicated task fed over a bounded
+    // channel, so the session loop never blocks on Slack's rate-limited
+    // network calls — keeping PTY output and keystroke forwarding snappy. See
+    // bridge_core::dispatch for the design.
+    let dispatch = dispatch::spawn(
+        channel.to_string(),
+        slack.clone(),
+        Box::new(SlackTranscriptFormat),
+    );
     let mut tick = tokio::time::interval(RENDER_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Counter for the live-message re-anchor feature: every N inbound Slack
-    // messages, drop current_message_id so the next TUI frame posts a NEW
+    // messages, anchor the transcript so the next TUI frame posts a NEW
     // message instead of editing the old one. This keeps the live frame
     // visible near the bottom of the channel as the user types. 0 disables.
     let mut messages_since_anchor: u32 = 0;
+    // Whether we've posted any live frame yet this session. Tracks the
+    // anchor-refresh "is_some()" gate the inline posting used to derive from
+    // current_message_id (which now lives in the dispatcher task).
+    let mut posted_live_frame = false;
 
     // Split the attach server so we can both forward output and drain events.
     // Both `attach` and `attach_output` need to be droppable so that all
@@ -450,13 +426,6 @@ async fn run_session(
                 let _ = attach_output.take();
                 // Kill the PTY child so the shell doesn't outlive us.
                 let _ = pty.kill();
-                // Best-effort post any pending output (scroll buffer + live
-                // frame) to Slack within the shutdown budget.
-                let _ = tokio::time::timeout(
-                    SHUTDOWN_POST_TIMEOUT,
-                    drain_and_post(slack, channel, &mut renderer, &mut current_message_id, &mut active_scroll_buffer, &mut last_live_body),
-                )
-                .await;
                 break SessionEnd::Interrupted;
             }
 
@@ -465,7 +434,6 @@ async fn run_session(
                 info!("Shell exit grace elapsed, tearing down session");
                 let _ = attach.take();
                 let _ = attach_output.take();
-                drain_and_post(slack, channel, &mut renderer, &mut current_message_id, &mut active_scroll_buffer, &mut last_live_body).await;
                 break SessionEnd::ShellExited;
             }
 
@@ -505,12 +473,9 @@ async fn run_session(
                     None => {
                         info!("Shell output channel closed (shell exited)");
                         // Drop both broadcast senders so client tasks see
-                        // RecvError::Closed and write Goodbye immediately —
-                        // before we block on the trailing Slack post.
+                        // RecvError::Closed and write Goodbye immediately.
                         let _ = attach.take();
                         let _ = attach_output.take();
-
-                        drain_and_post(slack, channel, &mut renderer, &mut current_message_id, &mut active_scroll_buffer, &mut last_live_body).await;
                         break SessionEnd::ShellExited;
                     }
                 }
@@ -534,9 +499,23 @@ async fn run_session(
                 }
             }
 
-            // Drain pending scroll buffer + live frame and post.
+            // Hand a fresh snapshot (scrolled-off rows + live frame) to the
+            // dispatcher. Non-blocking: if the dispatcher is still busy with
+            // the previous batch, we skip this tick and leave the rows in the
+            // renderer's ring (bounded, oldest-evicting) for next time. This
+            // is what keeps the loop responsive under a heavy output burst.
             _ = tick.tick() => {
-                drain_and_post(slack, channel, &mut renderer, &mut current_message_id, &mut active_scroll_buffer, &mut last_live_body).await;
+                if dispatch.has_capacity() {
+                    let rows = renderer.drain_scroll_buffer_rows();
+                    let live = renderer.take_pending().map(|r| LiveFrame {
+                        text: r.text,
+                        is_edit: r.is_edit,
+                    });
+                    if live.as_ref().is_some_and(|l| l.is_edit) {
+                        posted_live_frame = true;
+                    }
+                    dispatch.try_send_frame(rows, live);
+                }
             }
 
             msg = message_rx.recv() => {
@@ -552,42 +531,34 @@ async fn run_session(
                     &input_tx,
                     &mut pty,
                     &mut renderer,
-                    slack,
-                    channel,
-                    &mut current_message_id,
-                    &mut active_scroll_buffer,
+                    &dispatch,
+                    &mut posted_live_frame,
                     &mut runtime_settings,
                     attach.as_ref(),
                 ).await;
 
-                // Re-anchor: every Nth inbound message, force the next TUI
-                // frame to post a NEW message instead of editing the old one.
-                // This keeps the live frame near the bottom of the channel
-                // so the user doesn't have to scroll back up to see it.
-                // The `--clear` command (handled inside handle_slack_message)
-                // already nulls current_message_id, so we treat that path as
-                // an implicit anchor reset by checking is_some() first.
-                if runtime_settings.anchor_refresh > 0 && current_message_id.is_some() {
+                // Re-anchor: every Nth inbound message, anchor the transcript
+                // so the next TUI frame posts a NEW message instead of editing
+                // the old one. This keeps the live frame near the bottom of the
+                // channel so the user doesn't have to scroll back up to see it.
+                // We only count once a live frame has actually been posted;
+                // `--clear` (handled inside handle_slack_message) resets the
+                // flag, so it implicitly resets this cycle too.
+                if runtime_settings.anchor_refresh > 0 && posted_live_frame {
                     messages_since_anchor = messages_since_anchor.saturating_add(1);
                     if messages_since_anchor >= runtime_settings.anchor_refresh {
-                        // last_live_body invalidates automatically next
-                        // tick (drain_and_post clears when current_message_id is None).
-                        current_message_id = None;
                         messages_since_anchor = 0;
-                        // The new message starts with a clean scroll buffer so
-                        // we don't repeat history that was already in the
-                        // previous (now-frozen) message. Also lock the
-                        // active scroll buffer — it'll sit above the new live
-                        // message and must not be edited further.
+                        posted_live_frame = false;
+                        // Seal the active scroll buffer as history and force a
+                        // fresh live message; clear the renderer's pending
+                        // scroll buffer so we don't repeat already-posted
+                        // history into the new message.
+                        dispatch.anchor();
                         renderer.clear_scroll_buffer();
-                        if let Some(active) = active_scroll_buffer.take() {
-                            lock_active_scroll_buffer(slack, channel, active).await;
-                        }
                     }
                 } else {
-                    // current_message_id is None — either we haven't posted a
-                    // TUI frame yet or --clear just ran. Reset the counter
-                    // so the *next* threshold cycle starts fresh.
+                    // No live frame posted yet (or --clear just ran). Reset the
+                    // counter so the *next* threshold cycle starts fresh.
                     messages_since_anchor = 0;
                 }
 
@@ -605,6 +576,18 @@ async fn run_session(
             }
         }
     };
+
+    // Final flush: hand the dispatcher one last snapshot of anything still in
+    // the renderer (trailing scroll-buffer rows + the final screen), then wait
+    // for it to drain within the shutdown budget. Best-effort — if the network
+    // is wedged we'd rather exit than hang.
+    let rows = renderer.drain_scroll_buffer_rows();
+    let live = renderer.take_pending().map(|r| LiveFrame {
+        text: r.text,
+        is_edit: r.is_edit,
+    });
+    dispatch.try_send_frame(rows, live);
+    let _ = tokio::time::timeout(SHUTDOWN_POST_TIMEOUT, dispatch.shutdown()).await;
 
     Ok(outcome)
 }
@@ -688,10 +671,8 @@ async fn handle_slack_message(
     input_tx: &mpsc::Sender<Vec<u8>>,
     pty: &mut PtyBackend,
     renderer: &mut TuiRenderer,
-    slack: &SlackClient,
-    channel: &str,
-    current_message_id: &mut Option<String>,
-    active_scroll_buffer: &mut Option<ActiveScrollBuffer>,
+    dispatch: &DispatchHandle,
+    posted_live_frame: &mut bool,
     runtime_settings: &mut settings::RuntimeSettings,
     attach: Option<&AttachServer>,
 ) -> SlackOutcome {
@@ -739,12 +720,9 @@ async fn handle_slack_message(
                     // Shell is alive (we're in the session loop); require
                     // explicit `--new force` to terminate it. Stateless: no
                     // pending-confirmation flag to mismanage on retries.
-                    let _ = slack
-                        .send_message(
-                            channel,
-                            "⚠️  A shell is already running. Reply `--new force` to terminate it and start a new one.",
-                        )
-                        .await;
+                    dispatch.say(
+                        "⚠️  A shell is already running. Reply `--new force` to terminate it and start a new one.",
+                    );
                     SlackOutcome::Continue
                 }
             }
@@ -753,26 +731,21 @@ async fn handle_slack_message(
                     error!("Failed to resize PTY: {e}");
                 }
                 renderer.resize(new_size.cols, new_size.rows);
-                let _ = slack
-                    .send_message(
-                        channel,
-                        &format!("📐 Resized to {}x{}", new_size.cols, new_size.rows),
-                    )
-                    .await;
+                dispatch.say(format!(
+                    "📐 Resized to {}x{}",
+                    new_size.cols, new_size.rows
+                ));
                 SlackOutcome::Continue
             }
             SpecialCommand::Clear => {
-                *current_message_id = None;
+                // Anchor the transcript: seal the active scroll buffer as
+                // history and start a fresh live message on next output. Clear
+                // the renderer's pending scroll buffer so already-posted
+                // history isn't repeated.
+                dispatch.anchor();
                 renderer.clear_scroll_buffer();
-                if let Some(active) = active_scroll_buffer.take() {
-                    lock_active_scroll_buffer(slack, channel, active).await;
-                }
-                let _ = slack
-                    .send_message(
-                        channel,
-                        "📌 Anchored. Next output will start a fresh message.",
-                    )
-                    .await;
+                *posted_live_frame = false;
+                dispatch.say("📌 Anchored. Next output will start a fresh message.");
                 SlackOutcome::Continue
             }
             SpecialCommand::Help { topic } => {
@@ -780,7 +753,7 @@ async fn handle_slack_message(
                     Some("config") => settings::help_text(),
                     _ => help_text(),
                 };
-                let _ = slack.send_message(channel, &text).await;
+                dispatch.say(text);
                 SlackOutcome::Continue
             }
             SpecialCommand::Name(new_name) => {
@@ -794,12 +767,10 @@ async fn handle_slack_message(
                         if let Some(s) = attach {
                             s.set_title(build_title_frame(&display));
                         }
-                        let _ = slack
-                            .send_message(channel, &format!("🏷️ Session renamed to *{display}*."))
-                            .await;
+                        dispatch.say(format!("🏷️ Session renamed to *{display}*."));
                     }
                     Err(e) => {
-                        let _ = slack.send_message(channel, &format!("⚠️ {e}")).await;
+                        dispatch.say(format!("⚠️ {e}"));
                     }
                 }
                 SlackOutcome::Continue
@@ -840,7 +811,7 @@ async fn handle_slack_message(
                         Err(e) => format!("⚠️ {e}"),
                     },
                 };
-                let _ = slack.send_message(channel, &reply).await;
+                dispatch.say(reply);
                 SlackOutcome::Continue
             }
             other => {
@@ -852,432 +823,6 @@ async fn handle_slack_message(
                 SlackOutcome::Continue
             }
         },
-    }
-}
-
-/// One open scroll buffer message that the bridge keeps extending each tick
-/// by editing in place. When the body grows past
-/// `SLACK_MESSAGE_CHAR_LIMIT`, the bridge edits it once more to relabel
-/// it as 📚 *History* — sealing it — and lets `active_scroll_buffer` drop
-/// to `None` so the next tick opens a fresh active.
-///
-/// `body` is the *full* current text of the message (including header
-/// and trailing fence) so we can do an unambiguous size check before
-/// committing to extend vs. lock.
-struct ActiveScrollBuffer {
-    message_id: String,
-    body: String,
-}
-
-/// Render a 📜 *Scroll buffer* message body containing the given rows.
-fn render_active_body(rows_text: &str) -> String {
-    format!("📜 *Scroll buffer*\n```\n{rows_text}```")
-}
-
-/// Demote `active` to a sealed 📚 *History* message by editing it once
-/// more with the History label and the same content body. Best-effort:
-/// on edit failure we log and move on — the user still sees the prior
-/// 📜 *Scroll buffer* label, which is wrong but harmless.
-async fn lock_active_scroll_buffer(slack: &SlackClient, channel: &str, active: ActiveScrollBuffer) {
-    // The body still has the 📜 *Scroll buffer* prefix; swap it for the
-    // 📚 *History* label. We keep the inner rows verbatim — same content,
-    // new label.
-    let locked_body = active
-        .body
-        .replacen("📜 *Scroll buffer*", "📚 *History*", 1);
-    debug!("Locking scroll buffer ts={} as History", active.message_id);
-    if let Err(e) = slack
-        .edit_message(channel, &active.message_id, &locked_body)
-        .await
-    {
-        error!("Failed to lock scroll buffer message as History: {e}");
-    }
-}
-
-/// Drain the renderer into Slack using the **two-level log-segment** model:
-///
-/// 1. If any rows have scrolled off the virtual terminal since the last
-///    tick, append them to the active 📜 *Scroll buffer* message:
-///    - If there's no active yet but there *is* a prior live message,
-///      reuse that live message: edit it in place with just the
-///      scrolled-off rows under a 📜 *Scroll buffer* header. (This kills
-///      the stale 🟢 *Live* label and avoids posting another message.)
-///    - If there's no active and no live, post a fresh active.
-///    - If there's an active, edit it to append the new rows.
-///    - If extending would push it past the size budget, lock the
-///      current active as 📚 *History* and start a fresh active.
-/// 2. Post or edit the new live message with the current screen.
-///
-/// Each row therefore lives in exactly one Slack message — scrolled-off
-/// content in either an active 📜 Scroll buffer or a locked 📚 History
-/// message, on-screen content in the live message — with the duplication
-/// problem ruled out structurally and tiny "3-line scroll buffer" messages
-/// avoided by extending the active rather than posting fresh each tick.
-async fn drain_and_post(
-    slack: &SlackClient,
-    channel: &str,
-    renderer: &mut TuiRenderer,
-    current_message_id: &mut Option<String>,
-    active_scroll_buffer: &mut Option<ActiveScrollBuffer>,
-    last_live_body: &mut Option<String>,
-) {
-    // If we have no current live message (start of session, --clear,
-    // anchor-refresh, or a recent demotion), the dedupe state for the
-    // *previous* live message is meaningless. Drop it so the next post
-    // happens fresh.
-    if current_message_id.is_none() {
-        *last_live_body = None;
-    }
-
-    let pending = renderer.scroll_buffer_pending();
-    if pending > 0 {
-        // Each pass either:
-        //  - extends the active with as many lines as fit, OR
-        //  - rolls over to a fresh active (locking the current one)
-        //    when not even one line fits in the active's remaining
-        //    budget, OR
-        //  - posts a fresh active when there is no current active.
-        //
-        // We do at most ONE Slack write per tick to keep per-tick work
-        // bounded under the rate-limiter's ~1.1s/call budget; whatever
-        // doesn't fit stays in the renderer's ring for the next tick.
-        // **No row is ever dropped** — earlier versions did, when the
-        // active was near-full and the next line couldn't fit; that
-        // path now triggers a rollover instead.
-        flush_one_scroll_buffer_batch(slack, channel, renderer, active_scroll_buffer, current_message_id).await;
-        // If the flush demoted our live message into the active
-        // scroll buffer, the body we tracked as "last live" no longer
-        // exists as a live message. Drop it so the next render posts
-        // fresh instead of being deduped against a stale memory.
-        if current_message_id.is_none() {
-            *last_live_body = None;
-        }
-
-        if renderer.scroll_buffer_pending() > 0 {
-            debug!(
-                "Scroll buffer backlog: {} rows still pending after this tick",
-                renderer.scroll_buffer_pending()
-            );
-        }
-    }
-
-    let Some(rendered) = renderer.take_pending() else {
-        return;
-    };
-    // Dedupe identical live frames: the renderer always emits the
-    // current frame each tick (so we catch screen changes that
-    // happened with no new `process` call between ticks — e.g. the
-    // tail end of a long burst sitting on screen after the agent has
-    // gone quiet), but most ticks produce the same body as last time
-    // and don't need a Slack edit. Skip if unchanged.
-    if rendered.is_edit && last_live_body.as_deref() == Some(rendered.text.as_str()) {
-        return;
-    }
-    post_or_edit(slack, channel, &rendered, current_message_id).await;
-    if rendered.is_edit {
-        *last_live_body = Some(rendered.text);
-    }
-}
-
-/// Do one unit of scroll buffer work: either extend the active with as
-/// many lines as fit, or roll over to a fresh active. Bounds per-tick
-/// Slack work to a single edit (or a single post + a lock-edit, when
-/// rolling over). Returns when there's nothing pending or one Slack
-/// write has been issued.
-async fn flush_one_scroll_buffer_batch(
-    slack: &SlackClient,
-    channel: &str,
-    renderer: &mut TuiRenderer,
-    active_scroll_buffer: &mut Option<ActiveScrollBuffer>,
-    current_message_id: &mut Option<String>,
-) {
-    if renderer.scroll_buffer_pending() == 0 {
-        return;
-    }
-
-    // A fresh active body starts with `📜 *Scroll buffer*\n```\n` plus a
-    // closing "```" — call that the framing overhead. Empirically ~24
-    // UTF-16 units; recompute exactly so a future header tweak can't
-    // silently desync.
-    let fresh_overhead = slack_text_size("📜 *Scroll buffer*\n```\n```");
-
-    // Available budget inside the active (or in a fresh active if
-    // there isn't one yet).
-    let available = match active_scroll_buffer {
-        Some(a) => SLACK_MESSAGE_CHAR_LIMIT.saturating_sub(slack_text_size(&a.body)),
-        None => SLACK_MESSAGE_CHAR_LIMIT.saturating_sub(fresh_overhead),
-    };
-
-    // If the active is too full to fit even the next line, lock it
-    // first. The next call (this tick or next) will then post a fresh
-    // active for the pending rows.
-    let next_line_size = renderer
-        .peek_first_scroll_buffer_row()
-        .map(slack_text_size_of_row)
-        .unwrap_or(0);
-    if next_line_size > available
-        && let Some(active) = active_scroll_buffer.take()
-    {
-        debug!(
-            "Active scroll buffer ts={} can't fit next line ({} > {}); locking as 📚 History",
-            active.message_id, next_line_size, available
-        );
-        lock_active_scroll_buffer(slack, channel, active).await;
-        return;
-    }
-
-    // Drain as many lines as fit into the available budget.
-    let budget = if active_scroll_buffer.is_some() {
-        available
-    } else {
-        SLACK_MESSAGE_CHAR_LIMIT.saturating_sub(fresh_overhead)
-    };
-    let batch = drain_lines_into_budget(renderer, budget);
-    if batch.is_empty() {
-        // The next pending row is bigger than even a fresh message can
-        // hold (a single line > ~2,776 units, which is wider than any
-        // realistic terminal). Hard-split at a char boundary so we make
-        // forward progress; a degenerately-wide line is content too.
-        if let Some(row) = renderer.pop_first_scroll_buffer_row() {
-            let mut line: String = row.into_iter().collect();
-            line.push('\n');
-            let split = char_boundary_at_utf16(&line, budget);
-            let head = line[..split].to_string();
-            let tail: String = line[split..].to_string();
-            // Push the tail back at the front of the ring as a single
-            // row (without its trailing newline) so we resume next tick.
-            let tail_chars: Vec<char> = tail.trim_end_matches('\n').chars().collect();
-            if !tail_chars.is_empty() {
-                renderer.push_front_scroll_buffer_row(tail_chars);
-            }
-            error!(
-                "Scroll buffer row wider than per-message budget; hard-split at {} units",
-                slack_text_size(&head)
-            );
-            ingest_scroll_buffer_batch(
-                slack,
-                channel,
-                current_message_id,
-                active_scroll_buffer,
-                &head,
-            )
-            .await;
-        }
-        return;
-    }
-    ingest_scroll_buffer_batch(
-        slack,
-        channel,
-        current_message_id,
-        active_scroll_buffer,
-        &batch,
-    )
-    .await;
-}
-
-/// UTF-16 size of a row including its trailing newline. Convenience —
-/// keeps the size calc symmetric with how `drain_lines_into_budget`
-/// constructs lines for inclusion.
-fn slack_text_size_of_row(row: &[char]) -> usize {
-    let mut size = 0;
-    for &c in row {
-        size += c.len_utf16();
-    }
-    size + 1 // for '\n'
-}
-
-/// Drain rows from the renderer (oldest first) and accumulate their
-/// rendered lines until the next line wouldn't fit in `budget` UTF-16
-/// units. Lines that don't fit stay in the renderer for next tick.
-/// Never drops rows.
-fn drain_lines_into_budget(renderer: &mut TuiRenderer, budget: usize) -> String {
-    let mut accum = String::new();
-    let mut accum_size = 0usize;
-    while let Some(peek) = renderer.peek_first_scroll_buffer_row() {
-        let line_size = slack_text_size_of_row(peek);
-        if accum_size + line_size > budget {
-            break;
-        }
-        // Commit.
-        let row = renderer.pop_first_scroll_buffer_row().unwrap();
-        for c in row {
-            accum.push(c);
-        }
-        accum.push('\n');
-        accum_size += line_size;
-    }
-    accum
-}
-
-/// Find the largest byte index `<= s.len()` whose prefix `s[..idx]`
-/// has exactly `units` or fewer UTF-16 code units AND is a valid char
-/// boundary. Used for hard-splitting an over-wide line so we never
-/// produce invalid UTF-8.
-fn char_boundary_at_utf16(s: &str, units: usize) -> usize {
-    let mut consumed = 0usize;
-    for (i, c) in s.char_indices() {
-        let next = consumed + c.len_utf16();
-        if next > units {
-            return i;
-        }
-        consumed = next;
-    }
-    s.len()
-}
-
-/// Apply a batch of scrolled-off rows (already concatenated as one
-/// text blob with trailing '\n's per row) to the active scroll-buffer
-/// message, extending it via edit when it fits and locking + rolling
-/// over when it doesn't. The caller is responsible for ensuring the
-/// batch fits in a single Slack edit — see [`flush_one_scroll_buffer_batch`].
-///
-/// Also handles the "no active, but a prior live anchor exists" case
-/// by demoting the live message to active scroll buffer.
-async fn ingest_scroll_buffer_batch(
-    slack: &SlackClient,
-    channel: &str,
-    current_message_id: &mut Option<String>,
-    active_scroll_buffer: &mut Option<ActiveScrollBuffer>,
-    batch: &str,
-) {
-    // Case A: no active scroll buffer yet. Either reuse the live message
-    // (demote it to scroll buffer) or post a fresh active.
-    if active_scroll_buffer.is_none() {
-        let body = render_active_body(batch);
-        if let Some(msg_id) = current_message_id.take() {
-            match slack.edit_message(channel, &msg_id, &body).await {
-                Ok(()) => {
-                    debug!("Demoted live message ts={msg_id} into active 📜 Scroll buffer");
-                    *active_scroll_buffer = Some(ActiveScrollBuffer {
-                        message_id: msg_id,
-                        body,
-                    });
-                    return;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to demote live message to scroll buffer, posting fresh: {e}"
-                    );
-                    // Fall through.
-                }
-            }
-        }
-        match slack.send_message(channel, &body).await {
-            Ok(ts) => {
-                debug!("Opened new active 📜 Scroll buffer ts={ts}");
-                *active_scroll_buffer = Some(ActiveScrollBuffer {
-                    message_id: ts,
-                    body,
-                });
-            }
-            Err(e) => error!("Failed to post new active scroll buffer: {e}"),
-        }
-        return;
-    }
-
-    // Case B: extend the existing active. If it would overflow Slack's
-    // edit cap, lock the current one and roll into a fresh active for
-    // the new rows. We measure with slack_text_size (UTF-16 units) — the
-    // unit Slack's msg_too_long check actually uses; an earlier version
-    // counted Rust `chars` and let emoji-heavy bodies sneak past, after
-    // which Slack truncated the edit mid-content with no closing fence.
-    let active = active_scroll_buffer.as_mut().unwrap();
-    let extended = build_extended_active_body(&active.body, batch);
-    let extended_size = slack_text_size(&extended);
-    if extended_size <= SLACK_MESSAGE_CHAR_LIMIT {
-        match slack
-            .edit_message(channel, &active.message_id, &extended)
-            .await
-        {
-            Ok(()) => {
-                active.body = extended;
-                return;
-            }
-            Err(e) => {
-                // The edit failed — most plausibly msg_too_long under
-                // a model mismatch we haven't accounted for. Don't keep
-                // a half-broken active around: lock what we have and
-                // start fresh with the new rows below. This is the
-                // safety-net path for "extension overflow we didn't
-                // predict"; the predicted path is the else branch.
-                error!(
-                    "Failed to extend active scroll buffer ts={} (extended size {}, budget {}): {e}; rolling over",
-                    active.message_id, extended_size, SLACK_MESSAGE_CHAR_LIMIT
-                );
-                // Fall through to rollover.
-            }
-        }
-    } else {
-        debug!(
-            "Active scroll buffer ts={} would exceed {} units (extended size {}); locking as 📚 History and rolling over",
-            active.message_id, SLACK_MESSAGE_CHAR_LIMIT, extended_size
-        );
-    }
-
-    // Rollover path: lock the current active, then open a fresh one
-    // containing just the new rows. (Don't try to demote anything here
-    // — the live message, if any, stays live; we just post a new active
-    // scroll buffer below it.)
-    let locked = active_scroll_buffer.take().unwrap();
-    lock_active_scroll_buffer(slack, channel, locked).await;
-
-    let body = render_active_body(batch);
-    match slack.send_message(channel, &body).await {
-        Ok(ts) => {
-            debug!("Opened new active 📜 Scroll buffer ts={ts} after rollover");
-            *active_scroll_buffer = Some(ActiveScrollBuffer {
-                message_id: ts,
-                body,
-            });
-        }
-        Err(e) => error!("Failed to post fresh active scroll buffer after rollover: {e}"),
-    }
-}
-
-/// Build the new full body of an active 📜 Scroll buffer after appending
-/// `new_rows_text`. The existing body has the form:
-///   "📜 *Scroll buffer*\n```\n<rows>```"
-/// We splice the new rows immediately before the trailing fence.
-fn build_extended_active_body(existing: &str, new_rows_text: &str) -> String {
-    // Strip the trailing "```" so we can append more rows then re-add it.
-    let trimmed = existing.strip_suffix("```").unwrap_or(existing);
-    format!("{trimmed}{new_rows_text}```")
-}
-
-/// Post a fresh message, or edit `current_message_id` for TUI frames.
-/// Falls back to a fresh post if editing fails for any reason — including
-/// `msg_too_long`, which shouldn't happen with the log-segment model
-/// (live frame is bounded by screen size) but is logged as a heads-up
-/// rather than swallowed silently.
-async fn post_or_edit(
-    slack: &SlackClient,
-    channel: &str,
-    rendered: &RenderedOutput,
-    current_message_id: &mut Option<String>,
-) {
-    if rendered.text.is_empty() {
-        return;
-    }
-
-    if rendered.is_edit
-        && let Some(msg_id) = current_message_id.as_deref()
-    {
-        match slack.edit_message(channel, msg_id, &rendered.text).await {
-            Ok(()) => return,
-            Err(e) => {
-                error!("Failed to edit live message, posting fresh: {e}");
-                *current_message_id = None;
-            }
-        }
-    }
-
-    match slack.send_message(channel, &rendered.text).await {
-        Ok(ts) => {
-            if rendered.is_edit {
-                *current_message_id = Some(ts);
-            }
-        }
-        Err(e) => error!("Failed to send message: {e}"),
     }
 }
 
@@ -1304,90 +849,5 @@ mod tests {
         assert!(!looks_like_channel_id("XABCDEFGH"));
         // Too short.
         assert!(!looks_like_channel_id("CXY"));
-    }
-
-    #[test]
-    fn extended_active_body_appends_before_fence() {
-        let original = render_active_body("first\nsecond\n");
-        let extended = build_extended_active_body(&original, "third\n");
-        assert_eq!(
-            extended,
-            "📜 *Scroll buffer*\n```\nfirst\nsecond\nthird\n```"
-        );
-    }
-
-    #[test]
-    fn extended_active_body_round_trips() {
-        // Successive extensions produce a single coherent message body.
-        let mut body = render_active_body("a\n");
-        body = build_extended_active_body(&body, "b\n");
-        body = build_extended_active_body(&body, "c\n");
-        assert_eq!(body, "📜 *Scroll buffer*\n```\na\nb\nc\n```");
-    }
-
-    #[test]
-    fn drain_lines_into_budget_never_drops() {
-        // Regression: an earlier version dropped rows when the next
-        // line couldn't fit even in a fresh budget — happened when the
-        // active scroll buffer was near-full and `available` was tiny.
-        // Correct behavior: leave the row in the renderer, return what
-        // we have. The caller's rollover path picks it up next pass.
-        let mut renderer = TuiRenderer::with_scroll_buffer(20, 2, 50);
-        // Trigger TUI mode so the renderer captures scrolled-off rows.
-        renderer.process(b"\x1b[2J");
-        for i in 0..5 {
-            renderer.process(format!("line{i}\r\n").as_bytes());
-        }
-        let pending_before = renderer.scroll_buffer_pending();
-        // Budget too small for even one line — drain returns "" and
-        // leaves the row in place.
-        let out = drain_lines_into_budget(&mut renderer, 1);
-        assert_eq!(out, "");
-        assert_eq!(
-            renderer.scroll_buffer_pending(),
-            pending_before,
-            "rows must not be dropped on tight budget"
-        );
-    }
-
-    #[test]
-    fn drain_lines_into_budget_takes_what_fits() {
-        let mut renderer = TuiRenderer::with_scroll_buffer(20, 2, 50);
-        // Trigger TUI mode so the renderer captures scrolled-off rows.
-        renderer.process(b"\x1b[2J");
-        for i in 0..5 {
-            renderer.process(format!("line{i}\r\n").as_bytes());
-        }
-        // "line0\n" is 6 chars; budget 20 should fit ~3 lines.
-        let out = drain_lines_into_budget(&mut renderer, 20);
-        assert!(out.contains("line0"));
-        assert!(out.contains("line1"));
-        assert!(out.contains("line2"));
-        // Remaining lines stay in the ring.
-        assert!(renderer.scroll_buffer_pending() > 0);
-    }
-
-    #[test]
-    fn char_boundary_at_utf16_handles_emoji() {
-        // 📜 is 1 char / 2 UTF-16 units. With units=1 we can't fit it
-        // — boundary lands at byte 0.
-        assert_eq!(char_boundary_at_utf16("📜x", 1), 0);
-        // With units=2 we fit the emoji exactly.
-        assert_eq!(char_boundary_at_utf16("📜x", 2), "📜".len());
-        // ASCII string.
-        assert_eq!(char_boundary_at_utf16("abcdef", 3), 3);
-    }
-
-    #[test]
-    fn slack_text_size_counts_utf16_units() {
-        // ASCII: identical to byte/char count.
-        assert_eq!(slack_text_size("hello"), 5);
-        // Emoji on the supplementary plane: 1 Rust char = 2 UTF-16 units.
-        // 📜 alone:
-        assert_eq!("📜".chars().count(), 1);
-        assert_eq!(slack_text_size("📜"), 2);
-        // The render_active_body header has 📜 (2 units) plus 17 ASCII
-        // units = 19. (" *Scroll buffer*\n" plus the leading space).
-        assert_eq!(slack_text_size("📜 *Scroll buffer*\n"), 19);
     }
 }
