@@ -4,10 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["browser-login"]
+# Embedded-browser interactive login. On by default (desktop builds). A
+# headless build (`--no-default-features`) drops the WebKitGTK/GTK link
+# dependency; that binary uses `--import-login` instead of `--login`.
+browser-login = ["bridge-auth/browser-login"]
+
 [dependencies]
 bridge-core = { path = "../crates/bridge-core" }
 bridge-pty = { path = "../crates/bridge-pty" }
-bridge-auth = { path = "../crates/bridge-auth" }
+bridge-auth = { path = "../crates/bridge-auth", default-features = false }
 bridge-slack = { path = "../crates/bridge-slack" }
 tokio.workspace = true
 anyhow.workspace = true

@@ -11,8 +11,20 @@ serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 tracing.workspace = true
-wry.workspace = true
-tao.workspace = true
+# wry/tao power the embedded browser used by interactive `--login`. They link
+# WebKitGTK on Linux, which isn't present on headless hosts (servers, dev
+# desktops). Gated behind a default-on feature so desktop builds are unchanged,
+# but a headless Linux build can opt out — there, credentials arrive via
+# `--import-login` instead of the browser.
+wry = { workspace = true, optional = true }
+tao = { workspace = true, optional = true }
+
+[features]
+default = ["browser-login"]
+# Compile the embedded-browser login flow. Off => `login()` returns an error
+# directing the user to `--import-login`, and the binary has no WebKit/GTK
+# link-time dependency.
+browser-login = ["dep:wry", "dep:tao"]
 
 [dev-dependencies]
 tempfile = "3"

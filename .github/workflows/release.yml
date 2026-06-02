@@ -128,8 +128,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # wry/tao need GTK + WebKit on Linux. Windows + macOS use the OS-provided
-      # WebView2 / WKWebView so no extra packages there.
+      # wry/tao need GTK + WebKit on Linux for the *desktop* variant's embedded
+      # login browser. Windows + macOS use the OS-provided WebView2 / WKWebView
+      # so no extra packages there.
       - name: Install Linux WebView deps
         if: runner.os == 'Linux'
         run: |
@@ -146,14 +147,44 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Build release
+      # Windows + macOS: a single desktop build (browser login on; their
+      # WebView is OS-provided, so the binary is self-contained).
+      - name: Build release (Windows/macOS)
+        if: runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }}
+
+      # Linux ships TWO binaries:
+      #  - headless (default): no WebKit/GTK link, runs on any distro (servers,
+      #    dev desktops). Login via --import-login.
+      #  - desktop: embedded browser login, needs WebKitGTK present at runtime.
+      - name: Build release (Linux, headless + desktop)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --target ${{ matrix.target }} --no-default-features
+          mv "target/${{ matrix.target }}/release/cli-bridge" \
+             "target/${{ matrix.target }}/release/cli-bridge-headless"
+          cargo build --release --target ${{ matrix.target }}
+          mv "target/${{ matrix.target }}/release/cli-bridge" \
+             "target/${{ matrix.target }}/release/cli-bridge-desktop"
+
+      # Stage just the wanted binaries so the artifact upload is a clean glob.
+      - name: Stage binaries
+        shell: bash
+        run: |
+          mkdir -p staging
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cp "target/${{ matrix.target }}/release/cli-bridge-headless" staging/
+            cp "target/${{ matrix.target }}/release/cli-bridge-desktop" staging/
+          else
+            cp "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" staging/
+          fi
+          ls -la staging/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: cli-bridge-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          path: staging/*
           if-no-files-found: error
           retention-days: 3
 
@@ -193,11 +224,19 @@ jobs:
                release/cli-bridge-${VERSION}-macos-aarch64
             chmod +x release/cli-bridge-${VERSION}-macos-aarch64
           fi
-          # Linux
-          if [ -f artifacts/cli-bridge-x86_64-unknown-linux-gnu/cli-bridge ]; then
-            cp artifacts/cli-bridge-x86_64-unknown-linux-gnu/cli-bridge \
+          # Linux — two binaries. The headless one takes the plain
+          # `…-linux-x86_64` name (runs anywhere; the default download); the
+          # desktop one (embedded browser login, needs WebKitGTK) is suffixed.
+          LINUX_ARTIFACT=artifacts/cli-bridge-x86_64-unknown-linux-gnu
+          if [ -f "$LINUX_ARTIFACT/cli-bridge-headless" ]; then
+            cp "$LINUX_ARTIFACT/cli-bridge-headless" \
                release/cli-bridge-${VERSION}-linux-x86_64
             chmod +x release/cli-bridge-${VERSION}-linux-x86_64
+          fi
+          if [ -f "$LINUX_ARTIFACT/cli-bridge-desktop" ]; then
+            cp "$LINUX_ARTIFACT/cli-bridge-desktop" \
+               release/cli-bridge-${VERSION}-linux-x86_64-desktop
+            chmod +x release/cli-bridge-${VERSION}-linux-x86_64-desktop
           fi
           echo -n "$BUILD_SHA" > release/BUILD_SHA.txt
           ls -la release/

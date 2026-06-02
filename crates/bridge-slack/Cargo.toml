@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 bridge-core = { path = "../bridge-core" }
-bridge-auth = { path = "../bridge-auth" }
 reqwest.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

@@ -69,6 +69,12 @@ jobs:
       - name: cargo build
         run: cargo build --all-targets
 
+      # The headless Linux build (no embedded browser login) is a shipped
+      # release variant — make sure CI keeps it compiling.
+      - name: cargo build (headless, Linux)
+        if: runner.os == 'Linux'
+        run: cargo build -p cli-bridge --no-default-features
+
       - name: cargo test
         run: cargo test
 

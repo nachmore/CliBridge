@@ -70,8 +70,19 @@ cargo build --release
 
 ### Running on a remote box (SSH)
 
+The Linux release ships two binaries:
+
+- **`cli-bridge-…-linux-x86_64`** (headless) — no WebKitGTK/GTK dependency,
+  runs on any distro including bare servers and dev desktops. This is the one
+  to put on a remote box. It has no `--login` (no embedded browser); bring
+  credentials in with `--import-login` (below).
+- **`cli-bridge-…-linux-x86_64-desktop`** — adds the embedded browser
+  `--login`. Use it on a Linux *desktop* with WebKitGTK installed if you want
+  to sign in on that machine directly.
+
 `--login` opens a real browser window via WebView, which won't work over
-SSH. Sign in once on a machine with a display, then move the credentials:
+SSH (and isn't compiled into the headless binary). Sign in once on a machine
+with a display, then move the credentials:
 
 ```sh
 # On your laptop (where you can run a browser):
