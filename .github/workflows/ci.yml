@@ -36,12 +36,13 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }}${{ runner.os == 'Linux' && ', x86_64-unknown-linux-musl' || '' }}
           components: rustfmt, clippy
 
       # wry/tao need GTK + WebKit on Linux for the embedded login browser.
-      # Windows uses WebView2 from the OS; macOS uses WKWebView from the OS.
-      - name: Install Linux WebView deps
+      # musl-tools is for the headless static build below. Windows uses
+      # WebView2 from the OS; macOS uses WKWebView from the OS.
+      - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -50,7 +51,8 @@ jobs:
             libgtk-3-dev \
             libsoup-3.0-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            musl-tools
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -69,11 +71,12 @@ jobs:
       - name: cargo build
         run: cargo build --all-targets
 
-      # The headless Linux build (no embedded browser login) is a shipped
-      # release variant — make sure CI keeps it compiling.
-      - name: cargo build (headless, Linux)
+      # The headless Linux binary is a shipped release variant: a static musl
+      # build (no glibc/WebKit/OpenSSL) so it runs on any distro. Build it the
+      # same way the release does so CI catches musl/static breakage early.
+      - name: cargo build (headless musl, Linux)
         if: runner.os == 'Linux'
-        run: cargo build -p cli-bridge --no-default-features
+        run: cargo build -p cli-bridge --no-default-features --target x86_64-unknown-linux-musl
 
       - name: cargo test
         run: cargo test

@@ -72,8 +72,9 @@ cargo build --release
 
 The Linux release ships two binaries:
 
-- **`cli-bridge-…-linux-x86_64`** (headless) — no WebKitGTK/GTK dependency,
-  runs on any distro including bare servers and dev desktops. This is the one
+- **`cli-bridge-…-linux-x86_64`** (headless) — a fully static musl build: no
+  WebKitGTK, no glibc version dependency, no system OpenSSL. Runs on any
+  x86_64 Linux (servers, dev desktops, old distros, Alpine). This is the one
   to put on a remote box. It has no `--login` (no embedded browser); bring
   credentials in with `--import-login` (below).
 - **`cli-bridge-…-linux-x86_64-desktop`** — adds the embedded browser

@@ -123,15 +123,20 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.build_sha }}
 
+      # Linux builds two targets: gnu for the desktop variant (it needs system
+      # WebKitGTK anyway, so it's distro-bound) and musl for the headless
+      # variant (fully static — no glibc/WebKit/OpenSSL — so one binary runs on
+      # any x86_64 Linux regardless of how old its glibc is).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }}${{ runner.os == 'Linux' && ', x86_64-unknown-linux-musl' || '' }}
 
       # wry/tao need GTK + WebKit on Linux for the *desktop* variant's embedded
-      # login browser. Windows + macOS use the OS-provided WebView2 / WKWebView
-      # so no extra packages there.
-      - name: Install Linux WebView deps
+      # login browser. musl-tools provides the static-link C toolchain for the
+      # headless musl build. Windows + macOS use the OS-provided WebView2 /
+      # WKWebView so no extra packages there.
+      - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -140,7 +145,8 @@ jobs:
             libgtk-3-dev \
             libsoup-3.0-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            musl-tools
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -154,18 +160,15 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       # Linux ships TWO binaries:
-      #  - headless (default): no WebKit/GTK link, runs on any distro (servers,
-      #    dev desktops). Login via --import-login.
-      #  - desktop: embedded browser login, needs WebKitGTK present at runtime.
+      #  - headless: static musl build (no WebKit/GTK/glibc), runs on any
+      #    distro — servers, dev desktops, Alpine. Login via --import-login.
+      #  - desktop: glibc build with embedded browser login; needs WebKitGTK
+      #    present at runtime.
       - name: Build release (Linux, headless + desktop)
         if: runner.os == 'Linux'
         run: |
-          cargo build --release --target ${{ matrix.target }} --no-default-features
-          mv "target/${{ matrix.target }}/release/cli-bridge" \
-             "target/${{ matrix.target }}/release/cli-bridge-headless"
+          cargo build --release --target x86_64-unknown-linux-musl --no-default-features
           cargo build --release --target ${{ matrix.target }}
-          mv "target/${{ matrix.target }}/release/cli-bridge" \
-             "target/${{ matrix.target }}/release/cli-bridge-desktop"
 
       # Stage just the wanted binaries so the artifact upload is a clean glob.
       - name: Stage binaries
@@ -173,8 +176,8 @@ jobs:
         run: |
           mkdir -p staging
           if [ "${{ runner.os }}" = "Linux" ]; then
-            cp "target/${{ matrix.target }}/release/cli-bridge-headless" staging/
-            cp "target/${{ matrix.target }}/release/cli-bridge-desktop" staging/
+            cp target/x86_64-unknown-linux-musl/release/cli-bridge staging/cli-bridge-headless
+            cp "target/${{ matrix.target }}/release/cli-bridge" staging/cli-bridge-desktop
           else
             cp "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" staging/
           fi
