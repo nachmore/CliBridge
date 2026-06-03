@@ -6,6 +6,15 @@
 //!   (📜 🟢 🌉) are one `char` but two units. Measuring in `char`s lets
 //!   emoji-heavy bodies sneak past the limit, after which Slack silently
 //!   truncates the edit mid-content with no closing fence.
+//! - **Slack escapes `&`, `<`, `>`** in the message text and counts the
+//!   *escaped* length against `msg_too_long`. A body full of `<`, `>`, `&`
+//!   (code, diffs, shell redirects — exactly what a dev CLI emits) grows when
+//!   stored: each `<`/`>` → `&lt;`/`&gt;` (+3 units), each `&` → `&amp;` (+4).
+//!   `measure` must count the escaped width or we send bodies we think fit but
+//!   Slack rejects — which also wedges a scroll buffer that can never seal.
+//! - **The self-marker is prepended at send time.** Every posted body gets a
+//!   leading `🌉 ` (`SELF_MARKER`) added by the client *after* the dispatcher
+//!   sized it, so the limit must reserve that width too.
 //! - **Per-message ceiling well under the API cap.** Slack's desktop client
 //!   collapses the tail of any text field over ~3,000 chars into a separate
 //!   "Show more" bubble, which breaks fenced-code formatting (the closing
@@ -15,10 +24,13 @@
 
 use bridge_core::dispatch::TranscriptFormat;
 
-/// Per-message size budget in UTF-16 code units. See module docs for the two
-/// Slack ceilings this stays under. Mirrors the value the bridge used when it
-/// posted scroll-buffer messages inline.
-const SLACK_MESSAGE_SIZE_LIMIT: usize = 2_800;
+/// Effective per-message budget in UTF-16 units. Slack's hard `msg_too_long`
+/// ceiling (and its "Show more" bubble split) sit around 3,000; we stay under
+/// at 2,800, then subtract the width of the self-marker the client prepends to
+/// every body *after* the dispatcher has sized it (`🌉 ` = 3 units; asserted
+/// against the live [`crate::client::SELF_MARKER`] in tests). So a body that
+/// passes `measure` still fits once marked and entity-escaped.
+const SLACK_MESSAGE_SIZE_LIMIT: usize = 2_800 - 3;
 
 const SCROLL_LABEL: &str = "📜 *Scroll buffer*";
 const HISTORY_LABEL: &str = "📚 *History*";
@@ -32,7 +44,11 @@ impl TranscriptFormat for SlackTranscriptFormat {
     }
 
     fn measure(&self, s: &str) -> usize {
-        s.encode_utf16().count()
+        // Count what Slack actually stores: `&`, `<`, `>` are escaped to
+        // `&amp;`, `&lt;`, `&gt;`, and msg_too_long is measured against that
+        // escaped text. Count UTF-16 units (Slack's unit), charging the escape
+        // expansion for those three characters.
+        s.chars().map(slack_char_cost).sum()
     }
 
     fn scroll_body(&self, rows_text: &str) -> String {
@@ -147,14 +163,16 @@ impl SlackTranscriptFormat {
         pages
     }
 
-    /// Split `s` into pieces each measuring `<= budget` UTF-16 units, at char
-    /// boundaries so we never produce invalid UTF-8.
+    /// Split `s` into pieces each measuring `<= budget` (escaped) units, at
+    /// char boundaries so we never produce invalid UTF-8. Uses the same
+    /// escape-aware per-char cost as `measure`, so an entity-heavy line (all
+    /// `<`/`>`/`&`) splits to fit Slack's stored size, not the raw size.
     fn hard_split(&self, s: &str, budget: usize) -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();
         let mut cur_size = 0usize;
         for c in s.chars() {
-            let cs = c.len_utf16();
+            let cs = slack_char_cost(c);
             if cur_size + cs > budget && !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
                 cur_size = 0;
@@ -166,6 +184,17 @@ impl SlackTranscriptFormat {
             out.push(cur);
         }
         out
+    }
+}
+
+/// UTF-16 width of `c` as Slack stores it: `&`/`<`/`>` are escaped to
+/// `&amp;`/`&lt;`/`&gt;` and counted at their escaped length; everything else
+/// is its plain UTF-16 width.
+fn slack_char_cost(c: char) -> usize {
+    match c {
+        '&' => 5,       // &amp;
+        '<' | '>' => 4, // &lt; / &gt;
+        _ => c.len_utf16(),
     }
 }
 
@@ -213,6 +242,59 @@ mod tests {
         assert_eq!(f.measure("hello"), 5);
         // 📜 is 1 char / 2 UTF-16 units.
         assert_eq!(f.measure("📜"), 2);
+    }
+
+    #[test]
+    fn measure_charges_slack_entity_escaping() {
+        // Slack stores &/</> as &amp;/&lt;/&gt; and counts the escaped length.
+        // We must charge the expansion so we never send a body Slack rejects.
+        let f = SlackTranscriptFormat;
+        assert_eq!(f.measure("<"), 4); // &lt;
+        assert_eq!(f.measure(">"), 4); // &gt;
+        assert_eq!(f.measure("&"), 5); // &amp;
+        // A line of shell redirection: `cat <f >g && echo` — count expands.
+        let raw = "a <b> c & d";
+        // a(1) space(1) <(4) b(1) >(4) space(1) c(1) space(1) &(5) space(1) d(1)
+        assert_eq!(f.measure(raw), 21);
+        // Sanity: that's larger than the naive UTF-16 count (11).
+        assert_eq!(raw.encode_utf16().count(), 11);
+    }
+
+    #[test]
+    fn limit_reserves_room_for_self_marker() {
+        // The effective budget is below Slack's raw ceiling by the marker width
+        // the client prepends, so a body at the limit still fits once marked.
+        // Assert against the live marker so a change to it can't silently
+        // desync the budget.
+        let f = SlackTranscriptFormat;
+        let marker_units = crate::client::SELF_MARKER.encode_utf16().count();
+        assert_eq!(f.size_limit(), 2_800 - marker_units);
+    }
+
+    #[test]
+    fn entity_heavy_body_paginates_to_fit_escaped() {
+        // Regression: a body of all '<' (each escapes to 4 units) that's "under
+        // the limit" by naive count must still split so the *escaped* size of
+        // every page fits. This is the kiro-cli wedge: code/diff output is full
+        // of </>/& and was sailing past the size check, then Slack rejected the
+        // edit and the scroll buffer could neither extend nor seal.
+        let f = SlackTranscriptFormat;
+        let line: String = "<".repeat(2_000); // 2000 raw, 8000 escaped units
+        let body = format!("🟢 *Live*\n```\n{line}\n```");
+        let pages = f.paginate(&body);
+        assert!(
+            pages.len() > 1,
+            "entity-heavy body must split: {}",
+            pages.len()
+        );
+        for page in &pages {
+            assert!(
+                f.measure(page) <= f.size_limit(),
+                "page escaped-size {} over limit {}",
+                f.measure(page),
+                f.size_limit()
+            );
+        }
     }
 
     #[test]
