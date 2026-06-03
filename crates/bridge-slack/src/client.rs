@@ -29,6 +29,17 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// unlikely to start their own input with.
 pub const SELF_MARKER: &str = "🌉 ";
 
+/// Map a Slack API error string to a `BridgeError`. `msg_too_long` becomes the
+/// typed `MessageTooLong` variant so the dispatcher can shrink-and-retry; all
+/// others are generic `Messaging`. `op` is "post" or "edit" for the message.
+fn classify_post_error(op: &str, slack_error: &str) -> BridgeError {
+    if slack_error == "msg_too_long" {
+        BridgeError::MessageTooLong(format!("Failed to {op} message: {slack_error}"))
+    } else {
+        BridgeError::Messaging(format!("Failed to {op} message: {slack_error}"))
+    }
+}
+
 /// Slack implementation of the MessagingClient trait.
 /// Uses user tokens (xoxc-) with the d cookie for authentication.
 pub struct SlackClient {
@@ -531,10 +542,8 @@ impl MessagingClient for SlackClient {
             .map_err(|e| BridgeError::Messaging(format!("JSON parse error: {e}")))?;
 
         if !resp.ok {
-            return Err(BridgeError::Messaging(format!(
-                "Failed to post message: {}",
-                resp.error.unwrap_or_default()
-            )));
+            let err = resp.error.unwrap_or_default();
+            return Err(classify_post_error("post", &err));
         }
 
         let ts = resp
@@ -581,10 +590,8 @@ impl MessagingClient for SlackClient {
             .map_err(|e| BridgeError::Messaging(format!("JSON parse error: {e}")))?;
 
         if !resp.ok {
-            return Err(BridgeError::Messaging(format!(
-                "Failed to edit message: {}",
-                resp.error.unwrap_or_default()
-            )));
+            let err = resp.error.unwrap_or_default();
+            return Err(classify_post_error("edit", &err));
         }
 
         Ok(())

@@ -141,6 +141,30 @@ pub trait TranscriptFormat: Send + Sync + 'static {
     fn paginate(&self, body: &str) -> Vec<String> {
         vec![body.to_string()]
     }
+
+    /// Last-resort defense: return `body` shrunk by roughly `fraction` of its
+    /// length (e.g. 0.01 = 1%), still well-formed (fences closed, content
+    /// trimmed from the *end* so the start stays intact). Used by the
+    /// dispatcher when the platform rejects a post as too-long despite our
+    /// size accounting — it shrinks and retries until the post succeeds, so a
+    /// sizing miscalculation can never permanently wedge a message.
+    ///
+    /// Returns `None` when the body can't be shrunk further (already minimal),
+    /// signalling the dispatcher to give up on that body. The default trims raw
+    /// characters from the end; platforms with framing (fences, headers) should
+    /// override to preserve well-formedness.
+    fn shrink(&self, body: &str, fraction: f64) -> Option<String> {
+        let total = body.chars().count();
+        if total == 0 {
+            return None;
+        }
+        let drop = ((total as f64 * fraction).ceil() as usize).max(1);
+        let keep = total.saturating_sub(drop);
+        if keep == 0 {
+            return None;
+        }
+        Some(body.chars().take(keep).collect())
+    }
 }
 
 /// Handle the session loop keeps. Sends are non-blocking: if the dispatcher is
@@ -358,7 +382,7 @@ impl Dispatcher {
                 for page in pages.into_iter().rev() {
                     self.queue.push_front(Work::Stream(page));
                 }
-                if let Err(e) = self.sink.post(&self.channel, &first).await {
+                if let Err(e) = self.post_resilient(&first).await {
                     error!("failed to post message: {e}");
                 }
             }
@@ -398,8 +422,8 @@ impl Dispatcher {
         let body = pages.last().map(String::as_str).unwrap_or(text);
 
         if let Some(id) = self.current_message_id.clone() {
-            match self.sink.edit(&self.channel, &id, body).await {
-                Ok(()) => {
+            match self.edit_resilient(&id, body).await {
+                Ok(_) => {
                     self.last_live_body = Some(text.to_string());
                     return;
                 }
@@ -409,8 +433,8 @@ impl Dispatcher {
                 }
             }
         }
-        match self.sink.post(&self.channel, body).await {
-            Ok(ts) => {
+        match self.post_resilient(body).await {
+            Ok((ts, _)) => {
                 self.current_message_id = Some(ts);
                 self.last_live_body = Some(text.to_string());
             }
@@ -421,12 +445,80 @@ impl Dispatcher {
     async fn lock_active(&mut self, active: ActiveScrollBuffer) {
         let locked = self.fmt.lock_body(&active.body);
         debug!("locking scroll buffer id={} as history", active.message_id);
-        if let Err(e) = self
-            .sink
-            .edit(&self.channel, &active.message_id, &locked)
-            .await
-        {
-            error!("failed to lock scroll buffer as history: {e}");
+        // Resilient edit: if the platform rejects this as too-long despite our
+        // sizing, shrink-and-retry rather than leaving a stuck buffer that
+        // retries the same oversized edit forever.
+        let _ = self.edit_resilient(&active.message_id, &locked).await;
+    }
+
+    /// How much to trim per shrink-retry attempt when the platform rejects a
+    /// body as too-long. 1% per step converges in a handful of retries even if
+    /// our size estimate is off by a lot, without overshooting and dropping
+    /// more content than necessary.
+    const SHRINK_STEP: f64 = 0.01;
+
+    /// Post `body`, shrinking and retrying if the platform rejects it as
+    /// too-long. Returns `Ok((ts, posted_body))` with the body that actually
+    /// went through (possibly shrunk), or the underlying error for non-size
+    /// failures / once the body can't shrink further. This is the last-resort
+    /// guard: even a wrong size calculation can't wedge us, because we keep
+    /// trimming until Slack accepts it.
+    async fn post_resilient(&self, body: &str) -> Result<(String, String), BridgeError> {
+        let mut current = body.to_string();
+        loop {
+            match self.sink.post(&self.channel, &current).await {
+                Ok(ts) => return Ok((ts, current)),
+                Err(BridgeError::MessageTooLong(msg)) => {
+                    match self.fmt.shrink(&current, Self::SHRINK_STEP) {
+                        Some(smaller)
+                            if self.fmt.measure(&smaller) < self.fmt.measure(&current) =>
+                        {
+                            warn!(
+                                "post rejected as too-long ({msg}); shrank {} -> {} units, retrying",
+                                self.fmt.measure(&current),
+                                self.fmt.measure(&smaller)
+                            );
+                            current = smaller;
+                        }
+                        _ => {
+                            error!("post rejected as too-long and cannot shrink further: {msg}");
+                            return Err(BridgeError::MessageTooLong(msg));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Edit `id` to `body`, shrinking and retrying on too-long. Returns the
+    /// body that actually went through so the caller can keep its tracked copy
+    /// (e.g. `active.body`) in sync with what the platform now holds.
+    async fn edit_resilient(&self, id: &str, body: &str) -> Result<String, BridgeError> {
+        let mut current = body.to_string();
+        loop {
+            match self.sink.edit(&self.channel, id, &current).await {
+                Ok(()) => return Ok(current),
+                Err(BridgeError::MessageTooLong(msg)) => {
+                    match self.fmt.shrink(&current, Self::SHRINK_STEP) {
+                        Some(smaller)
+                            if self.fmt.measure(&smaller) < self.fmt.measure(&current) =>
+                        {
+                            warn!(
+                                "edit rejected as too-long ({msg}); shrank {} -> {} units, retrying",
+                                self.fmt.measure(&current),
+                                self.fmt.measure(&smaller)
+                            );
+                            current = smaller;
+                        }
+                        _ => {
+                            error!("edit rejected as too-long and cannot shrink further: {msg}");
+                            return Err(BridgeError::MessageTooLong(msg));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -521,15 +613,16 @@ impl Dispatcher {
         if self.active.is_none() {
             let body = self.fmt.scroll_body(batch);
             if let Some(id) = self.current_message_id.take() {
-                match self.sink.edit(&self.channel, &id, &body).await {
-                    Ok(()) => {
+                match self.edit_resilient(&id, &body).await {
+                    Ok(posted) => {
                         debug!("demoted live message id={id} into active scroll buffer");
                         // The demoted live message is gone; force a fresh post
-                        // next live frame.
+                        // next live frame. Track what actually posted (shrink-
+                        // retry may have trimmed it).
                         self.last_live_body = None;
                         self.active = Some(ActiveScrollBuffer {
                             message_id: id,
-                            body,
+                            body: posted,
                         });
                         return;
                     }
@@ -540,12 +633,12 @@ impl Dispatcher {
                     }
                 }
             }
-            match self.sink.post(&self.channel, &body).await {
-                Ok(ts) => {
+            match self.post_resilient(&body).await {
+                Ok((ts, posted)) => {
                     debug!("opened new active scroll buffer id={ts}");
                     self.active = Some(ActiveScrollBuffer {
                         message_id: ts,
-                        body,
+                        body: posted,
                     });
                 }
                 Err(e) => error!("failed to post new active scroll buffer: {e}"),
@@ -564,10 +657,10 @@ impl Dispatcher {
         let extended = self.fmt.extend_body(&active_body, batch);
         let extended_size = self.fmt.measure(&extended);
         if extended_size <= self.fmt.size_limit() {
-            match self.sink.edit(&self.channel, &active_id, &extended).await {
-                Ok(()) => {
+            match self.edit_resilient(&active_id, &extended).await {
+                Ok(posted) => {
                     if let Some(active) = self.active.as_mut() {
-                        active.body = extended;
+                        active.body = posted;
                     }
                     return;
                 }
@@ -589,12 +682,12 @@ impl Dispatcher {
         let locked = self.active.take().unwrap();
         self.lock_active(locked).await;
         let body = self.fmt.scroll_body(batch);
-        match self.sink.post(&self.channel, &body).await {
-            Ok(ts) => {
+        match self.post_resilient(&body).await {
+            Ok((ts, posted)) => {
                 debug!("opened new active scroll buffer id={ts} after rollover");
                 self.active = Some(ActiveScrollBuffer {
                     message_id: ts,
-                    body,
+                    body: posted,
                 });
             }
             Err(e) => error!("failed to post fresh active scroll buffer after rollover: {e}"),
@@ -955,5 +1048,91 @@ mod tests {
             rejoined.push_str(body);
         }
         assert_eq!(rejoined, big, "no streaming content may be lost");
+    }
+
+    /// Sink that rejects any body longer than `hard_limit` with MessageTooLong
+    /// — simulating a platform whose real ceiling is *lower* than what the
+    /// format's `measure` predicted (i.e. our sizing was wrong). Records only
+    /// the bodies that actually succeeded.
+    struct SizeEnforcingSink {
+        hard_limit: usize,
+        accepted: StdMutex<Vec<String>>,
+        next_id: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TranscriptSink for SizeEnforcingSink {
+        async fn post(&self, _channel: &str, text: &str) -> Result<String, BridgeError> {
+            if text.chars().count() > self.hard_limit {
+                return Err(BridgeError::MessageTooLong("too long".into()));
+            }
+            self.accepted.lock().unwrap().push(text.to_string());
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("id{id}"))
+        }
+        async fn edit(&self, _channel: &str, _id: &str, text: &str) -> Result<(), BridgeError> {
+            if text.chars().count() > self.hard_limit {
+                return Err(BridgeError::MessageTooLong("too long".into()));
+            }
+            self.accepted.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn shrink_and_retry_when_platform_rejects_oversize() {
+        // The format thinks `limit` is 1000 (so it never paginates), but the
+        // platform's real ceiling is 50. A streaming chunk of 200 chars must
+        // still get posted — shrunk down until it fits — never wedging.
+        let sink = std::sync::Arc::new(SizeEnforcingSink {
+            hard_limit: 50,
+            accepted: StdMutex::new(Vec::new()),
+            next_id: AtomicUsize::new(0),
+        });
+        let handle = spawn("chan".to_string(), sink.clone(), fmt(1000));
+        handle.try_send_frame(
+            vec![],
+            Some(LiveFrame {
+                text: "x".repeat(200),
+                is_edit: false,
+            }),
+        );
+        handle.shutdown().await;
+
+        let accepted = sink.accepted.lock().unwrap();
+        assert_eq!(accepted.len(), 1, "should have posted exactly once");
+        assert!(
+            accepted[0].chars().count() <= 50,
+            "posted body must fit the platform ceiling, got {}",
+            accepted[0].chars().count()
+        );
+        assert!(!accepted[0].is_empty(), "must not shrink to nothing");
+    }
+
+    #[tokio::test]
+    async fn shrink_retry_keeps_active_body_in_sync() {
+        // A scroll-buffer batch that the format sizes as fitting but the
+        // platform rejects must still open an active buffer (shrunk to fit),
+        // and a following extend must splice onto the *shrunk* body — so the
+        // next edit also fits rather than re-growing past the ceiling.
+        let sink = std::sync::Arc::new(SizeEnforcingSink {
+            hard_limit: 30,
+            accepted: StdMutex::new(Vec::new()),
+            next_id: AtomicUsize::new(0),
+        });
+        let handle = spawn("chan".to_string(), sink.clone(), fmt(1000));
+        // First batch: a long row that the platform will reject until shrunk.
+        handle.try_send_frame(vec![row(&"a".repeat(40))], None);
+        handle.shutdown().await;
+
+        let accepted = sink.accepted.lock().unwrap();
+        assert!(!accepted.is_empty(), "active buffer should have opened");
+        for body in accepted.iter() {
+            assert!(
+                body.chars().count() <= 30,
+                "every accepted body must fit: {} chars",
+                body.chars().count()
+            );
+        }
     }
 }

@@ -8,6 +8,13 @@ pub enum BridgeError {
     #[error("Messaging client error: {0}")]
     Messaging(String),
 
+    /// The platform rejected a message because its body exceeded the size
+    /// limit. Distinguished from generic `Messaging` so the dispatcher can
+    /// react by shrinking and retrying rather than just logging — a sizing
+    /// miscalculation must never permanently wedge a message.
+    #[error("Message too long: {0}")]
+    MessageTooLong(String),
+
     #[error("Authentication error: {0}")]
     Auth(String),
 

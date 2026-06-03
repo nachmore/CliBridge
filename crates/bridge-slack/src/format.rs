@@ -76,6 +76,42 @@ impl TranscriptFormat for SlackTranscriptFormat {
             None => self.paginate_plain(body),
         }
     }
+
+    fn shrink(&self, body: &str, fraction: f64) -> Option<String> {
+        // For a fenced body, trim from the *end of the content* and re-close
+        // the fence so the result stays well-formed. The header and the start
+        // of the content (oldest scrollback) are preserved; the tail is what
+        // gets dropped — and the dispatcher removes the same tail from history,
+        // so nothing is double-counted.
+        match split_fenced(body) {
+            Some((header, content)) => {
+                let total = content.chars().count();
+                if total == 0 {
+                    return None;
+                }
+                let drop = ((total as f64 * fraction).ceil() as usize).max(1);
+                let keep = total.saturating_sub(drop);
+                if keep == 0 {
+                    return None;
+                }
+                let trimmed: String = content.chars().take(keep).collect();
+                Some(format!("{header}{FENCE_OPEN}{trimmed}{FENCE_CLOSE}"))
+            }
+            // Unfenced (plain reply / banner): trim raw chars from the end.
+            None => {
+                let total = body.chars().count();
+                if total == 0 {
+                    return None;
+                }
+                let drop = ((total as f64 * fraction).ceil() as usize).max(1);
+                let keep = total.saturating_sub(drop);
+                if keep == 0 {
+                    return None;
+                }
+                Some(body.chars().take(keep).collect())
+            }
+        }
+    }
 }
 
 /// Closing code fence plus the bytes Slack adds around it.
@@ -269,6 +305,41 @@ mod tests {
         let f = SlackTranscriptFormat;
         let marker_units = crate::client::SELF_MARKER.encode_utf16().count();
         assert_eq!(f.size_limit(), 2_800 - marker_units);
+    }
+
+    #[test]
+    fn shrink_trims_content_and_keeps_fence_closed() {
+        // Shrinking a fenced body drops content from the end but leaves a
+        // well-formed message: header preserved, fence re-closed, smaller.
+        let f = SlackTranscriptFormat;
+        let body = f.scroll_body(&"x".repeat(100));
+        let before = f.measure(&body);
+        let shrunk = f.shrink(&body, 0.10).expect("should shrink");
+        assert!(shrunk.starts_with("📜 *Scroll buffer*\n```\n"));
+        assert!(shrunk.ends_with("```"));
+        assert!(
+            f.measure(&shrunk) < before,
+            "shrunk ({}) must be smaller than {before}",
+            f.measure(&shrunk)
+        );
+        // Start of content preserved (we trim from the tail).
+        assert!(shrunk.contains("xxxx"));
+    }
+
+    #[test]
+    fn shrink_unfenced_trims_from_end() {
+        let f = SlackTranscriptFormat;
+        let shrunk = f.shrink("hello world this is a reply", 0.5).unwrap();
+        assert!(shrunk.starts_with("hello"));
+        assert!(shrunk.chars().count() < "hello world this is a reply".chars().count());
+    }
+
+    #[test]
+    fn shrink_gives_up_on_minimal_body() {
+        let f = SlackTranscriptFormat;
+        // An empty-content fenced body can't shrink further.
+        let body = f.scroll_body("");
+        assert!(f.shrink(&body, 0.5).is_none());
     }
 
     #[test]
