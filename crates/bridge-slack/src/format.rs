@@ -22,7 +22,7 @@
 //!   each message renders as a single bubble, with headroom for labels.
 //! - **Fenced code blocks** wrap scrollback rows.
 
-use bridge_core::dispatch::TranscriptFormat;
+use bridge_core::dispatch::{TranscriptFormat, shrink_by_chars};
 
 /// Effective per-message budget in UTF-16 units. Slack's hard `msg_too_long`
 /// ceiling (and its "Show more" bubble split) sit around 3,000; we stay under
@@ -77,39 +77,32 @@ impl TranscriptFormat for SlackTranscriptFormat {
         }
     }
 
-    fn shrink(&self, body: &str, fraction: f64) -> Option<String> {
+    fn shrink(&self, body: &str, target: usize) -> Option<String> {
         // For a fenced body, trim from the *end of the content* and re-close
-        // the fence so the result stays well-formed. The header and the start
-        // of the content (oldest scrollback) are preserved; the tail is what
-        // gets dropped — and the dispatcher removes the same tail from history,
-        // so nothing is double-counted.
+        // the fence so the result stays well-formed, until the whole framed
+        // body measures at most `target`. The header and the start of the
+        // content (oldest scrollback) are preserved; the tail is dropped — and
+        // the dispatcher tracks the shrunk body as the new active, so the
+        // dropped tail isn't re-counted on the next extend.
         match split_fenced(body) {
             Some((header, content)) => {
-                let total = content.chars().count();
-                if total == 0 {
-                    return None;
+                // Budget for content = target minus the fixed framing overhead.
+                let overhead =
+                    self.measure(header) + self.measure(FENCE_OPEN) + self.measure(FENCE_CLOSE);
+                let content_target = target.saturating_sub(overhead);
+                // Trim content to fit, measured with the same (escape-aware)
+                // accounting the rest of the format uses.
+                let trimmed = shrink_by_chars(content, content_target, |s| self.measure(s))?;
+                let framed = format!("{header}{FENCE_OPEN}{trimmed}{FENCE_CLOSE}");
+                // Must end up strictly smaller than the input.
+                if self.measure(&framed) < self.measure(body) {
+                    Some(framed)
+                } else {
+                    None
                 }
-                let drop = ((total as f64 * fraction).ceil() as usize).max(1);
-                let keep = total.saturating_sub(drop);
-                if keep == 0 {
-                    return None;
-                }
-                let trimmed: String = content.chars().take(keep).collect();
-                Some(format!("{header}{FENCE_OPEN}{trimmed}{FENCE_CLOSE}"))
             }
             // Unfenced (plain reply / banner): trim raw chars from the end.
-            None => {
-                let total = body.chars().count();
-                if total == 0 {
-                    return None;
-                }
-                let drop = ((total as f64 * fraction).ceil() as usize).max(1);
-                let keep = total.saturating_sub(drop);
-                if keep == 0 {
-                    return None;
-                }
-                Some(body.chars().take(keep).collect())
-            }
+            None => shrink_by_chars(body, target, |s| self.measure(s)),
         }
     }
 }
@@ -308,18 +301,20 @@ mod tests {
     }
 
     #[test]
-    fn shrink_trims_content_and_keeps_fence_closed() {
-        // Shrinking a fenced body drops content from the end but leaves a
-        // well-formed message: header preserved, fence re-closed, smaller.
+    fn shrink_trims_content_to_target_and_keeps_fence_closed() {
+        // Shrinking a fenced body to a target drops content from the end but
+        // leaves a well-formed message: header preserved, fence re-closed, and
+        // the whole framed body measures at most the target.
         let f = SlackTranscriptFormat;
         let body = f.scroll_body(&"x".repeat(100));
         let before = f.measure(&body);
-        let shrunk = f.shrink(&body, 0.10).expect("should shrink");
+        let target = before - 30;
+        let shrunk = f.shrink(&body, target).expect("should shrink");
         assert!(shrunk.starts_with("📜 *Scroll buffer*\n```\n"));
         assert!(shrunk.ends_with("```"));
         assert!(
-            f.measure(&shrunk) < before,
-            "shrunk ({}) must be smaller than {before}",
+            f.measure(&shrunk) <= target,
+            "shrunk ({}) must be within target {target}",
             f.measure(&shrunk)
         );
         // Start of content preserved (we trim from the tail).
@@ -327,19 +322,20 @@ mod tests {
     }
 
     #[test]
-    fn shrink_unfenced_trims_from_end() {
+    fn shrink_unfenced_trims_to_target() {
         let f = SlackTranscriptFormat;
-        let shrunk = f.shrink("hello world this is a reply", 0.5).unwrap();
+        let body = "hello world this is a reply";
+        let shrunk = f.shrink(body, 5).unwrap();
         assert!(shrunk.starts_with("hello"));
-        assert!(shrunk.chars().count() < "hello world this is a reply".chars().count());
+        assert!(f.measure(&shrunk) <= 5);
     }
 
     #[test]
-    fn shrink_gives_up_on_minimal_body() {
+    fn shrink_gives_up_when_framing_exceeds_target() {
         let f = SlackTranscriptFormat;
-        // An empty-content fenced body can't shrink further.
-        let body = f.scroll_body("");
-        assert!(f.shrink(&body, 0.5).is_none());
+        // Target smaller than the fixed fence/header framing → can't fit.
+        let body = f.scroll_body("some content");
+        assert!(f.shrink(&body, 1).is_none());
     }
 
     #[test]

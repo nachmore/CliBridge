@@ -142,29 +142,53 @@ pub trait TranscriptFormat: Send + Sync + 'static {
         vec![body.to_string()]
     }
 
-    /// Last-resort defense: return `body` shrunk by roughly `fraction` of its
-    /// length (e.g. 0.01 = 1%), still well-formed (fences closed, content
-    /// trimmed from the *end* so the start stays intact). Used by the
-    /// dispatcher when the platform rejects a post as too-long despite our
-    /// size accounting — it shrinks and retries until the post succeeds, so a
-    /// sizing miscalculation can never permanently wedge a message.
+    /// Last-resort defense: return `body` shrunk so it measures at most
+    /// `target` units, still well-formed (fences closed, content trimmed from
+    /// the *end* so the start stays intact). Used by the dispatcher when the
+    /// platform rejects a post as too-long despite our size accounting — it
+    /// shrinks to a target and retries until the post succeeds, so a sizing
+    /// miscalculation can never permanently wedge a message.
     ///
-    /// Returns `None` when the body can't be shrunk further (already minimal),
-    /// signalling the dispatcher to give up on that body. The default trims raw
-    /// characters from the end; platforms with framing (fences, headers) should
-    /// override to preserve well-formedness.
-    fn shrink(&self, body: &str, fraction: f64) -> Option<String> {
-        let total = body.chars().count();
-        if total == 0 {
-            return None;
-        }
-        let drop = ((total as f64 * fraction).ceil() as usize).max(1);
-        let keep = total.saturating_sub(drop);
-        if keep == 0 {
-            return None;
-        }
-        Some(body.chars().take(keep).collect())
+    /// The result must be *strictly smaller* than `body` (so the retry loop
+    /// makes progress); return `None` when the body can't be shrunk to
+    /// `target` (e.g. fixed framing already exceeds it), signalling the
+    /// dispatcher to give up. The default trims raw characters from the end to
+    /// hit the target; platforms with framing (fences, headers) should override
+    /// to preserve well-formedness.
+    fn shrink(&self, body: &str, target: usize) -> Option<String> {
+        shrink_by_chars(body, target, |s| self.measure(s))
     }
+}
+
+/// Trim `body` from the end so it measures at most `target` (per `measure`),
+/// at a char boundary, and strictly smaller than the input. Returns `None` if
+/// it can't be made smaller. Shared default for plain (unframed) shrinking.
+pub fn shrink_by_chars(
+    body: &str,
+    target: usize,
+    measure: impl Fn(&str) -> usize,
+) -> Option<String> {
+    let current = measure(body);
+    if current == 0 {
+        return None;
+    }
+    // Walk back from the end, dropping chars until we're at or under target.
+    // Cap the kept length below the current char count so we always shrink at
+    // least one char even when measure(body) <= target (shouldn't happen, but
+    // keeps the loop honest).
+    let mut chars: Vec<char> = body.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    chars.pop(); // guarantee progress
+    while !chars.is_empty() {
+        let candidate: String = chars.iter().collect();
+        if measure(&candidate) <= target {
+            return Some(candidate);
+        }
+        chars.pop();
+    }
+    None
 }
 
 /// Handle the session loop keeps. Sends are non-blocking: if the dispatcher is
@@ -451,38 +475,39 @@ impl Dispatcher {
         let _ = self.edit_resilient(&active.message_id, &locked).await;
     }
 
-    /// How much to trim per shrink-retry attempt when the platform rejects a
-    /// body as too-long. 1% per step converges in a handful of retries even if
-    /// our size estimate is off by a lot, without overshooting and dropping
-    /// more content than necessary.
-    const SHRINK_STEP: f64 = 0.01;
+    /// First trim fraction when the platform rejects a body as too-long and
+    /// gives us no numeric hint. Doubled on each subsequent retry so we
+    /// converge fast even if the real ceiling is far below our estimate:
+    /// 5% → 10% → 20% → … A hinted limit bypasses this entirely (we jump
+    /// straight to the stated size).
+    const SHRINK_FIRST_FRACTION: f64 = 0.05;
 
     /// Post `body`, shrinking and retrying if the platform rejects it as
     /// too-long. Returns `Ok((ts, posted_body))` with the body that actually
     /// went through (possibly shrunk), or the underlying error for non-size
     /// failures / once the body can't shrink further. This is the last-resort
     /// guard: even a wrong size calculation can't wedge us, because we keep
-    /// trimming until Slack accepts it.
+    /// trimming until the platform accepts it.
     async fn post_resilient(&self, body: &str) -> Result<(String, String), BridgeError> {
         let mut current = body.to_string();
+        let mut fraction = Self::SHRINK_FIRST_FRACTION;
         loop {
             match self.sink.post(&self.channel, &current).await {
                 Ok(ts) => return Ok((ts, current)),
-                Err(BridgeError::MessageTooLong(msg)) => {
-                    match self.fmt.shrink(&current, Self::SHRINK_STEP) {
-                        Some(smaller)
-                            if self.fmt.measure(&smaller) < self.fmt.measure(&current) =>
-                        {
+                Err(BridgeError::MessageTooLong { detail, limit_hint }) => {
+                    match self.shrink_for_retry(&current, limit_hint, fraction) {
+                        Some(smaller) => {
                             warn!(
-                                "post rejected as too-long ({msg}); shrank {} -> {} units, retrying",
+                                "post rejected as too-long ({detail}); shrank {} -> {} units, retrying",
                                 self.fmt.measure(&current),
                                 self.fmt.measure(&smaller)
                             );
                             current = smaller;
+                            fraction *= 2.0;
                         }
-                        _ => {
-                            error!("post rejected as too-long and cannot shrink further: {msg}");
-                            return Err(BridgeError::MessageTooLong(msg));
+                        None => {
+                            error!("post rejected as too-long and cannot shrink further: {detail}");
+                            return Err(BridgeError::MessageTooLong { detail, limit_hint });
                         }
                     }
                 }
@@ -496,29 +521,62 @@ impl Dispatcher {
     /// (e.g. `active.body`) in sync with what the platform now holds.
     async fn edit_resilient(&self, id: &str, body: &str) -> Result<String, BridgeError> {
         let mut current = body.to_string();
+        let mut fraction = Self::SHRINK_FIRST_FRACTION;
         loop {
             match self.sink.edit(&self.channel, id, &current).await {
                 Ok(()) => return Ok(current),
-                Err(BridgeError::MessageTooLong(msg)) => {
-                    match self.fmt.shrink(&current, Self::SHRINK_STEP) {
-                        Some(smaller)
-                            if self.fmt.measure(&smaller) < self.fmt.measure(&current) =>
-                        {
+                Err(BridgeError::MessageTooLong { detail, limit_hint }) => {
+                    match self.shrink_for_retry(&current, limit_hint, fraction) {
+                        Some(smaller) => {
                             warn!(
-                                "edit rejected as too-long ({msg}); shrank {} -> {} units, retrying",
+                                "edit rejected as too-long ({detail}); shrank {} -> {} units, retrying",
                                 self.fmt.measure(&current),
                                 self.fmt.measure(&smaller)
                             );
                             current = smaller;
+                            fraction *= 2.0;
                         }
-                        _ => {
-                            error!("edit rejected as too-long and cannot shrink further: {msg}");
-                            return Err(BridgeError::MessageTooLong(msg));
+                        None => {
+                            error!("edit rejected as too-long and cannot shrink further: {detail}");
+                            return Err(BridgeError::MessageTooLong { detail, limit_hint });
                         }
                     }
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// Compute the next shrink target and apply it. Adaptive:
+    /// - If the platform stated a `limit_hint`, target just under it (with a
+    ///   small safety margin, since our `measure` only approximates the
+    ///   platform's count) — usually a one-shot fit.
+    /// - Otherwise target the current measured size reduced by `fraction`, so
+    ///   the caller's doubling escalation guarantees fast convergence.
+    ///
+    /// Returns the shrunk body, or `None` if it can't be made any smaller.
+    fn shrink_for_retry(
+        &self,
+        current: &str,
+        limit_hint: Option<usize>,
+        fraction: f64,
+    ) -> Option<String> {
+        let measured = self.fmt.measure(current);
+        let target = match limit_hint {
+            // Aim a few percent under the stated limit: our measure() is an
+            // approximation of the platform's own counting, so leave headroom.
+            Some(limit) => ((limit as f64) * 0.97) as usize,
+            // No hint: trim `fraction` off what we measured.
+            None => ((measured as f64) * (1.0 - fraction)) as usize,
+        };
+        // Never target at or above the current size — we must make progress.
+        let target = target.min(measured.saturating_sub(1));
+        let smaller = self.fmt.shrink(current, target)?;
+        // Defensive: ensure the format actually returned something smaller.
+        if self.fmt.measure(&smaller) < measured {
+            Some(smaller)
+        } else {
+            None
         }
     }
 
@@ -1056,15 +1114,28 @@ mod tests {
     /// the bodies that actually succeeded.
     struct SizeEnforcingSink {
         hard_limit: usize,
+        /// Whether the rejection carries a numeric `limit_hint`.
+        give_hint: bool,
         accepted: StdMutex<Vec<String>>,
         next_id: AtomicUsize,
+    }
+
+    impl SizeEnforcingSink {
+        fn too_long(&self) -> BridgeError {
+            BridgeError::MessageTooLong {
+                detail: "too long".into(),
+                // When `give_hint`, report the real ceiling so the dispatcher
+                // can jump straight to a fitting size in one retry.
+                limit_hint: self.give_hint.then_some(self.hard_limit),
+            }
+        }
     }
 
     #[async_trait]
     impl TranscriptSink for SizeEnforcingSink {
         async fn post(&self, _channel: &str, text: &str) -> Result<String, BridgeError> {
             if text.chars().count() > self.hard_limit {
-                return Err(BridgeError::MessageTooLong("too long".into()));
+                return Err(self.too_long());
             }
             self.accepted.lock().unwrap().push(text.to_string());
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -1072,7 +1143,7 @@ mod tests {
         }
         async fn edit(&self, _channel: &str, _id: &str, text: &str) -> Result<(), BridgeError> {
             if text.chars().count() > self.hard_limit {
-                return Err(BridgeError::MessageTooLong("too long".into()));
+                return Err(self.too_long());
             }
             self.accepted.lock().unwrap().push(text.to_string());
             Ok(())
@@ -1086,6 +1157,7 @@ mod tests {
         // still get posted — shrunk down until it fits — never wedging.
         let sink = std::sync::Arc::new(SizeEnforcingSink {
             hard_limit: 50,
+            give_hint: false,
             accepted: StdMutex::new(Vec::new()),
             next_id: AtomicUsize::new(0),
         });
@@ -1110,6 +1182,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hinted_limit_fits_in_one_retry() {
+        // When the rejection carries a numeric limit_hint, the dispatcher jumps
+        // straight to a fitting size — one reject, then one accept. The
+        // RejectCountingSink records every attempted post (accepted or not).
+        let sink = std::sync::Arc::new(RejectCountingSink {
+            hard_limit: 100,
+            attempts: StdMutex::new(Vec::new()),
+            next_id: AtomicUsize::new(0),
+        });
+        let handle = spawn("chan".to_string(), sink.clone(), fmt(10_000));
+        handle.try_send_frame(
+            vec![],
+            Some(LiveFrame {
+                text: "y".repeat(500),
+                is_edit: false,
+            }),
+        );
+        handle.shutdown().await;
+
+        let attempts = sink.attempts.lock().unwrap();
+        // First attempt (500) rejected, second (shrunk to ~97% of 100) accepted.
+        assert_eq!(
+            attempts.len(),
+            2,
+            "hint should converge in one retry: {attempts:?}"
+        );
+        assert!(attempts[0] > 100, "first attempt is the oversized body");
+        assert!(attempts[1] <= 100, "second attempt fits the hinted limit");
+    }
+
+    #[tokio::test]
     async fn shrink_retry_keeps_active_body_in_sync() {
         // A scroll-buffer batch that the format sizes as fitting but the
         // platform rejects must still open an active buffer (shrunk to fit),
@@ -1117,6 +1220,7 @@ mod tests {
         // next edit also fits rather than re-growing past the ceiling.
         let sink = std::sync::Arc::new(SizeEnforcingSink {
             hard_limit: 30,
+            give_hint: false,
             accepted: StdMutex::new(Vec::new()),
             next_id: AtomicUsize::new(0),
         });
@@ -1133,6 +1237,40 @@ mod tests {
                 "every accepted body must fit: {} chars",
                 body.chars().count()
             );
+        }
+    }
+
+    /// Like `SizeEnforcingSink` but records the size of *every* attempt (not
+    /// just accepted) and always supplies a `limit_hint`, so a test can count
+    /// how many retries the hinted fast-path takes.
+    struct RejectCountingSink {
+        hard_limit: usize,
+        attempts: StdMutex<Vec<usize>>,
+        next_id: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TranscriptSink for RejectCountingSink {
+        async fn post(&self, _channel: &str, text: &str) -> Result<String, BridgeError> {
+            self.attempts.lock().unwrap().push(text.chars().count());
+            if text.chars().count() > self.hard_limit {
+                return Err(BridgeError::MessageTooLong {
+                    detail: "too long".into(),
+                    limit_hint: Some(self.hard_limit),
+                });
+            }
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("id{id}"))
+        }
+        async fn edit(&self, _channel: &str, _id: &str, text: &str) -> Result<(), BridgeError> {
+            self.attempts.lock().unwrap().push(text.chars().count());
+            if text.chars().count() > self.hard_limit {
+                return Err(BridgeError::MessageTooLong {
+                    detail: "too long".into(),
+                    limit_hint: Some(self.hard_limit),
+                });
+            }
+            Ok(())
         }
     }
 }

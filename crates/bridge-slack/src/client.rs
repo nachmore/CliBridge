@@ -34,7 +34,12 @@ pub const SELF_MARKER: &str = "🌉 ";
 /// others are generic `Messaging`. `op` is "post" or "edit" for the message.
 fn classify_post_error(op: &str, slack_error: &str) -> BridgeError {
     if slack_error == "msg_too_long" {
-        BridgeError::MessageTooLong(format!("Failed to {op} message: {slack_error}"))
+        // Slack's msg_too_long response carries no numeric limit, so there's
+        // no hint to pass — the dispatcher escalates its trim adaptively.
+        BridgeError::MessageTooLong {
+            detail: format!("Failed to {op} message: {slack_error}"),
+            limit_hint: None,
+        }
     } else {
         BridgeError::Messaging(format!("Failed to {op} message: {slack_error}"))
     }
